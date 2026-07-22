@@ -1,6 +1,9 @@
 [workspace]
 resolver = "3"
-members = ["crates/probe"]
+members = ["crates/ast", "crates/probe"]
+# cargo-fuzz targets build with nightly sanitizer flags; keep them out of the
+# stable workspace so fmt/clippy/test/linkage jobs never touch them.
+exclude = ["crates/ast/fuzz"]
 
 [workspace.package]
 edition = "2024"

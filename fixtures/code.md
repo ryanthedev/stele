@@ -1,0 +1,18 @@
+```rust
+fn main() {
+    println!("fenced with info");
+}
+```
+
+~~~text with tildes
+`backticks` inside
+~~~
+
+    indented code block
+    second line
+
+```
+no info string
+```
+
+Inline `code span`, ``double `tick`` span, and `` `literal` ``.

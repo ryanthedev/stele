@@ -1,0 +1,11 @@
+# CRLF heading
+
+Paragraph one
+with continuation.
+
+- item a
+- item b
+
+```
+code line
+```
