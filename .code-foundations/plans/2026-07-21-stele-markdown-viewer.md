@@ -1,6 +1,8 @@
 # Plan: stele — terminal markdown viewer for Ghostty
 **Created:** 2026-07-21
-**Status:** ready
+**Status:** in-progress
+**Started:** 2026-07-21 23:05
+**Current Phase:** 1
 **Complexity:** complex
 ---
 ## Context
@@ -36,7 +38,7 @@ Grounding research (verified findings, falsification results, scope decisions S1
 
 ### Phase 1: Bootstrap + spikes
 **Model:** sonnet
-**Skills:** none — empirical spike harness and cargo scaffolding; the design skills apply to later phases that productionize
+**Skills:** code-foundations:cc-defensive-programming (resolved at build SETUP — the probe harness is an external-I/O boundary whose defining edge case is timeout handling against a non-answering terminal)
 **Gate:** Standard
 
 **Goal:** Stand up the workspace and CI, and resolve every unverified dependency the architecture rests on as written verdicts before anything is built on them.
@@ -313,4 +315,10 @@ Registration: `Painter::register_media(Box<dyn MediaSink>)`, `Painter::register_
 
 ---
 ## Execution Log
-_To be filled during /code-foundations:build_
+
+### Phase 1: Bootstrap + spikes (Gate: Standard)
+- [x] BUILD: Discovery + design + implementation (stub → implement → validate) complete
+- [x] REVIEW: Verification passed (attempt 2 — attempt 1 FAILed on a demonstrated silent-failure defect in `Launcher::run_probe`, fixed and regression-tested)
+- [x] Committed
+Commit: efd2633
+Summary: Cargo workspace, CI (fmt/clippy -D warnings/test/linkage), and `crates/probe` — a PTY harness that drives a real Ghostty window via `open -na Ghostty.app --args -e` (note: `ghostty -e` hangs) with per-probe timeouts. All three spikes ran live and produced measured verdict docs in `docs/spikes/`. **Verdicts that change downstream phases: mode 2026 is supported (approach C confirmed, no differ needed); mode 2027 is ON by default, contradicting the research's source-reading (P3 must build its corpus against 2027-ON and pin the Ghostty version); OSC 1337 ReportCellSize is unanswered — use `CSI 16t` for cell geometry (P6); kitty deletion is silent, so P6's create/delete balance must assert from the client send-log; virtual placement `U=1` is sequence-accepted but visually unverified, needing one manual pass in P6; highlight engine is lumis 0.12.0 (~31 MiB, judgment call inside the 30-100 MB band — syntect+two-face measured 2.14 MB and is recorded as the revisit option); Mermaid is mermaid-text 0.57.0 emitting a real box-drawing grid; RaTeX adopted on 1048/1048 corpus, but `LayoutOptions.color` MUST be set explicitly — the library default is black at 1.24:1 contrast on dark backgrounds.**

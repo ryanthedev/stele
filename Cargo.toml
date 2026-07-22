@@ -1,0 +1,13 @@
+[workspace]
+resolver = "3"
+members = ["crates/probe"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+rust-version = "1.95.0"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1

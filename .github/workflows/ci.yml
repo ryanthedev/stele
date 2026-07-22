@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: clippy
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - run: cargo test --workspace --all-features
+
+  # DW-1.1: release binaries must carry no dynamic dependency beyond the
+  # platform's own system libs. Ghostty itself is never present on this
+  # runner (see docs/spikes/ghostty-caps.md) — that is why the
+  # Ghostty-dependent spike verdicts are committed artifacts checked by the
+  # `spike-artifacts` job below, not something this job re-derives.
+  linkage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - run: cargo build --release --workspace
+      - name: Assert no non-system dynamic dependencies
+        run: |
+          set -euo pipefail
+          fail=0
+          for bin in target/release/*; do
+            [ -f "$bin" ] && [ -x "$bin" ] || continue
+            file "$bin" | grep -q ELF || continue
+            echo "== $bin =="
+            ldd "$bin" || true
+            # Allow only the glibc/gcc/linux-vdso family; anything else
+            # (a vendored .so, an unexpectedly dynamic crate dep) fails CI.
+            bad=$(ldd "$bin" | grep -viE '(linux-vdso|libc\.so|libm\.so|libgcc_s\.so|libpthread\.so|libdl\.so|librt\.so|ld-linux|=> */lib|statically linked|not a dynamic executable)' || true)
+            if [ -n "$bad" ]; then
+              echo "Unexpected dynamic dependency in $bin:"
+              echo "$bad"
+              fail=1
+            fi
+          done
+          exit $fail
+
+  # Spike results (docs/spikes/*.md) are produced by running the probe
+  # harness against a live Ghostty session locally (`just verify-ghostty`)
+  # and committing the output — CI has no Ghostty and cannot reproduce them.
+  # This job only asserts the committed artifacts exist and are non-empty,
+  # per the plan's Test Coverage note.
+  spike-artifacts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Assert spike docs exist and are non-empty
+        run: |
+          set -euo pipefail
+          for f in docs/spikes/ghostty-caps.md docs/spikes/highlight-engine.md docs/spikes/ratex.md; do
+            if [ ! -s "$f" ]; then
+              echo "missing or empty required spike artifact: $f"
+              exit 1
+            fi
+            if ! grep -q '^## Decision' "$f"; then
+              echo "$f is missing its required '## Decision' block"
+              exit 1
+            fi
+          done
