@@ -1,0 +1,1848 @@
+{
+  "cases": [
+    {
+      "id": "ascii_0",
+      "category": "ascii_basic",
+      "codepoints": [
+        "U+0061"
+      ],
+      "cluster": "a"
+    },
+    {
+      "id": "ascii_1",
+      "category": "ascii_basic",
+      "codepoints": [
+        "U+005A"
+      ],
+      "cluster": "Z"
+    },
+    {
+      "id": "ascii_2",
+      "category": "ascii_basic",
+      "codepoints": [
+        "U+0035"
+      ],
+      "cluster": "5"
+    },
+    {
+      "id": "ascii_3",
+      "category": "ascii_basic",
+      "codepoints": [
+        "U+0021"
+      ],
+      "cluster": "!"
+    },
+    {
+      "id": "ascii_4",
+      "category": "ascii_basic",
+      "codepoints": [
+        "U+005F"
+      ],
+      "cluster": "_"
+    },
+    {
+      "id": "ascii_5",
+      "category": "ascii_basic",
+      "codepoints": [
+        "U+0023"
+      ],
+      "cluster": "#"
+    },
+    {
+      "id": "combining_0",
+      "category": "combining_marks",
+      "codepoints": [
+        "U+0065",
+        "U+0301"
+      ],
+      "cluster": "é"
+    },
+    {
+      "id": "combining_1",
+      "category": "combining_marks",
+      "codepoints": [
+        "U+0061",
+        "U+0300"
+      ],
+      "cluster": "à"
+    },
+    {
+      "id": "combining_2",
+      "category": "combining_marks",
+      "codepoints": [
+        "U+006E",
+        "U+0303"
+      ],
+      "cluster": "ñ"
+    },
+    {
+      "id": "combining_3",
+      "category": "combining_marks",
+      "codepoints": [
+        "U+006F",
+        "U+0308"
+      ],
+      "cluster": "ö"
+    },
+    {
+      "id": "combining_4",
+      "category": "combining_marks",
+      "codepoints": [
+        "U+0075",
+        "U+030A"
+      ],
+      "cluster": "ů"
+    },
+    {
+      "id": "combining_5",
+      "category": "combining_marks",
+      "codepoints": [
+        "U+0063",
+        "U+0327"
+      ],
+      "cluster": "ç"
+    },
+    {
+      "id": "combining_6",
+      "category": "combining_marks",
+      "codepoints": [
+        "U+0069",
+        "U+0307"
+      ],
+      "cluster": "i̇"
+    },
+    {
+      "id": "combining_7",
+      "category": "combining_marks",
+      "codepoints": [
+        "U+0065",
+        "U+0304"
+      ],
+      "cluster": "ē"
+    },
+    {
+      "id": "combining_8",
+      "category": "combining_marks",
+      "codepoints": [
+        "U+0061",
+        "U+0306"
+      ],
+      "cluster": "ă"
+    },
+    {
+      "id": "combining_9",
+      "category": "combining_marks",
+      "codepoints": [
+        "U+0079",
+        "U+0308"
+      ],
+      "cluster": "ÿ"
+    },
+    {
+      "id": "combining_10",
+      "category": "combining_marks",
+      "codepoints": [
+        "U+0065",
+        "U+0301",
+        "U+0302"
+      ],
+      "cluster": "é̂"
+    },
+    {
+      "id": "combining_11",
+      "category": "combining_marks",
+      "codepoints": [
+        "U+0061",
+        "U+0300",
+        "U+0323"
+      ],
+      "cluster": "ạ̀"
+    },
+    {
+      "id": "combining_12",
+      "category": "combining_marks",
+      "codepoints": [
+        "U+006F",
+        "U+0308",
+        "U+0304"
+      ],
+      "cluster": "ȫ"
+    },
+    {
+      "id": "combining_13",
+      "category": "combining_marks",
+      "codepoints": [
+        "U+0075",
+        "U+030A",
+        "U+0301"
+      ],
+      "cluster": "ů́"
+    },
+    {
+      "id": "combining_14",
+      "category": "combining_marks",
+      "codepoints": [
+        "U+0069",
+        "U+0308",
+        "U+0301"
+      ],
+      "cluster": "ḯ"
+    },
+    {
+      "id": "zerowidth_0",
+      "category": "standalone_zero_width",
+      "codepoints": [
+        "U+200B"
+      ],
+      "cluster": "​"
+    },
+    {
+      "id": "zerowidth_1",
+      "category": "standalone_zero_width",
+      "codepoints": [
+        "U+200C"
+      ],
+      "cluster": "‌"
+    },
+    {
+      "id": "zerowidth_2",
+      "category": "standalone_zero_width",
+      "codepoints": [
+        "U+200D"
+      ],
+      "cluster": "‍"
+    },
+    {
+      "id": "zerowidth_3",
+      "category": "standalone_zero_width",
+      "codepoints": [
+        "U+FEFF"
+      ],
+      "cluster": "﻿"
+    },
+    {
+      "id": "zerowidth_4",
+      "category": "standalone_zero_width",
+      "codepoints": [
+        "U+0301"
+      ],
+      "cluster": "́"
+    },
+    {
+      "id": "zerowidth_5",
+      "category": "standalone_zero_width",
+      "codepoints": [
+        "U+2060"
+      ],
+      "cluster": "⁠"
+    },
+    {
+      "id": "cjk_0",
+      "category": "cjk_common",
+      "codepoints": [
+        "U+4E2D"
+      ],
+      "cluster": "中"
+    },
+    {
+      "id": "cjk_1",
+      "category": "cjk_common",
+      "codepoints": [
+        "U+6587"
+      ],
+      "cluster": "文"
+    },
+    {
+      "id": "cjk_2",
+      "category": "cjk_common",
+      "codepoints": [
+        "U+5B57"
+      ],
+      "cluster": "字"
+    },
+    {
+      "id": "cjk_3",
+      "category": "cjk_common",
+      "codepoints": [
+        "U+4F60"
+      ],
+      "cluster": "你"
+    },
+    {
+      "id": "cjk_4",
+      "category": "cjk_common",
+      "codepoints": [
+        "U+597D"
+      ],
+      "cluster": "好"
+    },
+    {
+      "id": "cjk_5",
+      "category": "cjk_common",
+      "codepoints": [
+        "U+4E16"
+      ],
+      "cluster": "世"
+    },
+    {
+      "id": "cjk_6",
+      "category": "cjk_common",
+      "codepoints": [
+        "U+754C"
+      ],
+      "cluster": "界"
+    },
+    {
+      "id": "cjk_7",
+      "category": "cjk_common",
+      "codepoints": [
+        "U+65E5"
+      ],
+      "cluster": "日"
+    },
+    {
+      "id": "cjk_8",
+      "category": "cjk_common",
+      "codepoints": [
+        "U+672C"
+      ],
+      "cluster": "本"
+    },
+    {
+      "id": "cjk_9",
+      "category": "cjk_common",
+      "codepoints": [
+        "U+8A9E"
+      ],
+      "cluster": "語"
+    },
+    {
+      "id": "cjk_10",
+      "category": "cjk_common",
+      "codepoints": [
+        "U+6F22"
+      ],
+      "cluster": "漢"
+    },
+    {
+      "id": "cjk_11",
+      "category": "cjk_common",
+      "codepoints": [
+        "U+5B57"
+      ],
+      "cluster": "字"
+    },
+    {
+      "id": "cjk_12",
+      "category": "cjk_common",
+      "codepoints": [
+        "U+5B66"
+      ],
+      "cluster": "学"
+    },
+    {
+      "id": "cjk_13",
+      "category": "cjk_common",
+      "codepoints": [
+        "U+6821"
+      ],
+      "cluster": "校"
+    },
+    {
+      "id": "cjk_14",
+      "category": "cjk_common",
+      "codepoints": [
+        "U+5927"
+      ],
+      "cluster": "大"
+    },
+    {
+      "id": "cjk_15",
+      "category": "cjk_common",
+      "codepoints": [
+        "U+5C0F"
+      ],
+      "cluster": "小"
+    },
+    {
+      "id": "cjk_16",
+      "category": "cjk_common",
+      "codepoints": [
+        "U+5C71"
+      ],
+      "cluster": "山"
+    },
+    {
+      "id": "cjk_17",
+      "category": "cjk_common",
+      "codepoints": [
+        "U+5DDD"
+      ],
+      "cluster": "川"
+    },
+    {
+      "id": "cjk_18",
+      "category": "cjk_common",
+      "codepoints": [
+        "U+6C34"
+      ],
+      "cluster": "水"
+    },
+    {
+      "id": "cjk_19",
+      "category": "cjk_common",
+      "codepoints": [
+        "U+706B"
+      ],
+      "cluster": "火"
+    },
+    {
+      "id": "cjk_20",
+      "category": "cjk_common",
+      "codepoints": [
+        "U+6728"
+      ],
+      "cluster": "木"
+    },
+    {
+      "id": "cjk_21",
+      "category": "cjk_common",
+      "codepoints": [
+        "U+91D1"
+      ],
+      "cluster": "金"
+    },
+    {
+      "id": "cjk_22",
+      "category": "cjk_common",
+      "codepoints": [
+        "U+571F"
+      ],
+      "cluster": "土"
+    },
+    {
+      "id": "cjk_23",
+      "category": "cjk_common",
+      "codepoints": [
+        "U+4EBA"
+      ],
+      "cluster": "人"
+    },
+    {
+      "id": "cjk_24",
+      "category": "cjk_common",
+      "codepoints": [
+        "U+53E3"
+      ],
+      "cluster": "口"
+    },
+    {
+      "id": "cjk_25",
+      "category": "cjk_common",
+      "codepoints": [
+        "U+529B"
+      ],
+      "cluster": "力"
+    },
+    {
+      "id": "cjk_26",
+      "category": "cjk_common",
+      "codepoints": [
+        "U+4E0A"
+      ],
+      "cluster": "上"
+    },
+    {
+      "id": "cjk_27",
+      "category": "cjk_common",
+      "codepoints": [
+        "U+4E0B"
+      ],
+      "cluster": "下"
+    },
+    {
+      "id": "cjk_28",
+      "category": "cjk_common",
+      "codepoints": [
+        "U+5DE6"
+      ],
+      "cluster": "左"
+    },
+    {
+      "id": "cjk_29",
+      "category": "cjk_common",
+      "codepoints": [
+        "U+53F3"
+      ],
+      "cluster": "右"
+    },
+    {
+      "id": "cjk_30",
+      "category": "cjk_common",
+      "codepoints": [
+        "U+3042"
+      ],
+      "cluster": "あ"
+    },
+    {
+      "id": "cjk_31",
+      "category": "cjk_common",
+      "codepoints": [
+        "U+3044"
+      ],
+      "cluster": "い"
+    },
+    {
+      "id": "cjk_32",
+      "category": "cjk_common",
+      "codepoints": [
+        "U+3046"
+      ],
+      "cluster": "う"
+    },
+    {
+      "id": "cjk_33",
+      "category": "cjk_common",
+      "codepoints": [
+        "U+3048"
+      ],
+      "cluster": "え"
+    },
+    {
+      "id": "cjk_34",
+      "category": "cjk_common",
+      "codepoints": [
+        "U+304A"
+      ],
+      "cluster": "お"
+    },
+    {
+      "id": "cjk_35",
+      "category": "cjk_common",
+      "codepoints": [
+        "U+304B"
+      ],
+      "cluster": "か"
+    },
+    {
+      "id": "cjk_36",
+      "category": "cjk_common",
+      "codepoints": [
+        "U+304D"
+      ],
+      "cluster": "き"
+    },
+    {
+      "id": "cjk_37",
+      "category": "cjk_common",
+      "codepoints": [
+        "U+304F"
+      ],
+      "cluster": "く"
+    },
+    {
+      "id": "cjk_38",
+      "category": "cjk_common",
+      "codepoints": [
+        "U+3051"
+      ],
+      "cluster": "け"
+    },
+    {
+      "id": "cjk_39",
+      "category": "cjk_common",
+      "codepoints": [
+        "U+3053"
+      ],
+      "cluster": "こ"
+    },
+    {
+      "id": "cjk_40",
+      "category": "cjk_common",
+      "codepoints": [
+        "U+30A2"
+      ],
+      "cluster": "ア"
+    },
+    {
+      "id": "cjk_41",
+      "category": "cjk_common",
+      "codepoints": [
+        "U+30A4"
+      ],
+      "cluster": "イ"
+    },
+    {
+      "id": "cjk_42",
+      "category": "cjk_common",
+      "codepoints": [
+        "U+30A6"
+      ],
+      "cluster": "ウ"
+    },
+    {
+      "id": "cjk_43",
+      "category": "cjk_common",
+      "codepoints": [
+        "U+30A8"
+      ],
+      "cluster": "エ"
+    },
+    {
+      "id": "cjk_44",
+      "category": "cjk_common",
+      "codepoints": [
+        "U+30AA"
+      ],
+      "cluster": "オ"
+    },
+    {
+      "id": "hangul_pre_0",
+      "category": "hangul_precomposed",
+      "codepoints": [
+        "U+AC00"
+      ],
+      "cluster": "가"
+    },
+    {
+      "id": "hangul_pre_1",
+      "category": "hangul_precomposed",
+      "codepoints": [
+        "U+B098"
+      ],
+      "cluster": "나"
+    },
+    {
+      "id": "hangul_pre_2",
+      "category": "hangul_precomposed",
+      "codepoints": [
+        "U+B2E4"
+      ],
+      "cluster": "다"
+    },
+    {
+      "id": "hangul_pre_3",
+      "category": "hangul_precomposed",
+      "codepoints": [
+        "U+B77C"
+      ],
+      "cluster": "라"
+    },
+    {
+      "id": "hangul_pre_4",
+      "category": "hangul_precomposed",
+      "codepoints": [
+        "U+B9C8"
+      ],
+      "cluster": "마"
+    },
+    {
+      "id": "hangul_pre_5",
+      "category": "hangul_precomposed",
+      "codepoints": [
+        "U+BC14"
+      ],
+      "cluster": "바"
+    },
+    {
+      "id": "hangul_pre_6",
+      "category": "hangul_precomposed",
+      "codepoints": [
+        "U+C0AC"
+      ],
+      "cluster": "사"
+    },
+    {
+      "id": "hangul_pre_7",
+      "category": "hangul_precomposed",
+      "codepoints": [
+        "U+C544"
+      ],
+      "cluster": "아"
+    },
+    {
+      "id": "hangul_pre_8",
+      "category": "hangul_precomposed",
+      "codepoints": [
+        "U+C790"
+      ],
+      "cluster": "자"
+    },
+    {
+      "id": "hangul_pre_9",
+      "category": "hangul_precomposed",
+      "codepoints": [
+        "U+D558"
+      ],
+      "cluster": "하"
+    },
+    {
+      "id": "jamo_0_L",
+      "category": "hangul_jamo_sequences",
+      "codepoints": [
+        "U+1100"
+      ],
+      "cluster": "ᄀ"
+    },
+    {
+      "id": "jamo_1_L",
+      "category": "hangul_jamo_sequences",
+      "codepoints": [
+        "U+1102"
+      ],
+      "cluster": "ᄂ"
+    },
+    {
+      "id": "jamo_2_LV",
+      "category": "hangul_jamo_sequences",
+      "codepoints": [
+        "U+1100",
+        "U+1161"
+      ],
+      "cluster": "가"
+    },
+    {
+      "id": "jamo_3_LV",
+      "category": "hangul_jamo_sequences",
+      "codepoints": [
+        "U+1102",
+        "U+1165"
+      ],
+      "cluster": "너"
+    },
+    {
+      "id": "jamo_4_LV",
+      "category": "hangul_jamo_sequences",
+      "codepoints": [
+        "U+1103",
+        "U+1169"
+      ],
+      "cluster": "도"
+    },
+    {
+      "id": "jamo_5_LV",
+      "category": "hangul_jamo_sequences",
+      "codepoints": [
+        "U+1105",
+        "U+116E"
+      ],
+      "cluster": "루"
+    },
+    {
+      "id": "jamo_6_LV",
+      "category": "hangul_jamo_sequences",
+      "codepoints": [
+        "U+1109",
+        "U+1175"
+      ],
+      "cluster": "시"
+    },
+    {
+      "id": "jamo_7_LV",
+      "category": "hangul_jamo_sequences",
+      "codepoints": [
+        "U+110B",
+        "U+1161"
+      ],
+      "cluster": "아"
+    },
+    {
+      "id": "jamo_8_LVT",
+      "category": "hangul_jamo_sequences",
+      "codepoints": [
+        "U+1100",
+        "U+1161",
+        "U+11A8"
+      ],
+      "cluster": "각"
+    },
+    {
+      "id": "jamo_9_LVT",
+      "category": "hangul_jamo_sequences",
+      "codepoints": [
+        "U+1102",
+        "U+1165",
+        "U+11AB"
+      ],
+      "cluster": "넌"
+    },
+    {
+      "id": "jamo_10_LVT",
+      "category": "hangul_jamo_sequences",
+      "codepoints": [
+        "U+1103",
+        "U+1169",
+        "U+11AE"
+      ],
+      "cluster": "돋"
+    },
+    {
+      "id": "jamo_11_LVT",
+      "category": "hangul_jamo_sequences",
+      "codepoints": [
+        "U+1105",
+        "U+116E",
+        "U+11BA"
+      ],
+      "cluster": "룻"
+    },
+    {
+      "id": "jamo_12_LVT",
+      "category": "hangul_jamo_sequences",
+      "codepoints": [
+        "U+1109",
+        "U+1175",
+        "U+11BD"
+      ],
+      "cluster": "싲"
+    },
+    {
+      "id": "jamo_13_LVT",
+      "category": "hangul_jamo_sequences",
+      "codepoints": [
+        "U+110B",
+        "U+1161",
+        "U+11A8"
+      ],
+      "cluster": "악"
+    },
+    {
+      "id": "jamo_14_LVT",
+      "category": "hangul_jamo_sequences",
+      "codepoints": [
+        "U+110C",
+        "U+1165",
+        "U+11AB"
+      ],
+      "cluster": "전"
+    },
+    {
+      "id": "vs16_0",
+      "category": "vs16_promotions",
+      "codepoints": [
+        "U+2764",
+        "U+FE0F"
+      ],
+      "cluster": "❤️"
+    },
+    {
+      "id": "vs16_1",
+      "category": "vs16_promotions",
+      "codepoints": [
+        "U+2600",
+        "U+FE0F"
+      ],
+      "cluster": "☀️"
+    },
+    {
+      "id": "vs16_2",
+      "category": "vs16_promotions",
+      "codepoints": [
+        "U+2602",
+        "U+FE0F"
+      ],
+      "cluster": "☂️"
+    },
+    {
+      "id": "vs16_3",
+      "category": "vs16_promotions",
+      "codepoints": [
+        "U+2702",
+        "U+FE0F"
+      ],
+      "cluster": "✂️"
+    },
+    {
+      "id": "vs16_4",
+      "category": "vs16_promotions",
+      "codepoints": [
+        "U+2708",
+        "U+FE0F"
+      ],
+      "cluster": "✈️"
+    },
+    {
+      "id": "vs16_5",
+      "category": "vs16_promotions",
+      "codepoints": [
+        "U+2699",
+        "U+FE0F"
+      ],
+      "cluster": "⚙️"
+    },
+    {
+      "id": "vs16_6",
+      "category": "vs16_promotions",
+      "codepoints": [
+        "U+26A0",
+        "U+FE0F"
+      ],
+      "cluster": "⚠️"
+    },
+    {
+      "id": "vs16_7",
+      "category": "vs16_promotions",
+      "codepoints": [
+        "U+260E",
+        "U+FE0F"
+      ],
+      "cluster": "☎️"
+    },
+    {
+      "id": "vs16_8",
+      "category": "vs16_promotions",
+      "codepoints": [
+        "U+267B",
+        "U+FE0F"
+      ],
+      "cluster": "♻️"
+    },
+    {
+      "id": "vs16_9",
+      "category": "vs16_promotions",
+      "codepoints": [
+        "U+2709",
+        "U+FE0F"
+      ],
+      "cluster": "✉️"
+    },
+    {
+      "id": "vs16_10",
+      "category": "vs16_promotions",
+      "codepoints": [
+        "U+2618",
+        "U+FE0F"
+      ],
+      "cluster": "☘️"
+    },
+    {
+      "id": "vs16_11",
+      "category": "vs16_promotions",
+      "codepoints": [
+        "U+2620",
+        "U+FE0F"
+      ],
+      "cluster": "☠️"
+    },
+    {
+      "id": "vs16_12",
+      "category": "vs16_promotions",
+      "codepoints": [
+        "U+2622",
+        "U+FE0F"
+      ],
+      "cluster": "☢️"
+    },
+    {
+      "id": "vs16_13",
+      "category": "vs16_promotions",
+      "codepoints": [
+        "U+2623",
+        "U+FE0F"
+      ],
+      "cluster": "☣️"
+    },
+    {
+      "id": "vs16_14",
+      "category": "vs16_promotions",
+      "codepoints": [
+        "U+262E",
+        "U+FE0F"
+      ],
+      "cluster": "☮️"
+    },
+    {
+      "id": "vs16_15",
+      "category": "vs16_promotions",
+      "codepoints": [
+        "U+262F",
+        "U+FE0F"
+      ],
+      "cluster": "☯️"
+    },
+    {
+      "id": "vs16_16",
+      "category": "vs16_promotions",
+      "codepoints": [
+        "U+2638",
+        "U+FE0F"
+      ],
+      "cluster": "☸️"
+    },
+    {
+      "id": "vs16_17",
+      "category": "vs16_promotions",
+      "codepoints": [
+        "U+2661",
+        "U+FE0F"
+      ],
+      "cluster": "♡️"
+    },
+    {
+      "id": "vs16_18",
+      "category": "vs16_promotions",
+      "codepoints": [
+        "U+2663",
+        "U+FE0F"
+      ],
+      "cluster": "♣️"
+    },
+    {
+      "id": "vs16_19",
+      "category": "vs16_promotions",
+      "codepoints": [
+        "U+2665",
+        "U+FE0F"
+      ],
+      "cluster": "♥️"
+    },
+    {
+      "id": "vs15_0",
+      "category": "vs15_demotions",
+      "codepoints": [
+        "U+231A",
+        "U+FE0E"
+      ],
+      "cluster": "⌚︎"
+    },
+    {
+      "id": "vs15_1",
+      "category": "vs15_demotions",
+      "codepoints": [
+        "U+231B",
+        "U+FE0E"
+      ],
+      "cluster": "⌛︎"
+    },
+    {
+      "id": "vs15_2",
+      "category": "vs15_demotions",
+      "codepoints": [
+        "U+23E9",
+        "U+FE0E"
+      ],
+      "cluster": "⏩︎"
+    },
+    {
+      "id": "vs15_3",
+      "category": "vs15_demotions",
+      "codepoints": [
+        "U+23EA",
+        "U+FE0E"
+      ],
+      "cluster": "⏪︎"
+    },
+    {
+      "id": "vs15_4",
+      "category": "vs15_demotions",
+      "codepoints": [
+        "U+23EB",
+        "U+FE0E"
+      ],
+      "cluster": "⏫︎"
+    },
+    {
+      "id": "vs15_5",
+      "category": "vs15_demotions",
+      "codepoints": [
+        "U+23EC",
+        "U+FE0E"
+      ],
+      "cluster": "⏬︎"
+    },
+    {
+      "id": "vs15_6",
+      "category": "vs15_demotions",
+      "codepoints": [
+        "U+23F0",
+        "U+FE0E"
+      ],
+      "cluster": "⏰︎"
+    },
+    {
+      "id": "vs15_7",
+      "category": "vs15_demotions",
+      "codepoints": [
+        "U+23F3",
+        "U+FE0E"
+      ],
+      "cluster": "⏳︎"
+    },
+    {
+      "id": "vs15_8",
+      "category": "vs15_demotions",
+      "codepoints": [
+        "U+25FD",
+        "U+FE0E"
+      ],
+      "cluster": "◽︎"
+    },
+    {
+      "id": "vs15_9",
+      "category": "vs15_demotions",
+      "codepoints": [
+        "U+25FE",
+        "U+FE0E"
+      ],
+      "cluster": "◾︎"
+    },
+    {
+      "id": "vs15_10",
+      "category": "vs15_demotions",
+      "codepoints": [
+        "U+2614",
+        "U+FE0E"
+      ],
+      "cluster": "☔︎"
+    },
+    {
+      "id": "vs15_11",
+      "category": "vs15_demotions",
+      "codepoints": [
+        "U+2648",
+        "U+FE0E"
+      ],
+      "cluster": "♈︎"
+    },
+    {
+      "id": "vs15_12",
+      "category": "vs15_demotions",
+      "codepoints": [
+        "U+2649",
+        "U+FE0E"
+      ],
+      "cluster": "♉︎"
+    },
+    {
+      "id": "vs15_13",
+      "category": "vs15_demotions",
+      "codepoints": [
+        "U+264A",
+        "U+FE0E"
+      ],
+      "cluster": "♊︎"
+    },
+    {
+      "id": "vs15_14",
+      "category": "vs15_demotions",
+      "codepoints": [
+        "U+264B",
+        "U+FE0E"
+      ],
+      "cluster": "♋︎"
+    },
+    {
+      "id": "vs15_15",
+      "category": "vs15_demotions",
+      "codepoints": [
+        "U+264C",
+        "U+FE0E"
+      ],
+      "cluster": "♌︎"
+    },
+    {
+      "id": "vs15_16",
+      "category": "vs15_demotions",
+      "codepoints": [
+        "U+264D",
+        "U+FE0E"
+      ],
+      "cluster": "♍︎"
+    },
+    {
+      "id": "vs15_17",
+      "category": "vs15_demotions",
+      "codepoints": [
+        "U+264E",
+        "U+FE0E"
+      ],
+      "cluster": "♎︎"
+    },
+    {
+      "id": "vs15_18",
+      "category": "vs15_demotions",
+      "codepoints": [
+        "U+264F",
+        "U+FE0E"
+      ],
+      "cluster": "♏︎"
+    },
+    {
+      "id": "vs15_19",
+      "category": "vs15_demotions",
+      "codepoints": [
+        "U+2650",
+        "U+FE0E"
+      ],
+      "cluster": "♐︎"
+    },
+    {
+      "id": "flag_0_US",
+      "category": "flag_pairs",
+      "codepoints": [
+        "U+1F1FA",
+        "U+1F1F8"
+      ],
+      "cluster": "🇺🇸"
+    },
+    {
+      "id": "flag_1_GB",
+      "category": "flag_pairs",
+      "codepoints": [
+        "U+1F1EC",
+        "U+1F1E7"
+      ],
+      "cluster": "🇬🇧"
+    },
+    {
+      "id": "flag_2_JP",
+      "category": "flag_pairs",
+      "codepoints": [
+        "U+1F1EF",
+        "U+1F1F5"
+      ],
+      "cluster": "🇯🇵"
+    },
+    {
+      "id": "flag_3_FR",
+      "category": "flag_pairs",
+      "codepoints": [
+        "U+1F1EB",
+        "U+1F1F7"
+      ],
+      "cluster": "🇫🇷"
+    },
+    {
+      "id": "flag_4_DE",
+      "category": "flag_pairs",
+      "codepoints": [
+        "U+1F1E9",
+        "U+1F1EA"
+      ],
+      "cluster": "🇩🇪"
+    },
+    {
+      "id": "flag_5_CA",
+      "category": "flag_pairs",
+      "codepoints": [
+        "U+1F1E8",
+        "U+1F1E6"
+      ],
+      "cluster": "🇨🇦"
+    },
+    {
+      "id": "flag_6_AU",
+      "category": "flag_pairs",
+      "codepoints": [
+        "U+1F1E6",
+        "U+1F1FA"
+      ],
+      "cluster": "🇦🇺"
+    },
+    {
+      "id": "flag_7_BR",
+      "category": "flag_pairs",
+      "codepoints": [
+        "U+1F1E7",
+        "U+1F1F7"
+      ],
+      "cluster": "🇧🇷"
+    },
+    {
+      "id": "flag_8_IN",
+      "category": "flag_pairs",
+      "codepoints": [
+        "U+1F1EE",
+        "U+1F1F3"
+      ],
+      "cluster": "🇮🇳"
+    },
+    {
+      "id": "flag_9_CN",
+      "category": "flag_pairs",
+      "codepoints": [
+        "U+1F1E8",
+        "U+1F1F3"
+      ],
+      "cluster": "🇨🇳"
+    },
+    {
+      "id": "flag_10_KR",
+      "category": "flag_pairs",
+      "codepoints": [
+        "U+1F1F0",
+        "U+1F1F7"
+      ],
+      "cluster": "🇰🇷"
+    },
+    {
+      "id": "flag_11_IT",
+      "category": "flag_pairs",
+      "codepoints": [
+        "U+1F1EE",
+        "U+1F1F9"
+      ],
+      "cluster": "🇮🇹"
+    },
+    {
+      "id": "flag_12_ES",
+      "category": "flag_pairs",
+      "codepoints": [
+        "U+1F1EA",
+        "U+1F1F8"
+      ],
+      "cluster": "🇪🇸"
+    },
+    {
+      "id": "flag_13_MX",
+      "category": "flag_pairs",
+      "codepoints": [
+        "U+1F1F2",
+        "U+1F1FD"
+      ],
+      "cluster": "🇲🇽"
+    },
+    {
+      "id": "flag_14_RU",
+      "category": "flag_pairs",
+      "codepoints": [
+        "U+1F1F7",
+        "U+1F1FA"
+      ],
+      "cluster": "🇷🇺"
+    },
+    {
+      "id": "flag_15_ZA",
+      "category": "flag_pairs",
+      "codepoints": [
+        "U+1F1FF",
+        "U+1F1E6"
+      ],
+      "cluster": "🇿🇦"
+    },
+    {
+      "id": "flag_16_EG",
+      "category": "flag_pairs",
+      "codepoints": [
+        "U+1F1EA",
+        "U+1F1EC"
+      ],
+      "cluster": "🇪🇬"
+    },
+    {
+      "id": "flag_17_NG",
+      "category": "flag_pairs",
+      "codepoints": [
+        "U+1F1F3",
+        "U+1F1EC"
+      ],
+      "cluster": "🇳🇬"
+    },
+    {
+      "id": "flag_18_SE",
+      "category": "flag_pairs",
+      "codepoints": [
+        "U+1F1F8",
+        "U+1F1EA"
+      ],
+      "cluster": "🇸🇪"
+    },
+    {
+      "id": "flag_19_CH",
+      "category": "flag_pairs",
+      "codepoints": [
+        "U+1F1E8",
+        "U+1F1ED"
+      ],
+      "cluster": "🇨🇭"
+    },
+    {
+      "id": "family_zwj_0",
+      "category": "family_zwj_sequences",
+      "codepoints": [
+        "U+1F468",
+        "U+200D",
+        "U+1F469",
+        "U+200D",
+        "U+1F467",
+        "U+200D",
+        "U+1F466"
+      ],
+      "cluster": "👨‍👩‍👧‍👦"
+    },
+    {
+      "id": "family_zwj_1",
+      "category": "family_zwj_sequences",
+      "codepoints": [
+        "U+1F469",
+        "U+200D",
+        "U+1F469",
+        "U+200D",
+        "U+1F467"
+      ],
+      "cluster": "👩‍👩‍👧"
+    },
+    {
+      "id": "family_zwj_2",
+      "category": "family_zwj_sequences",
+      "codepoints": [
+        "U+1F468",
+        "U+200D",
+        "U+1F468",
+        "U+200D",
+        "U+1F466",
+        "U+200D",
+        "U+1F466"
+      ],
+      "cluster": "👨‍👨‍👦‍👦"
+    },
+    {
+      "id": "family_zwj_3",
+      "category": "family_zwj_sequences",
+      "codepoints": [
+        "U+1F469",
+        "U+200D",
+        "U+1F467",
+        "U+200D",
+        "U+1F466"
+      ],
+      "cluster": "👩‍👧‍👦"
+    },
+    {
+      "id": "family_zwj_4",
+      "category": "family_zwj_sequences",
+      "codepoints": [
+        "U+1F468",
+        "U+200D",
+        "U+1F469",
+        "U+200D",
+        "U+1F466"
+      ],
+      "cluster": "👨‍👩‍👦"
+    },
+    {
+      "id": "family_zwj_5",
+      "category": "family_zwj_sequences",
+      "codepoints": [
+        "U+1F469",
+        "U+200D",
+        "U+2764",
+        "U+FE0F",
+        "U+200D",
+        "U+1F468"
+      ],
+      "cluster": "👩‍❤️‍👨"
+    },
+    {
+      "id": "family_zwj_6",
+      "category": "family_zwj_sequences",
+      "codepoints": [
+        "U+1F468",
+        "U+200D",
+        "U+2764",
+        "U+FE0F",
+        "U+200D",
+        "U+1F48B",
+        "U+200D",
+        "U+1F468"
+      ],
+      "cluster": "👨‍❤️‍💋‍👨"
+    },
+    {
+      "id": "family_zwj_7",
+      "category": "family_zwj_sequences",
+      "codepoints": [
+        "U+1F469",
+        "U+200D",
+        "U+2695",
+        "U+FE0F"
+      ],
+      "cluster": "👩‍⚕️"
+    },
+    {
+      "id": "family_zwj_8",
+      "category": "family_zwj_sequences",
+      "codepoints": [
+        "U+1F468",
+        "U+200D",
+        "U+1F3EB"
+      ],
+      "cluster": "👨‍🏫"
+    },
+    {
+      "id": "family_zwj_9",
+      "category": "family_zwj_sequences",
+      "codepoints": [
+        "U+1F469",
+        "U+200D",
+        "U+1F4BB"
+      ],
+      "cluster": "👩‍💻"
+    },
+    {
+      "id": "family_zwj_10",
+      "category": "family_zwj_sequences",
+      "codepoints": [
+        "U+1F9D1",
+        "U+200D",
+        "U+1F680"
+      ],
+      "cluster": "🧑‍🚀"
+    },
+    {
+      "id": "family_zwj_11",
+      "category": "family_zwj_sequences",
+      "codepoints": [
+        "U+1F3F3",
+        "U+FE0F",
+        "U+200D",
+        "U+1F308"
+      ],
+      "cluster": "🏳️‍🌈"
+    },
+    {
+      "id": "family_zwj_12",
+      "category": "family_zwj_sequences",
+      "codepoints": [
+        "U+1F3F3",
+        "U+FE0F",
+        "U+200D",
+        "U+26A7",
+        "U+FE0F"
+      ],
+      "cluster": "🏳️‍⚧️"
+    },
+    {
+      "id": "family_zwj_13",
+      "category": "family_zwj_sequences",
+      "codepoints": [
+        "U+1F3F4",
+        "U+200D",
+        "U+2620",
+        "U+FE0F"
+      ],
+      "cluster": "🏴‍☠️"
+    },
+    {
+      "id": "family_zwj_14",
+      "category": "family_zwj_sequences",
+      "codepoints": [
+        "U+1F441",
+        "U+FE0F",
+        "U+200D",
+        "U+1F5E8",
+        "U+FE0F"
+      ],
+      "cluster": "👁️‍🗨️"
+    },
+    {
+      "id": "family_zwj_15",
+      "category": "family_zwj_sequences",
+      "codepoints": [
+        "U+1F43B",
+        "U+200D",
+        "U+2744",
+        "U+FE0F"
+      ],
+      "cluster": "🐻‍❄️"
+    },
+    {
+      "id": "family_zwj_16",
+      "category": "family_zwj_sequences",
+      "codepoints": [
+        "U+1F62E",
+        "U+200D",
+        "U+1F4A8"
+      ],
+      "cluster": "😮‍💨"
+    },
+    {
+      "id": "family_zwj_17",
+      "category": "family_zwj_sequences",
+      "codepoints": [
+        "U+2764",
+        "U+FE0F",
+        "U+200D",
+        "U+1F525"
+      ],
+      "cluster": "❤️‍🔥"
+    },
+    {
+      "id": "fitz_0",
+      "category": "fitzpatrick_modifiers",
+      "codepoints": [
+        "U+1F44D",
+        "U+1F3FB"
+      ],
+      "cluster": "👍🏻"
+    },
+    {
+      "id": "fitz_1",
+      "category": "fitzpatrick_modifiers",
+      "codepoints": [
+        "U+1F44D",
+        "U+1F3FC"
+      ],
+      "cluster": "👍🏼"
+    },
+    {
+      "id": "fitz_2",
+      "category": "fitzpatrick_modifiers",
+      "codepoints": [
+        "U+1F44D",
+        "U+1F3FD"
+      ],
+      "cluster": "👍🏽"
+    },
+    {
+      "id": "fitz_3",
+      "category": "fitzpatrick_modifiers",
+      "codepoints": [
+        "U+1F44D",
+        "U+1F3FE"
+      ],
+      "cluster": "👍🏾"
+    },
+    {
+      "id": "fitz_4",
+      "category": "fitzpatrick_modifiers",
+      "codepoints": [
+        "U+1F44D",
+        "U+1F3FF"
+      ],
+      "cluster": "👍🏿"
+    },
+    {
+      "id": "fitz_5",
+      "category": "fitzpatrick_modifiers",
+      "codepoints": [
+        "U+1F44B",
+        "U+1F3FB"
+      ],
+      "cluster": "👋🏻"
+    },
+    {
+      "id": "fitz_6",
+      "category": "fitzpatrick_modifiers",
+      "codepoints": [
+        "U+1F44B",
+        "U+1F3FD"
+      ],
+      "cluster": "👋🏽"
+    },
+    {
+      "id": "fitz_7",
+      "category": "fitzpatrick_modifiers",
+      "codepoints": [
+        "U+1F91D",
+        "U+1F3FD"
+      ],
+      "cluster": "🤝🏽"
+    },
+    {
+      "id": "fitz_8",
+      "category": "fitzpatrick_modifiers",
+      "codepoints": [
+        "U+1F44F",
+        "U+1F3FB"
+      ],
+      "cluster": "👏🏻"
+    },
+    {
+      "id": "fitz_9",
+      "category": "fitzpatrick_modifiers",
+      "codepoints": [
+        "U+1F44F",
+        "U+1F3FF"
+      ],
+      "cluster": "👏🏿"
+    },
+    {
+      "id": "fitz_10",
+      "category": "fitzpatrick_modifiers",
+      "codepoints": [
+        "U+1F4AA",
+        "U+1F3FD"
+      ],
+      "cluster": "💪🏽"
+    },
+    {
+      "id": "fitz_11",
+      "category": "fitzpatrick_modifiers",
+      "codepoints": [
+        "U+1F64F",
+        "U+1F3FB"
+      ],
+      "cluster": "🙏🏻"
+    },
+    {
+      "id": "fitz_12",
+      "category": "fitzpatrick_modifiers",
+      "codepoints": [
+        "U+1F468",
+        "U+1F3FD",
+        "U+200D",
+        "U+1F4BB"
+      ],
+      "cluster": "👨🏽‍💻"
+    },
+    {
+      "id": "fitz_13",
+      "category": "fitzpatrick_modifiers",
+      "codepoints": [
+        "U+1F469",
+        "U+1F3FE",
+        "U+200D",
+        "U+1F3A4"
+      ],
+      "cluster": "👩🏾‍🎤"
+    },
+    {
+      "id": "fitz_14",
+      "category": "fitzpatrick_modifiers",
+      "codepoints": [
+        "U+1F9D1",
+        "U+1F3FB",
+        "U+200D",
+        "U+1F680"
+      ],
+      "cluster": "🧑🏻‍🚀"
+    },
+    {
+      "id": "fitz_15",
+      "category": "fitzpatrick_modifiers",
+      "codepoints": [
+        "U+1F926",
+        "U+1F3FD",
+        "U+200D",
+        "U+2642",
+        "U+FE0F"
+      ],
+      "cluster": "🤦🏽‍♂️"
+    },
+    {
+      "id": "fitz_16",
+      "category": "fitzpatrick_modifiers",
+      "codepoints": [
+        "U+1F937",
+        "U+1F3FB",
+        "U+200D",
+        "U+2640",
+        "U+FE0F"
+      ],
+      "cluster": "🤷🏻‍♀️"
+    },
+    {
+      "id": "ambiguous_0",
+      "category": "ambiguous_width_chars",
+      "codepoints": [
+        "U+00D7"
+      ],
+      "cluster": "×"
+    },
+    {
+      "id": "ambiguous_1",
+      "category": "ambiguous_width_chars",
+      "codepoints": [
+        "U+00B0"
+      ],
+      "cluster": "°"
+    },
+    {
+      "id": "ambiguous_2",
+      "category": "ambiguous_width_chars",
+      "codepoints": [
+        "U+00A7"
+      ],
+      "cluster": "§"
+    },
+    {
+      "id": "ambiguous_3",
+      "category": "ambiguous_width_chars",
+      "codepoints": [
+        "U+00B1"
+      ],
+      "cluster": "±"
+    },
+    {
+      "id": "ambiguous_4",
+      "category": "ambiguous_width_chars",
+      "codepoints": [
+        "U+00F7"
+      ],
+      "cluster": "÷"
+    },
+    {
+      "id": "ambiguous_5",
+      "category": "ambiguous_width_chars",
+      "codepoints": [
+        "U+00B5"
+      ],
+      "cluster": "µ"
+    },
+    {
+      "id": "ambiguous_6",
+      "category": "ambiguous_width_chars",
+      "codepoints": [
+        "U+00B6"
+      ],
+      "cluster": "¶"
+    },
+    {
+      "id": "ambiguous_7",
+      "category": "ambiguous_width_chars",
+      "codepoints": [
+        "U+00B7"
+      ],
+      "cluster": "·"
+    },
+    {
+      "id": "ambiguous_8",
+      "category": "ambiguous_width_chars",
+      "codepoints": [
+        "U+2030"
+      ],
+      "cluster": "‰"
+    },
+    {
+      "id": "ambiguous_9",
+      "category": "ambiguous_width_chars",
+      "codepoints": [
+        "U+2116"
+      ],
+      "cluster": "№"
+    },
+    {
+      "id": "ambiguous_10",
+      "category": "ambiguous_width_chars",
+      "codepoints": [
+        "U+03A9"
+      ],
+      "cluster": "Ω"
+    },
+    {
+      "id": "ambiguous_11",
+      "category": "ambiguous_width_chars",
+      "codepoints": [
+        "U+03B1"
+      ],
+      "cluster": "α"
+    },
+    {
+      "id": "ambiguous_12",
+      "category": "ambiguous_width_chars",
+      "codepoints": [
+        "U+03B2"
+      ],
+      "cluster": "β"
+    },
+    {
+      "id": "ambiguous_13",
+      "category": "ambiguous_width_chars",
+      "codepoints": [
+        "U+2190"
+      ],
+      "cluster": "←"
+    }
+  ]
+}

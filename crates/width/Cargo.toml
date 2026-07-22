@@ -1,0 +1,54 @@
+[package]
+name = "width"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Ghostty-correct cell-width measurement: grapheme clusters in, cell counts out"
+
+[dependencies]
+unicode-segmentation = "1"
+unicode-width = "0.2"
+# UCD Emoji/Emoji_Component property lookup (is a codepoint recognized as
+# emoji-capable, a ZWJ, a regional indicator, a variation selector...) —
+# the correction layer's classification step, not a guess from a
+# hand-maintained codepoint list.
+unicode-properties = { version = "0.1.4", features = ["emoji"] }
+# Only used by the corpus-measurement tool (src/bin/measure_corpus.rs),
+# never by the engine itself — optional and feature-gated so a normal
+# `width` build (what P4's layout crate depends on) never compiles or
+# links the probe/PTY machinery.
+probe = { path = "../probe", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+
+[dev-dependencies]
+proptest = "1"
+# Unconditionally available to tests (corpus_agreement.rs reads the
+# committed corpus JSON) regardless of whether `corpus-tool` is enabled.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[features]
+# Builds/tests the live-Ghostty corpus tool. Off by default so the engine
+# crate stays a pure, dependency-light library; enabled explicitly (and by
+# `--all-features`, which CI's clippy job uses) to build or run the tool.
+corpus-tool = ["dep:probe", "dep:serde", "dep:serde_json"]
+
+[[bin]]
+name = "measure_corpus"
+path = "src/bin/measure_corpus.rs"
+required-features = ["corpus-tool"]
+
+[[test]]
+name = "live_ghostty_corpus"
+path = "tests/live_ghostty_corpus.rs"
+required-features = ["corpus-tool"]
+
+[[test]]
+name = "corpus_agreement"
+path = "tests/corpus_agreement.rs"
+
+[[test]]
+name = "property_display_width"
+path = "tests/property_display_width.rs"
