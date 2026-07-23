@@ -1,0 +1,13 @@
+Column │ Column │ Column
+A      │   B    │      C
+───────┼────────┼───────
+left   │ center │  right
+a | b  │   em   │   code
+short  │        │       
+row    │        │       
+
+Narrow:
+
+x
+─
+1

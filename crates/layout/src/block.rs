@@ -1,0 +1,300 @@
+//! The block walker: containers push prefix segments (gutter bars, list
+//! markers), leaves emit wrapped/clipped lines through [`Ctx`].
+//!
+//! Prefix discipline: every content line = composed prefix runs + content
+//! runs. The prefix is capped so at least `min(8, width)` content columns
+//! always remain (the nested-indent clamp) and a composed line never
+//! exceeds the layout width.
+
+use ast::{AlertKind, Block, BlockKind, Document, ListKind};
+use width::WidthEngine;
+
+use crate::inline::{self, Piece};
+use crate::{AlertTone, CellSize, IntrinsicSizer, Line, Reserved, Run, Semantic, StyleId};
+
+/// Minimum content columns the prefix may never consume (clamped to the
+/// layout width itself at pathological widths).
+const MIN_CONTENT_COLS: u16 = 8;
+
+/// Gutter bar for blockquotes and alerts.
+const QUOTE_BAR: &str = "\u{2502} "; // "│ "
+
+struct Seg {
+    /// Emitted on the first line after the segment is pushed (the marker).
+    first: String,
+    /// Emitted on every later line (the continuation indent).
+    rest: String,
+    style: Semantic,
+    used: bool,
+}
+
+pub(crate) struct Ctx<'a> {
+    pub doc: &'a Document,
+    pub engine: &'a WidthEngine,
+    pub sizer: &'a dyn IntrinsicSizer,
+    width: u16,
+    lines: Vec<Line>,
+    prefix: Vec<Seg>,
+}
+
+impl<'a> Ctx<'a> {
+    pub fn new(
+        doc: &'a Document,
+        engine: &'a WidthEngine,
+        sizer: &'a dyn IntrinsicSizer,
+        width: u16,
+    ) -> Self {
+        Ctx {
+            doc,
+            engine,
+            sizer,
+            width,
+            lines: Vec::new(),
+            prefix: Vec::new(),
+        }
+    }
+
+    pub fn into_lines(self) -> Vec<Line> {
+        self.lines
+    }
+
+    /// Push a container prefix; `first` shows on the next emitted line,
+    /// `rest` (same display width by construction) on lines after that.
+    fn push_prefix(&mut self, first: String, rest: String, style: Semantic) {
+        self.prefix.push(Seg {
+            first,
+            rest,
+            style,
+            used: false,
+        });
+    }
+
+    fn pop_prefix(&mut self) {
+        self.prefix.pop();
+    }
+
+    /// The widest prefix layout will actually honor.
+    fn prefix_budget(&self) -> u16 {
+        self.width - MIN_CONTENT_COLS.min(self.width)
+    }
+
+    /// Columns available to content after the (possibly clamped) prefix.
+    pub fn content_width(&self) -> u16 {
+        let pw: u16 = self.prefix.iter().fold(0u16, |acc, s| {
+            acc.saturating_add(inline::cells(self.engine, &s.rest))
+        });
+        self.width - pw.min(self.prefix_budget())
+    }
+
+    /// Compose the current prefix as runs (consuming each segment's `first`
+    /// form), clamped to the prefix budget.
+    fn prefix_runs(&mut self) -> Vec<Run> {
+        let mut runs: Vec<Run> = Vec::new();
+        for seg in &mut self.prefix {
+            let text = if seg.used { &seg.rest } else { &seg.first };
+            seg.used = true;
+            let w = self.engine.display_width(text) as u16;
+            inline::append(&mut runs, text, StyleId::Semantic(seg.style), w);
+        }
+        inline::clip_runs(runs, self.prefix_budget(), false, self.engine)
+    }
+
+    /// Emit one content line under the current prefix.
+    pub(crate) fn emit(&mut self, content: Vec<Run>) {
+        let mut runs = self.prefix_runs();
+        runs.extend(content);
+        self.lines.push(Line::Runs(runs));
+    }
+
+    /// Vertical spacing: a prefix-only line.
+    fn blank_line(&mut self) {
+        self.emit(Vec::new());
+    }
+
+    /// Emit a reserved media box scaled to fit the current content width,
+    /// one `Line::Reserved` per row. Reserved lines carry no prefix runs
+    /// (the pinned `Line` shape has no room for them); P6 paints the box
+    /// over the whole row.
+    fn emit_box(&mut self, node_id: ast::NodeId, size: CellSize) {
+        let cw = self.content_width().max(1);
+        let (cols, rows) = if size.cols <= cw {
+            (size.cols.max(1), size.rows.max(1))
+        } else {
+            // Scale to fit, preserving aspect ratio (ceil, at least 1 row).
+            let rows = (u32::from(size.rows.max(1)) * u32::from(cw)).div_ceil(u32::from(size.cols));
+            (cw, rows.clamp(1, u32::from(u16::MAX)) as u16)
+        };
+        let reserved = Reserved {
+            node_id,
+            cols,
+            rows,
+        };
+        for _ in 0..rows {
+            self.lines.push(Line::Reserved(reserved));
+        }
+    }
+
+    /// Wrap `pieces` (already flattened) under the current prefix.
+    fn emit_pieces(&mut self, pieces: Vec<Piece>) {
+        if pieces.is_empty() {
+            // An empty block (e.g. `# ` heading) still occupies one line.
+            self.emit(Vec::new());
+            return;
+        }
+        for piece in pieces {
+            match piece {
+                Piece::Runs(runs) => self.emit(runs),
+                Piece::Box(node, size) => self.emit_box(node, size),
+            }
+        }
+    }
+
+    /// Flatten + wrap an inline sequence under `base` style and emit it.
+    fn flow(&mut self, inlines: &[ast::Inline], base: Semantic) {
+        let atoms = inline::flatten(inlines, base, self.doc, self.sizer, true);
+        let pieces = inline::wrap(atoms, self.content_width(), self.engine);
+        self.emit_pieces(pieces);
+    }
+
+    /// Emit literal text line by line: clipped with an indicator, never
+    /// wrapped (code blocks, HTML blocks, frontmatter). Tabs expand to
+    /// four spaces (the width engine measures cells, not control bytes).
+    fn literal_block(&mut self, literal: &str, style: Semantic) {
+        let cw = self.content_width();
+        let mut src_lines: Vec<&str> = literal.split('\n').collect();
+        if src_lines.last() == Some(&"") {
+            src_lines.pop(); // the conventional trailing newline
+        }
+        for src in src_lines {
+            let text = if src.contains('\t') {
+                src.replace('\t', "    ")
+            } else {
+                src.to_string()
+            };
+            let w = inline::cells(self.engine, &text);
+            let runs = vec![Run {
+                text,
+                style_id: StyleId::Semantic(style),
+                width: w,
+            }];
+            let runs = inline::clip_runs(runs, cw, true, self.engine);
+            self.emit(runs);
+        }
+    }
+}
+
+/// Walk sibling blocks; with `separate`, one blank line goes between them.
+pub(crate) fn walk_blocks(ctx: &mut Ctx<'_>, blocks: &[Block], separate: bool) {
+    for (i, block) in blocks.iter().enumerate() {
+        if i > 0 && separate {
+            ctx.blank_line();
+        }
+        walk_block(ctx, block);
+    }
+}
+
+fn walk_block(ctx: &mut Ctx<'_>, block: &Block) {
+    match &block.kind {
+        BlockKind::Paragraph { children } => ctx.flow(children, Semantic::Text),
+        BlockKind::Heading { level, children } => ctx.flow(children, Semantic::Heading(*level)),
+        BlockKind::ThematicBreak => {
+            let cw = ctx.content_width();
+            let dash = "\u{2500}"; // ─
+            let dw = ctx.engine.cluster_width(dash).max(1);
+            let text = dash.repeat(usize::from(cw / dw));
+            let w = ctx.engine.display_width(&text) as u16;
+            ctx.emit(vec![Run {
+                text,
+                style_id: StyleId::Semantic(Semantic::Rule),
+                width: w,
+            }]);
+        }
+        BlockKind::BlockQuote { children } => {
+            ctx.push_prefix(
+                QUOTE_BAR.into(),
+                QUOTE_BAR.into(),
+                Semantic::BlockquoteMarker,
+            );
+            walk_blocks(ctx, children, true);
+            ctx.pop_prefix();
+        }
+        BlockKind::Alert { kind, children } => {
+            ctx.push_prefix(
+                QUOTE_BAR.into(),
+                QUOTE_BAR.into(),
+                Semantic::BlockquoteMarker,
+            );
+            let (label, tone) = alert_label(*kind);
+            let w = ctx.engine.display_width(label) as u16;
+            ctx.emit(vec![Run {
+                text: label.to_string(),
+                style_id: StyleId::Semantic(Semantic::AlertTitle(tone)),
+                width: w,
+            }]);
+            if !children.is_empty() {
+                ctx.blank_line();
+                walk_blocks(ctx, children, true);
+            }
+            ctx.pop_prefix();
+        }
+        BlockKind::List { kind, tight, items } => {
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 && !tight {
+                    ctx.blank_line();
+                }
+                walk_list_item(ctx, kind, i, item, *tight);
+            }
+        }
+        // A ListItem outside a List cannot come out of the parser; lay its
+        // children out rather than silently dropping content if it ever does.
+        BlockKind::ListItem { children, .. } => walk_blocks(ctx, children, true),
+        BlockKind::CodeBlock { literal, .. } => ctx.literal_block(literal, Semantic::CodeBlock),
+        BlockKind::HtmlBlock { literal } => ctx.literal_block(literal, Semantic::Html),
+        BlockKind::FrontMatter { literal } => ctx.literal_block(literal, Semantic::FrontMatter),
+        BlockKind::Table { alignments, rows } => crate::table::layout_table(ctx, alignments, rows),
+        // Rows/cells only occur under Table and are handled there.
+        BlockKind::TableRow { .. } | BlockKind::TableCell { .. } => {}
+        BlockKind::FootnoteDefinition { label, children } => {
+            let marker = format!("[^{label}] ");
+            let mw = ctx.engine.display_width(&marker);
+            ctx.push_prefix(marker, " ".repeat(mw), Semantic::FootnoteLabel);
+            walk_blocks(ctx, children, true);
+            ctx.pop_prefix();
+        }
+    }
+}
+
+fn walk_list_item(ctx: &mut Ctx<'_>, kind: &ListKind, index: usize, item: &Block, tight: bool) {
+    let BlockKind::ListItem { checked, children } = &item.kind else {
+        // The parser guarantees list children are items; degrade gracefully.
+        walk_block(ctx, item);
+        return;
+    };
+    let (marker, style) = match checked {
+        Some(true) => ("[x] ".to_string(), Semantic::TaskMarker),
+        Some(false) => ("[ ] ".to_string(), Semantic::TaskMarker),
+        None => match kind {
+            ListKind::Bullet(_) => ("\u{2022} ".to_string(), Semantic::ListMarker), // "• "
+            ListKind::Ordered { start, delim } => (
+                format!("{}{delim} ", start.saturating_add(index as u64)),
+                Semantic::ListMarker,
+            ),
+        },
+    };
+    let mw = ctx.engine.display_width(&marker);
+    ctx.push_prefix(marker, " ".repeat(mw), style);
+    // CommonMark tightness: blocks inside a tight item (e.g. a nested list
+    // right under its paragraph) sit flush; loose items keep blank rows.
+    walk_blocks(ctx, children, !tight);
+    ctx.pop_prefix();
+}
+
+fn alert_label(kind: AlertKind) -> (&'static str, AlertTone) {
+    match kind {
+        AlertKind::Note => ("[!NOTE]", AlertTone::Note),
+        AlertKind::Tip => ("[!TIP]", AlertTone::Tip),
+        AlertKind::Important => ("[!IMPORTANT]", AlertTone::Important),
+        AlertKind::Warning => ("[!WARNING]", AlertTone::Warning),
+        AlertKind::Caution => ("[!CAUTION]", AlertTone::Caution),
+    }
+}

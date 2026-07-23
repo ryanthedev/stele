@@ -1,0 +1,492 @@
+//! Edge-case and behavior tests past the DW floor: every named edge case
+//! from the phase spec, plus seams the implementation surfaced (sizer
+//! integration, style emission, range clamping, list mechanics).
+
+use ast::{Document, InlineKind, NodeId, NodeRef};
+use layout::{
+    CellSize, IntrinsicSizer, LayoutConfig, LayoutTree, Line, NullSizer, Run, Semantic, StyleId,
+    layout,
+};
+use width::{WidthConfig, WidthEngine};
+
+fn engine() -> WidthEngine {
+    WidthEngine::new(WidthConfig::default())
+}
+
+fn lay(doc: &Document, width: u16) -> LayoutTree {
+    layout(doc, width, &LayoutConfig::default(), &engine(), &NullSizer)
+}
+
+fn all_runs(tree: &LayoutTree) -> Vec<&Run> {
+    tree.lines(0..tree.line_count())
+        .filter_map(|l| match l {
+            Line::Runs(runs) => Some(runs.iter()),
+            Line::Reserved(_) => None,
+        })
+        .flatten()
+        .collect()
+}
+
+fn text_of(tree: &LayoutTree) -> Vec<String> {
+    tree.lines(0..tree.line_count())
+        .map(|l| match l {
+            Line::Runs(runs) => runs.iter().map(|r| r.text.as_str()).collect::<String>(),
+            Line::Reserved(r) => format!("<reserved {}x{}>", r.cols, r.rows),
+        })
+        .collect()
+}
+
+fn assert_bound(tree: &LayoutTree) {
+    for (i, line) in tree.lines(0..tree.line_count()).enumerate() {
+        assert!(
+            line.width() <= tree.width(),
+            "line {i} width {} exceeds bound {}",
+            line.width(),
+            tree.width()
+        );
+    }
+}
+
+/// Sizes every image/math node at one fixed natural size.
+struct FixedSizer(CellSize);
+
+impl IntrinsicSizer for FixedSizer {
+    fn size(&self, node: NodeId, doc: &Document) -> Option<CellSize> {
+        match doc.node(node) {
+            Some(NodeRef::Inline(i))
+                if matches!(i.kind, InlineKind::Image { .. } | InlineKind::Math { .. }) =>
+            {
+                Some(self.0)
+            }
+            _ => None,
+        }
+    }
+}
+
+// ---- named edge cases ------------------------------------------------
+
+#[test]
+fn test_empty_document_yields_empty_tree() {
+    let doc = Document::parse("");
+    let tree = lay(&doc, 80);
+    assert_eq!(tree.line_count(), 0);
+    assert!(tree.is_empty());
+    assert_eq!(tree.lines(0..10).count(), 0, "range past end must clamp");
+}
+
+#[test]
+fn test_unbreakable_word_break_anywhere_fallback() {
+    let word = "a".repeat(60);
+    let doc = Document::parse(&word);
+    let tree = lay(&doc, 24);
+    assert_bound(&tree);
+    assert!(tree.line_count() > 1, "60-cell word must span lines at 24");
+    let joined: String = text_of(&tree).join("");
+    assert_eq!(joined, word, "break-anywhere must not lose characters");
+}
+
+#[test]
+fn test_code_block_clips_never_wraps() {
+    let long = "x".repeat(90);
+    let src = format!("```\n{long}\nshort\n```\n");
+    let doc = Document::parse(&src);
+    let tree = lay(&doc, 24);
+    assert_bound(&tree);
+    assert_eq!(
+        tree.line_count(),
+        2,
+        "two source lines must stay two layout lines (clip, no wrap)"
+    );
+    let lines = text_of(&tree);
+    assert!(
+        lines[0].ends_with('\u{2026}'),
+        "clipped code line carries the indicator: {:?}",
+        lines[0]
+    );
+    assert_eq!(lines[1], "short");
+    let has_indicator_style = all_runs(&tree)
+        .iter()
+        .any(|r| r.style_id == StyleId::Semantic(Semantic::OverflowIndicator));
+    assert!(has_indicator_style);
+}
+
+#[test]
+fn test_nested_list_indent_clamped_leaves_content_room() {
+    let mut src = String::new();
+    for depth in 0..15 {
+        src.push_str(&"  ".repeat(depth));
+        src.push_str("- deepitem\n");
+    }
+    let doc = Document::parse(&src);
+    let tree = lay(&doc, 24);
+    assert_bound(&tree);
+    // The deepest item's text must still be present (possibly broken),
+    // not swallowed by indent.
+    let joined: String = text_of(&tree).join("\n");
+    assert!(
+        joined.matches("deepitem").count() >= 10,
+        "deep items lost to indent:\n{joined}"
+    );
+}
+
+#[test]
+fn test_image_scaled_to_fit_preserving_aspect() {
+    let doc = Document::parse("![diagram](d.png)\n");
+    let sizer = FixedSizer(CellSize {
+        cols: 200,
+        rows: 50,
+    });
+    let tree = layout(&doc, 100, &LayoutConfig::default(), &engine(), &sizer);
+    assert_bound(&tree);
+    let reserved: Vec<_> = tree
+        .lines(0..tree.line_count())
+        .filter_map(|l| match l {
+            Line::Reserved(r) => Some(*r),
+            _ => None,
+        })
+        .collect();
+    assert!(!reserved.is_empty(), "sized image must reserve lines");
+    let r = reserved[0];
+    assert_eq!(r.cols, 100, "wider-than-viewport image scales to width");
+    assert_eq!(r.rows, 25, "aspect ratio preserved (200x50 -> 100x25)");
+    assert_eq!(
+        reserved.len(),
+        usize::from(r.rows),
+        "one Reserved line per row"
+    );
+    assert!(
+        reserved.iter().all(|x| x == &r),
+        "all rows carry the identical Reserved value"
+    );
+}
+
+#[test]
+fn test_table_overflow_ladder_rung1_wrap_in_cell() {
+    // Natural widths overflow 40 but min widths fit: cells wrap, no
+    // clipping, bound held.
+    let src = "| One | Two |\n| --- | --- |\n| a long sentence that wraps | another long sentence here |\n";
+    let doc = Document::parse(src);
+    let tree = lay(&doc, 40);
+    assert_bound(&tree);
+    let body_rows = tree.line_count() - 2; // header line + rule
+    assert!(body_rows > 1, "the row must wrap onto multiple lines");
+    assert!(
+        !all_runs(&tree)
+            .iter()
+            .any(|r| r.style_id == StyleId::Semantic(Semantic::OverflowIndicator)),
+        "rung 1 needs no clipping"
+    );
+}
+
+#[test]
+fn test_table_overflow_ladder_rung2_per_column_floors() {
+    // Min-content (unbreakable words) exceeds the width: columns squeeze
+    // below min, words break anywhere, still no clipping.
+    let src = "| A | B |\n| - | - |\n| aaaaaaaaaaaaaaaaaaaaaaaa | bbbbbbbbbbbbbbbbbbbbbbbb |\n";
+    let doc = Document::parse(src);
+    let tree = lay(&doc, 24);
+    assert_bound(&tree);
+    assert!(
+        !all_runs(&tree)
+            .iter()
+            .any(|r| r.style_id == StyleId::Semantic(Semantic::OverflowIndicator)),
+        "rung 2 fits without clipping"
+    );
+    // Both words survive intact across broken lines.
+    let joined: String = text_of(&tree).join("");
+    assert_eq!(joined.matches('a').count(), 24, "the 24 a's survive intact");
+    assert_eq!(joined.matches('b').count(), 24);
+}
+
+#[test]
+fn test_table_overflow_ladder_rung3_clip_with_indicator() {
+    let cols = 15;
+    let header: String = (0..cols).map(|i| format!("| h{i} ")).collect::<String>() + "|\n";
+    let rule: String = "| - ".repeat(cols) + "|\n";
+    let row: String = "| x ".repeat(cols) + "|\n";
+    let doc = Document::parse(&(header + &rule + &row));
+    let tree = lay(&doc, 24);
+    assert_bound(&tree);
+    assert!(
+        all_runs(&tree)
+            .iter()
+            .any(|r| r.style_id == StyleId::Semantic(Semantic::OverflowIndicator)),
+        "rung 3 must clip with an indicator"
+    );
+}
+
+// ---- sizer seam ------------------------------------------------------
+
+#[test]
+fn test_null_sizer_lays_out_image_as_alt_text() {
+    let doc = Document::parse("![friendly alt text](image.png)\n");
+    let tree = lay(&doc, 80);
+    let joined = text_of(&tree).join("");
+    assert!(joined.contains("friendly alt text"), "{joined:?}");
+    assert!(
+        all_runs(&tree)
+            .iter()
+            .any(|r| r.style_id == StyleId::Semantic(Semantic::ImageAlt)),
+        "alt text carries the ImageAlt role"
+    );
+    assert!(
+        !tree
+            .lines(0..tree.line_count())
+            .any(|l| matches!(l, Line::Reserved(_))),
+        "NullSizer must never reserve"
+    );
+}
+
+#[test]
+fn test_null_sizer_lays_out_math_as_tex_source() {
+    let doc = Document::parse("Euler: $e^{i\\pi}+1=0$\n");
+    let tree = lay(&doc, 80);
+    let joined = text_of(&tree).join("");
+    assert!(joined.contains("e^{i\\pi}+1=0"), "{joined:?}");
+    assert!(
+        all_runs(&tree)
+            .iter()
+            .any(|r| r.style_id == StyleId::Semantic(Semantic::MathTex))
+    );
+}
+
+#[test]
+fn test_sizer_receives_resolvable_node_id() {
+    // The NodeId handed to the sizer must resolve, via Document::node, to
+    // the very image node (the P6 contract).
+    struct Probe;
+    impl IntrinsicSizer for Probe {
+        fn size(&self, node: NodeId, doc: &Document) -> Option<CellSize> {
+            match doc.node(node) {
+                Some(NodeRef::Inline(i)) => match &i.kind {
+                    InlineKind::Image { dest, .. } => {
+                        assert_eq!(dest, "p6/target.png");
+                        Some(CellSize { cols: 10, rows: 2 })
+                    }
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+    }
+    let doc = Document::parse("![x](p6/target.png)\n");
+    let tree = layout(&doc, 80, &LayoutConfig::default(), &engine(), &Probe);
+    let reserved: Vec<_> = tree
+        .lines(0..tree.line_count())
+        .filter_map(|l| match l {
+            Line::Reserved(r) => Some(*r),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reserved.len(), 2);
+    // And the emitted Reserved carries that same id.
+    match doc.node(reserved[0].node_id) {
+        Some(NodeRef::Inline(i)) => {
+            assert!(matches!(&i.kind, InlineKind::Image { dest, .. } if dest == "p6/target.png"))
+        }
+        other => panic!("Reserved node_id resolved to {other:?}"),
+    }
+}
+
+// ---- style emission --------------------------------------------------
+
+#[test]
+fn test_layout_emits_only_semantic_style_ids() {
+    // The Capture range belongs to P7; layout must never mint one.
+    let src = "# h *em* **st** `code` [l](u) ~~s~~\n\n> q\n\n- i\n\n| a |\n| - |\n| b |\n";
+    let doc = Document::parse(src);
+    for width in [24u16, 100] {
+        let tree = lay(&doc, width);
+        for run in all_runs(&tree) {
+            assert!(
+                matches!(run.style_id, StyleId::Semantic(_)),
+                "layout emitted {:?}",
+                run.style_id
+            );
+        }
+    }
+}
+
+#[test]
+fn test_semantic_roles_reach_runs() {
+    let doc = Document::parse("## Head *emph* **strong** `code` [link](u)\n");
+    let tree = lay(&doc, 100);
+    let styles: Vec<StyleId> = all_runs(&tree).iter().map(|r| r.style_id).collect();
+    for want in [
+        Semantic::Heading(2),
+        Semantic::Emph,
+        Semantic::Strong,
+        Semantic::CodeInline,
+        Semantic::Link,
+    ] {
+        assert!(
+            styles.contains(&StyleId::Semantic(want)),
+            "missing role {want:?} in {styles:?}"
+        );
+    }
+}
+
+#[test]
+fn test_run_widths_match_engine_measurement() {
+    let doc = Document::parse("plain 中文 and 👍 emoji\n");
+    let tree = lay(&doc, 100);
+    let engine = engine();
+    for run in all_runs(&tree) {
+        assert_eq!(
+            usize::from(run.width),
+            engine.display_width(&run.text),
+            "run width disagrees with engine for {:?}",
+            run.text
+        );
+    }
+}
+
+// ---- structure -------------------------------------------------------
+
+#[test]
+fn test_width_clamps_to_config_range() {
+    let doc = Document::parse("hello\n");
+    assert_eq!(lay(&doc, 5).width(), 24, "below min clamps up");
+    assert_eq!(lay(&doc, 500).width(), 100, "above max clamps down");
+    assert_eq!(lay(&doc, 60).width(), 60, "in range passes through");
+}
+
+#[test]
+fn test_lines_range_clamps_not_panics() {
+    let doc = Document::parse("a\n\nb\n\nc\n");
+    let tree = lay(&doc, 80);
+    let n = tree.line_count();
+    assert_eq!(tree.lines(0..usize::MAX).count(), n);
+    assert_eq!(tree.lines(n + 5..n + 9).count(), 0);
+    #[allow(clippy::reversed_empty_ranges)]
+    let inverted = tree.lines(3..1).count();
+    assert_eq!(inverted, 0);
+}
+
+#[test]
+fn test_tight_vs_loose_list_spacing() {
+    let tight = lay(&Document::parse("- a\n- b\n- c\n"), 80);
+    assert_eq!(tight.line_count(), 3, "tight list: no blank rows");
+    let loose = lay(&Document::parse("- a\n\n- b\n\n- c\n"), 80);
+    assert_eq!(loose.line_count(), 5, "loose list: blank row between items");
+}
+
+#[test]
+fn test_ordered_list_start_and_delimiter() {
+    let doc = Document::parse("5) five\n6) six\n");
+    let lines = text_of(&lay(&doc, 80));
+    assert_eq!(lines, vec!["5) five", "6) six"]);
+}
+
+#[test]
+fn test_task_list_markers() {
+    let doc = Document::parse("- [x] done\n- [ ] todo\n");
+    let tree = lay(&doc, 80);
+    let lines = text_of(&tree);
+    assert_eq!(lines, vec!["[x] done", "[ ] todo"]);
+    assert!(
+        all_runs(&tree)
+            .iter()
+            .any(|r| r.style_id == StyleId::Semantic(Semantic::TaskMarker))
+    );
+}
+
+#[test]
+fn test_hard_break_forces_new_line() {
+    let doc = Document::parse("alpha  \nbeta\n");
+    let lines = text_of(&lay(&doc, 80));
+    assert_eq!(lines, vec!["alpha", "beta"]);
+}
+
+#[test]
+fn test_nested_blockquote_prefix_stacks() {
+    let doc = Document::parse("> > inner\n");
+    let lines = text_of(&lay(&doc, 80));
+    assert_eq!(lines, vec!["\u{2502} \u{2502} inner"]);
+}
+
+#[test]
+fn test_table_right_alignment_pads_left() {
+    let doc = Document::parse("| Num |\n| --: |\n| 7 |\n");
+    let lines = text_of(&lay(&doc, 80));
+    // Column width = max("Num", "7") = 3; the body cell is right-aligned.
+    assert_eq!(lines[2], "  7");
+}
+
+#[test]
+fn test_thematic_break_spans_width_exactly() {
+    let doc = Document::parse("---\n");
+    let tree = lay(&doc, 40);
+    assert_eq!(tree.line_count(), 1);
+    let line = tree.lines(0..1).next().unwrap();
+    assert_eq!(line.width(), 40, "rule fills the content width");
+}
+
+#[test]
+fn test_reflow_at_different_widths_from_same_doc() {
+    // Beyond DW-4.4's fixture sweep: several widths from one retained doc,
+    // each equal to a fresh parse+layout.
+    let src = "# T\n\nSome paragraph that wraps at narrow widths only.\n\n- one\n- two\n";
+    let doc = Document::parse(src);
+    for w in [24u16, 37, 61, 100] {
+        let reflow = lay(&doc, w);
+        let fresh = lay(&Document::parse(src), w);
+        assert_eq!(reflow, fresh, "width {w}");
+    }
+}
+
+// --- Phase 4 gate-review regressions: u16 width-arithmetic overflow ---
+// A token wider than u16::MAX cells must not wrap around a fit check. These
+// assert against the engine-remeasured painted text, NOT Run.width, so a run
+// that lies about its own width cannot make the assertion pass.
+
+/// Real painted width of every line, measured independently of `Run.width`.
+fn assert_bound_remeasured(tree: &LayoutTree) {
+    let eng = engine();
+    for (i, text) in text_of(tree).iter().enumerate() {
+        let painted = eng.display_width(text);
+        assert!(
+            painted <= tree.width() as usize,
+            "line {i}: painted {painted} cells exceeds bound {} — text len {}",
+            tree.width(),
+            text.len()
+        );
+    }
+}
+
+#[test]
+fn test_unbreakable_word_past_u16_is_still_bounded() {
+    // 65_600 cells: truncates to 64 under a bare `as u16`, slipping the
+    // break-anywhere guard. Must break by cluster and stay within width.
+    let doc = Document::parse(&"a".repeat(65_600));
+    let tree = lay(&doc, 100);
+    assert_bound_remeasured(&tree);
+    assert_bound(&tree); // Run.width must also be honest, not just the text
+}
+
+#[test]
+fn test_code_line_past_u16_is_clipped_not_emitted_whole() {
+    let src = format!("```\n{}\n```\n", "x".repeat(65_600));
+    let doc = Document::parse(&src);
+    let tree = lay(&doc, 80);
+    assert_bound_remeasured(&tree);
+    // Code is clipped, never wrapped: a single content line out.
+    let content: Vec<_> = text_of(&tree)
+        .into_iter()
+        .filter(|l| l.contains('x'))
+        .collect();
+    assert_eq!(content.len(), 1, "code must clip to one line, not wrap");
+    assert!(content[0].contains('…'), "clip indicator expected");
+}
+
+#[test]
+fn test_many_column_table_neither_panics_nor_overflows() {
+    // >21_846 columns overflows u16 separator math (debug panic / release
+    // wrap); the composed row also sums past u16::MAX. Must survive both.
+    let n = 22_000;
+    let header = format!("|{}\n", "a|".repeat(n));
+    let delim = format!("|{}\n", "-|".repeat(n));
+    let doc = Document::parse(&format!("{header}{delim}"));
+    let tree = lay(&doc, 100);
+    assert_bound_remeasured(&tree);
+}

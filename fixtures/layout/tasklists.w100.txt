@@ -1,0 +1,5 @@
+[ ] unchecked task
+[x] checked task
+[x] capital checked
+• plain item
+  [ ] nested task

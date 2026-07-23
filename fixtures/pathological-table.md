@@ -1,0 +1,29 @@
+# Pathological tables
+
+A table whose natural widths overflow any sane viewport (rung 1 wrapping):
+
+| Description | Details | Notes |
+| ----------- | ------- | ----- |
+| This first cell holds a long descriptive sentence that will certainly need to wrap inside its cell at narrow widths | The second column also carries a fairly long run of prose so that both columns fight for space | short |
+| second row | more content here that wraps | end |
+
+Unbreakable identifiers longer than any column (rung 2 floors + break-anywhere):
+
+| Identifier | Value |
+| ---------- | ----- |
+| supercalifragilisticexpialidocious_configuration_key_name | 4b825dc642cb6eb9a060e54bf8d69288fbee4904deadbeefcafe |
+| 東京都特別区部東京都特別区部東京都特別区部 | 0123456789012345678901234567890123456789 |
+
+Too many columns for a narrow viewport (rung 3 clip):
+
+| c1 | c2 | c3 | c4 | c5 | c6 | c7 | c8 | c9 | c10 | c11 | c12 |
+| -- | -- | -- | -- | -- | -- | -- | -- | -- | --- | --- | --- |
+| a | b | c | d | e | f | g | h | i | j | k | l |
+| aa | bb | cc | dd | ee | ff | gg | hh | ii | jj | kk | ll |
+
+Alignment stress with wide clusters:
+
+| Left | Center | Right |
+| :--- | :----: | ----: |
+| ab | 👨‍👩‍👧‍👦 emoji | 12 |
+| a | 中文字 | 3456 |

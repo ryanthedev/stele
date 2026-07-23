@@ -1,0 +1,74 @@
+Pathological tables
+
+A table whose natural
+widths overflow any sane
+viewport (rung 1
+wrapping):
+
+Descripti │ Detai │ Note
+on        │ ls    │ s   
+──────────┼───────┼─────
+This      │ The   │ shor
+first     │ secon │ t   
+cell      │ d     │     
+holds a   │ colum │     
+long      │ n     │     
+descripti │ also  │     
+ve        │ carri │     
+sentence  │ es a  │     
+that will │ fairl │     
+certainly │ y     │     
+need to   │ long  │     
+wrap      │ run   │     
+inside    │ of    │     
+its cell  │ prose │     
+at narrow │ so    │     
+widths    │ that  │     
+          │ both  │     
+          │ colum │     
+          │ ns    │     
+          │ fight │     
+          │ for   │     
+          │ space │     
+second    │ more  │ end 
+row       │ conte │     
+          │ nt    │     
+          │ here  │     
+          │ that  │     
+          │ wraps │     
+
+Unbreakable identifiers
+longer than any column
+(rung 2 floors +
+break-anywhere):
+
+Identifier  │ Value     
+────────────┼───────────
+supercalifr │ 4b825dc642
+agilisticex │ cb6eb9a060
+pialidociou │ e54bf8d692
+s_configura │ 88fbee4904
+tion_key_na │ deadbeefca
+me          │ fe        
+東京都特別  │ 0123456789
+区部東京都  │ 0123456789
+特別区部東  │ 0123456789
+京都特別区  │ 0123456789
+部          │           
+
+Too many columns for a
+narrow viewport (rung 3
+clip):
+
+c1 │ c2 │ c3 │ c4 │ c5 …
+───┼────┼────┼────┼────…
+a  │ b  │ c  │ d  │ e  …
+aa │ bb │ cc │ dd │ ee …
+
+Alignment stress with
+wide clusters:
+
+Left │  Center  │ Right
+─────┼──────────┼──────
+ab   │ 👨‍👩‍👧‍👦 emoji │    12
+a    │  中文字  │  3456

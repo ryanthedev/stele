@@ -1,0 +1,7 @@
+Inline math E = mc^2 in a sentence.
+
+Display math: \int_0^\infty e^{-x^2} dx = \frac{\sqrt{\pi}}{2}
+
+Escaped $5 dollars and $5 or $10 prices stay text.
+
+Mixed a_i + b_j with subscripts and x^2 display.

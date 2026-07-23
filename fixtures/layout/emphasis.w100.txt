@@ -1,0 +1,11 @@
+emphasis and strong and both.
+
+underscore emphasis inside_word_stays literal.
+
+nested emphasis inside strong
+
+multiple-of-3 rule: foobarbaz
+
+strong with code and link inside
+
+a b c d and non-matching * lone stars *

@@ -1,0 +1,9 @@
+An inline link and an empty one.
+
+A reference link defined after use, a collapsed one, and a shortcut one.
+
+image alt text
+
+https://example.com/autolink and mailto@example.org.
+
+A ẞ casefolded reference.

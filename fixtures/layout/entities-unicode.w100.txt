@@ -1,0 +1,7 @@
+Entities: & < > " © # 😀 &nosuch;
+
+CJK: 漢字テキスト and full-width：punctuation。
+
+Emoji: 👨‍👩‍👧‍👦 family, 🇦🇺 flag, é combining.
+
+Ambiguous width: αβγ ± × §
