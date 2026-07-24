@@ -1,6 +1,14 @@
 [workspace]
 resolver = "3"
-members = ["crates/ast", "crates/layout", "crates/probe", "crates/stele", "crates/width"]
+members = [
+    "crates/ast",
+    "crates/gfx",
+    "crates/layout",
+    "crates/math",
+    "crates/probe",
+    "crates/stele",
+    "crates/width",
+]
 # cargo-fuzz targets build with nightly sanitizer flags; keep them out of the
 # stable workspace so fmt/clippy/test/linkage jobs never touch them.
 exclude = ["crates/ast/fuzz"]

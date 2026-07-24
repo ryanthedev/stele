@@ -1,0 +1,22 @@
+[package]
+name = "math"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "RaTeX-backed math rendering with a txm text-grid fallback"
+
+[dependencies]
+ratex-parser = "0.1.13"
+ratex-layout = "0.1.13"
+ratex-render = { version = "0.1.13", features = ["embed-fonts"] }
+ratex-types = "0.1.13"
+txm = "0.1.5"
+unicode-width = "0.2"
+
+[dev-dependencies]
+# Test-only: decoding rendered PNGs to assert on ink color/transparency
+# (DW-6.2/ratex.md's contrast check). Already a transitive dependency of
+# `ratex-render`; declared directly here since edition 2024 resolves the
+# extern prelude from direct dependencies only.
+png = "0.18"

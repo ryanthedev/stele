@@ -16,7 +16,13 @@ path = "src/main.rs"
 
 [dependencies]
 ast = { path = "../ast" }
+gfx = { path = "../gfx" }
 layout = { path = "../layout" }
+math = { path = "../math" }
 width = { path = "../width" }
 crossterm = "0.29"
 clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+# Test-only: building synthetic PNG fixtures for media-module tests.
+image = { version = "0.25", default-features = false, features = ["png"] }

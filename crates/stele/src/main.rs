@@ -10,14 +10,14 @@ use std::time::Duration;
 use ast::Document;
 use clap::Parser;
 use crossterm::event::{self, Event, KeyEventKind};
-use layout::{LayoutConfig, NullSizer, layout};
+use layout::{LayoutConfig, layout};
 use width::{WidthConfig, WidthEngine};
 
 use stele::app::{AppState, LayoutContext};
 use stele::cli::Cli;
 use stele::decor::StructuralDecor;
 use stele::loader;
-use stele::media::NoopMediaSink;
+use stele::media::{GfxMediaSink, ImageSizer, NoopMediaSink};
 use stele::painter::{Painter, Size};
 use stele::terminal::{TerminalGuard, install_panic_hook};
 
@@ -43,7 +43,29 @@ fn main() -> ExitCode {
 
     let doc = Document::parse(&source);
     let engine = WidthEngine::new(WidthConfig::default());
-    let sizer = NullSizer;
+
+    // Relative image paths resolve against the document's own directory.
+    let base_dir = cli
+        .file
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+    // Graphics are off under tmux (which does not pass kitty sequences
+    // through), when the user asks, and on any terminal that isn't Ghostty —
+    // stele targets Ghostty only, and streaming megabytes of base64 APC at a
+    // terminal that cannot decode it is worse than showing alt text. A
+    // disabled sizer reserves no boxes at all, so layout falls through to the
+    // alt-text path and the media sink is never invoked — the structural
+    // guarantee behind DW-6.4.
+    let is_ghostty = std::env::var("TERM_PROGRAM").is_ok_and(|t| t == "ghostty");
+    let graphics_disabled = cli.no_images || std::env::var_os("TMUX").is_some() || !is_ghostty;
+    let sizer: Box<dyn layout::IntrinsicSizer> = if graphics_disabled {
+        Box::new(ImageSizer::disabled(&base_dir))
+    } else {
+        Box::new(ImageSizer::new(&base_dir))
+    };
+
     let config = LayoutConfig {
         min_width: 24,
         max_width: cli.max_width.unwrap_or(100),
@@ -74,13 +96,19 @@ fn main() -> ExitCode {
         doc: &doc,
         config: &config,
         engine: &engine,
-        sizer: &sizer,
+        sizer: sizer.as_ref(),
     };
     let tree = layout(ctx.doc, size.width, ctx.config, ctx.engine, ctx.sizer);
     let mut state = AppState::new(tree, size);
 
     let mut painter = Painter::new(WidthEngine::new(WidthConfig::default()));
-    painter.register_media(Box::new(NoopMediaSink));
+    if graphics_disabled {
+        painter.register_media(Box::new(NoopMediaSink));
+    } else {
+        // The sink keeps its own copy of the document: it resolves image
+        // paths and math sources by `NodeId` at paint time.
+        painter.register_media(Box::new(GfxMediaSink::new(doc.clone(), &base_dir)));
+    }
     painter.register_decor(Box::new(StructuralDecor));
 
     let result = run_session(&ctx, &mut state, &mut painter);

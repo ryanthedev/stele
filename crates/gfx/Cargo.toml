@@ -1,0 +1,20 @@
+[package]
+name = "gfx"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Owned kitty graphics-protocol emission and bounded image decode"
+
+[dependencies]
+# Chunked base64 payload encoding for kitty's `a=t` transmission (spec caps
+# each chunk at 4096 base64 bytes).
+base64 = "0.22"
+# Decode + header-only dimension probe for local image files. Pure Rust
+# codecs only (no dynamic C library linkage — CI's linkage job forbids it).
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+[dev-dependencies]
+# Live-Ghostty test only (crates/gfx/tests/live_ghostty.rs); not linked into
+# the shipped binary at all (dev-dependencies never are).
+probe = { path = "../probe" }

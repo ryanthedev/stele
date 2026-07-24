@@ -119,6 +119,10 @@ impl Painter {
         out: &mut dyn Write,
     ) -> io::Result<()> {
         out.write_all(SYNC_BEGIN)?;
+        // Every frame, media or not: the sink needs a reliable boundary to
+        // reset per-frame state and sweep placements whose node has scrolled
+        // out of view entirely (no `paint` fires for those).
+        self.media.begin_frame(out);
         for row in 0..size.height {
             write!(out, "\x1b[{};1H", row + 1)?;
             let idx = scroll.saturating_add(row as usize);

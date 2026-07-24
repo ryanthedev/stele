@@ -18,4 +18,5 @@ pub mod terminal;
 
 pub use ast::NodeId;
 pub use layout::{CellSize, Reserved, Run, Semantic, StyleId};
+pub use media::{GfxMediaSink, ImageSizer};
 pub use painter::{CellPos, CellRect, Color, Painter, Size, Style};
