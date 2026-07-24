@@ -34,6 +34,21 @@ impl Frag {
     }
 }
 
+/// Whether a media box is allowed to share a line with text.
+///
+/// Size alone is the wrong test. `$$E=mc^2$$` measures one row, but display
+/// math is *semantically* a block — the author wrote `$$` precisely to set it
+/// apart from the prose — so letting it ride the baseline because it happens
+/// to be short would silently rewrite what the document says. Inline `$…$`
+/// math and images carry no such intent and flow with the text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BoxFlow {
+    /// May ride the baseline when it fits.
+    Inline,
+    /// Always claims its own rows, whatever it measures.
+    Block,
+}
+
 /// One wrappable unit.
 #[derive(Debug)]
 pub(crate) enum Atom {
@@ -44,7 +59,7 @@ pub(crate) enum Atom {
     Space,
     HardBreak,
     /// A sizer-sized media box (image or math), already at natural size.
-    Box(ast::NodeId, CellSize),
+    Box(ast::NodeId, CellSize, BoxFlow),
 }
 
 /// One wrapped output line, or a standalone media box that claims its own
@@ -127,13 +142,23 @@ impl Flattener<'_> {
                 self.link = saved;
             }
             InlineKind::Image { children, .. } => match self.try_size(inline) {
-                Some(size) => self.push_box(inline, size),
+                Some(size) => self.push_box(inline, size, BoxFlow::Inline),
                 None => self.visit_all(children, Semantic::ImageAlt),
             },
-            InlineKind::Math { tex, .. } => match self.try_size(inline) {
-                Some(size) => self.push_box(inline, size),
-                None => self.push_text(tex, Semantic::MathTex),
-            },
+            // `display` is the author's own statement of intent: `$$…$$` is set
+            // apart from the prose, `$…$` runs through it. Honor it rather than
+            // inferring flow from the rendered size.
+            InlineKind::Math { tex, display } => {
+                let flow = if *display {
+                    BoxFlow::Block
+                } else {
+                    BoxFlow::Inline
+                };
+                match self.try_size(inline) {
+                    Some(size) => self.push_box(inline, size, flow),
+                    None => self.push_text(tex, Semantic::MathTex),
+                }
+            }
             InlineKind::FootnoteReference { label } => {
                 self.push_text(&format!("[^{label}]"), Semantic::FootnoteRef)
             }
@@ -147,9 +172,9 @@ impl Flattener<'_> {
         self.sizer.size(inline.id, self.doc)
     }
 
-    fn push_box(&mut self, inline: &Inline, size: CellSize) {
+    fn push_box(&mut self, inline: &Inline, size: CellSize, flow: BoxFlow) {
         self.flush_word();
-        self.atoms.push(Atom::Box(inline.id, size));
+        self.atoms.push(Atom::Box(inline.id, size, flow));
     }
 
     /// Split text at whitespace; whitespace runs collapse to one `Space`.
@@ -211,7 +236,7 @@ pub(crate) fn wrap(atoms: Vec<Atom>, content_width: u16, engine: &WidthEngine) -
             // it wraps exactly like a word, keeping the spaces on either side,
             // so `text $formula$ more text` stays one flowing sentence. Only a
             // box that cannot do that falls through to the standalone arm.
-            Atom::Box(node, size) if size.rows <= 1 && size.cols.max(1) <= cw => {
+            Atom::Box(node, size, BoxFlow::Inline) if size.rows <= 1 && size.cols.max(1) <= cw => {
                 let box_w = size.cols.max(1);
                 let space_w = u16::from(pending_space && !cur.is_empty());
                 if !cur.is_empty() && cur_w.saturating_add(space_w).saturating_add(box_w) > cw {
@@ -228,9 +253,9 @@ pub(crate) fn wrap(atoms: Vec<Atom>, content_width: u16, engine: &WidthEngine) -
                 cur_w = cur_w.saturating_add(box_w);
                 pending_space = false;
             }
-            // Taller than one row, or wider than the whole content column:
-            // it claims its own rows. Display math and block images land here.
-            Atom::Box(node, size) => {
+            // Taller than one row, wider than the whole content column, or
+            // block by the author's own intent (`$$…$$`): it claims its own rows.
+            Atom::Box(node, size, _) => {
                 if !cur.is_empty() {
                     flush(&mut out, &mut cur, &mut cur_w);
                 }

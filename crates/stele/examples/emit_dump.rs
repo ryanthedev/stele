@@ -24,15 +24,49 @@ fn main() {
         .map(std::path::Path::to_path_buf)
         .unwrap_or_else(|| std::path::PathBuf::from("."));
 
+    let width: u16 = std::env::args()
+        .nth(2)
+        .and_then(|w| w.parse().ok())
+        .unwrap_or(100);
+
     let doc = ast::Document::parse(&src);
     let engine = WidthEngine::new(WidthConfig::default());
     let config = layout::LayoutConfig {
         min_width: 24,
-        max_width: 100,
+        max_width: width.max(24),
     };
     // The enabled sizer — exactly what main.rs builds when TERM_PROGRAM=ghostty.
     let sizer = ImageSizer::new(&base_dir);
-    let tree = layout(&doc, 100, &config, &engine, &sizer);
+    let tree = layout(&doc, width, &config, &engine, &sizer);
+
+    // DW-4.3: no line may exceed the layout width. Re-measured through the
+    // width engine rather than trusting the tree's own cached run widths, so a
+    // mis-measured grapheme cluster is caught rather than confirmed.
+    let mut overflow = Vec::new();
+    for (i, line) in tree.lines(0..tree.line_count()).enumerate() {
+        let measured: u16 = match line {
+            Line::Items(items) => items.iter().fold(0u16, |acc, item| {
+                let w = match item {
+                    LineItem::Run(r) => engine.display_width(&r.text).min(u16::MAX as usize) as u16,
+                    LineItem::Box(b) => b.cols,
+                };
+                acc.saturating_add(w)
+            }),
+            Line::Reserved(r) => r.cols,
+        };
+        if measured > width {
+            overflow.push((i, measured));
+        }
+    }
+    if overflow.is_empty() {
+        println!("width bound at {width}: OK ({} lines)", tree.line_count());
+    } else {
+        println!(
+            "width bound at {width}: {} LINE(S) OVERFLOW -> {:?}",
+            overflow.len(),
+            &overflow[..overflow.len().min(8)]
+        );
+    }
 
     // --- what layout decided -------------------------------------------
     let mut inline_rows = 0;

@@ -160,7 +160,7 @@ fn collect_atoms(atoms: &[Atom]) -> Vec<Atom> {
             ),
             Atom::Space => Atom::Space,
             Atom::HardBreak => Atom::HardBreak,
-            Atom::Box(id, size) => Atom::Box(*id, *size),
+            Atom::Box(id, size, flow) => Atom::Box(*id, *size, *flow),
         })
         .collect()
 }

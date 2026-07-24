@@ -646,3 +646,52 @@ fn test_inline_box_does_not_merge_the_runs_on_either_side_of_it() {
     assert!(matches!(items[box_at - 1], LineItem::Run(_)));
     assert!(matches!(items[box_at + 1], LineItem::Run(_)));
 }
+
+#[test]
+fn test_display_math_claims_its_own_rows_even_when_it_measures_one_row() {
+    // Regression: flow was decided purely by measured size, so a SHORT display
+    // formula like `$$E=mc^2$$` (one row) rode the text baseline as if the
+    // author had written `$…$`. `$$` is an explicit statement that the formula
+    // stands apart from the prose; size must not override it.
+    let doc = Document::parse("Einstein wrote $$E=mc^2$$ on the board.\n");
+    let tree = layout(
+        &doc,
+        80,
+        &LayoutConfig::default(),
+        &engine(),
+        &FixedSizer(CellSize { cols: 8, rows: 1 }),
+    );
+    assert!(
+        inline_boxes(&tree).is_empty(),
+        "display math must never ride the baseline: {:?}",
+        text_of(&tree)
+    );
+    assert!(
+        tree.lines(0..tree.line_count())
+            .any(|l| matches!(l, Line::Reserved(_))),
+        "display math claims its own row: {:?}",
+        text_of(&tree)
+    );
+}
+
+#[test]
+fn test_inline_math_of_the_same_size_still_rides_the_baseline() {
+    // The other half of the pair: identical measured size, `$…$` instead of
+    // `$$…$$`, must still flow inside the sentence. Together these two pin the
+    // rule as "author intent decides", not "size decides".
+    let doc = Document::parse("Einstein wrote $E=mc^2$ on the board.\n");
+    let tree = layout(
+        &doc,
+        80,
+        &LayoutConfig::default(),
+        &engine(),
+        &FixedSizer(CellSize { cols: 8, rows: 1 }),
+    );
+    let boxes = inline_boxes(&tree);
+    assert_eq!(boxes.len(), 1, "inline math rides the line: {boxes:?}");
+    let line = &text_of(&tree)[boxes[0].0];
+    assert!(
+        line.contains("Einstein wrote <box 8x1> on the board."),
+        "one flowing sentence: {line:?}"
+    );
+}
