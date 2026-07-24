@@ -167,7 +167,7 @@ fn emitter_level_100_cycles_stay_balanced_in_a_captured_buffer() {
 #[test]
 #[ignore = "requires running inside a real Ghostty GUI session"]
 fn emit_live_kitty_image_to_dev_tty() {
-    use std::io::Write;
+    use std::io::{BufRead, Write};
 
     let term = std::env::var("TERM_PROGRAM").unwrap_or_default();
     assert_eq!(
@@ -179,7 +179,11 @@ fn emit_live_kitty_image_to_dev_tty() {
     // merely has TERM_PROGRAM inherited has no /dev/tty, so skip loudly
     // rather than fail — this test is the human visual pass, and pretending
     // it ran would be worse than saying it didn't.
-    let mut tty = match std::fs::OpenOptions::new().write(true).open("/dev/tty") {
+    let mut tty = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+    {
         Ok(tty) => tty,
         Err(err) => {
             eprintln!(
@@ -202,13 +206,19 @@ fn emit_live_kitty_image_to_dev_tty() {
     let mut emitter = Emitter::new();
     let id = ImageId::new(9001);
 
-    writeln!(tty, "\n[stele DW-6.1 live pass] image should appear below:").unwrap();
+    // Leave several blank lines so the image, placed a few rows down, lands in
+    // clear space rather than over this text.
+    writeln!(
+        tty,
+        "\n[stele DW-6.1 live pass] a 64x64 blue/gradient square should appear below.\n\n\n\n\n"
+    )
+    .unwrap();
     emitter.transmit(id, &png, &mut tty);
     emitter.place(
         id,
         CellRect {
-            x: 0,
-            y: 0,
+            x: 2,
+            y: 4,
             width: 8,
             height: 4,
         },
@@ -216,16 +226,31 @@ fn emit_live_kitty_image_to_dev_tty() {
     );
     tty.flush().unwrap();
 
-    // Survive 100 scroll cycles: the placement must not corrupt the session.
+    // Survive 100 scroll cycles: an equal up/down pair returns to the same
+    // position, so a correct placement must still be intact afterward. This
+    // is the "survives 100 scroll cycles" half of DW-6.1.
     for _ in 0..100 {
         write!(tty, "\x1b[S\x1b[T").unwrap(); // scroll up then back down
     }
     tty.flush().unwrap();
 
+    // Hold the image on screen until a human confirms it — the whole point of
+    // a visual pass. (An earlier version deleted immediately after scrolling,
+    // so the image was correctly gone before anyone could see it, making the
+    // test look like nothing rendered.)
+    write!(
+        tty,
+        "\nDo you SEE the square, intact after 100 scrolls? Press Enter to clear it and finish. "
+    )
+    .unwrap();
+    tty.flush().unwrap();
+    let mut line = String::new();
+    let _ = std::io::BufReader::new(&tty).read_line(&mut line);
+
     emitter.delete(id, &mut tty);
     writeln!(
         tty,
-        "\n[stele DW-6.1 live pass] image deleted; session healthy."
+        "[stele DW-6.1 live pass] image deleted; session healthy."
     )
     .unwrap();
     tty.flush().unwrap();
