@@ -331,13 +331,19 @@ mod tests {
     }
 
     fn topmost_line_text(state: &AppState) -> String {
-        use layout::Line;
+        use layout::{Line, LineItem};
         match state
             .tree()
             .lines(state.scroll()..state.scroll() + 1)
             .next()
         {
-            Some(Line::Runs(runs)) => runs.iter().map(|r| r.text.as_str()).collect(),
+            Some(Line::Items(items)) => items
+                .iter()
+                .filter_map(|item| match item {
+                    LineItem::Run(run) => Some(run.text.as_str()),
+                    LineItem::Box(_) => None,
+                })
+                .collect(),
             _ => String::new(),
         }
     }

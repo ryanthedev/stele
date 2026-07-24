@@ -132,13 +132,27 @@ impl Emitter {
     /// — the exact vertical trail of ghost images the repaint-behind model is
     /// meant to avoid. The one-placement-per-image invariant makes reusing the
     /// image id as the placement id both safe and sufficient.
+    /// **Cursor policy (`C=1`) is load-bearing too.** By default a put leaves
+    /// the cursor after the image. Both of this painter's placement paths are
+    /// hostile to that:
+    ///
+    /// - An *inline* box shares its row with text, so the run after it has to
+    ///   resume at a known column.
+    /// - A *block* box is followed immediately by `CSI K` (clear to end of
+    ///   line). If the put has already walked the cursor onto a later row,
+    ///   that erases part of a row the painter has already drawn — and a
+    ///   placement on the last visible row would push the cursor past the
+    ///   bottom, scrolling the whole frame out from under the viewer.
+    ///
+    /// `C=1` pins the cursor at the placement origin, so the caller keeps
+    /// full control of where the next byte lands.
     pub fn place(&mut self, id: ImageId, rect: CellRect, out: &mut dyn Write) {
         let row = rect.y.saturating_add(1);
         let col = rect.x.saturating_add(1);
         let _ = write!(out, "\x1b[{row};{col}H");
         let _ = write!(
             out,
-            "\x1b_Ga=p,i={},p={},c={},r={},q=2\x1b\\",
+            "\x1b_Ga=p,i={},p={},c={},r={},C=1,q=2\x1b\\",
             id.get(),
             id.get(),
             rect.width.max(1),
@@ -269,7 +283,29 @@ mod tests {
             height: 3,
         };
         let out = captured(|buf| Emitter::new().place(ImageId::new(9), rect, buf));
-        assert_eq!(out, "\x1b[3;5H\x1b_Ga=p,i=9,p=9,c=10,r=3,q=2\x1b\\");
+        assert_eq!(out, "\x1b[3;5H\x1b_Ga=p,i=9,p=9,c=10,r=3,C=1,q=2\x1b\\");
+    }
+
+    /// `C=1` pins the cursor at the placement origin. Dropping it lets the
+    /// put walk the cursor past the image, which corrupts an inline box's
+    /// line (the following run resumes at the wrong column) and, on the last
+    /// visible row, scrolls the whole frame. Asserted on its own so the
+    /// reason survives even if the byte-exact test above is ever relaxed.
+    #[test]
+    fn test_place_pins_the_cursor_so_it_never_walks_past_the_image() {
+        let out = captured(|buf| {
+            Emitter::new().place(
+                ImageId::new(3),
+                CellRect {
+                    x: 12,
+                    y: 0,
+                    width: 6,
+                    height: 1,
+                },
+                buf,
+            )
+        });
+        assert!(out.contains("C=1"), "cursor must not move: {out:?}");
     }
 
     /// Regression for the ghost-image trail: re-placing the same image at a

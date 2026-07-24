@@ -12,7 +12,7 @@ use std::rc::Rc;
 use ast::{Document, Inline, InlineKind};
 use width::{WidthEngine, graphemes};
 
-use crate::{CellSize, IntrinsicSizer, Run, Semantic, StyleId};
+use crate::{CellSize, IntrinsicSizer, LineItem, Reserved, Run, Semantic, StyleId};
 
 /// The clip indicator (code blocks, table rung 3, break-anywhere guard).
 pub(crate) const INDICATOR: &str = "\u{2026}"; // …
@@ -47,10 +47,12 @@ pub(crate) enum Atom {
     Box(ast::NodeId, CellSize),
 }
 
-/// One wrapped output line or an interleaved media box.
+/// One wrapped output line, or a standalone media box that claims its own
+/// rows. A box small enough to ride the baseline never becomes a
+/// `Piece::Box` — it rides inside `Piece::Items` as a [`LineItem::Box`].
 #[derive(Debug)]
 pub(crate) enum Piece {
-    Runs(Vec<Run>),
+    Items(Vec<LineItem>),
     Box(ast::NodeId, CellSize),
 }
 
@@ -189,12 +191,12 @@ impl Flattener<'_> {
 pub(crate) fn wrap(atoms: Vec<Atom>, content_width: u16, engine: &WidthEngine) -> Vec<Piece> {
     let cw = content_width.max(1);
     let mut out: Vec<Piece> = Vec::new();
-    let mut cur: Vec<Run> = Vec::new();
+    let mut cur: Vec<LineItem> = Vec::new();
     let mut cur_w: u16 = 0;
     let mut pending_space = false;
 
-    let flush = |out: &mut Vec<Piece>, cur: &mut Vec<Run>, cur_w: &mut u16| {
-        out.push(Piece::Runs(std::mem::take(cur)));
+    let flush = |out: &mut Vec<Piece>, cur: &mut Vec<LineItem>, cur_w: &mut u16| {
+        out.push(Piece::Items(std::mem::take(cur)));
         *cur_w = 0;
     };
 
@@ -205,6 +207,29 @@ pub(crate) fn wrap(atoms: Vec<Atom>, content_width: u16, engine: &WidthEngine) -
                 flush(&mut out, &mut cur, &mut cur_w);
                 pending_space = false;
             }
+            // A one-row box narrow enough to share a line rides the baseline:
+            // it wraps exactly like a word, keeping the spaces on either side,
+            // so `text $formula$ more text` stays one flowing sentence. Only a
+            // box that cannot do that falls through to the standalone arm.
+            Atom::Box(node, size) if size.rows <= 1 && size.cols.max(1) <= cw => {
+                let box_w = size.cols.max(1);
+                let space_w = u16::from(pending_space && !cur.is_empty());
+                if !cur.is_empty() && cur_w.saturating_add(space_w).saturating_add(box_w) > cw {
+                    flush(&mut out, &mut cur, &mut cur_w);
+                } else if space_w == 1 {
+                    append(&mut cur, " ", StyleId::Semantic(Semantic::Text), 1);
+                    cur_w += 1;
+                }
+                cur.push(LineItem::Box(Reserved {
+                    node_id: node,
+                    cols: box_w,
+                    rows: 1,
+                }));
+                cur_w = cur_w.saturating_add(box_w);
+                pending_space = false;
+            }
+            // Taller than one row, or wider than the whole content column:
+            // it claims its own rows. Display math and block images land here.
             Atom::Box(node, size) => {
                 if !cur.is_empty() {
                     flush(&mut out, &mut cur, &mut cur_w);
@@ -245,7 +270,7 @@ pub(crate) fn wrap(atoms: Vec<Atom>, content_width: u16, engine: &WidthEngine) -
         }
     }
     if !cur.is_empty() {
-        out.push(Piece::Runs(cur));
+        out.push(Piece::Items(cur));
     }
     out
 }
@@ -255,7 +280,7 @@ pub(crate) fn wrap(atoms: Vec<Atom>, content_width: u16, engine: &WidthEngine) -
 /// possible at pathological widths of 1) degrades to the indicator.
 fn break_anywhere(
     out: &mut Vec<Piece>,
-    cur: &mut Vec<Run>,
+    cur: &mut Vec<LineItem>,
     cur_w: &mut u16,
     cw: u16,
     frags: &[Frag],
@@ -269,7 +294,7 @@ fn break_anywhere(
             if gw > cw {
                 let iw = cells(engine, INDICATOR);
                 if cur_w.saturating_add(iw) > cw {
-                    out.push(Piece::Runs(std::mem::take(cur)));
+                    out.push(Piece::Items(std::mem::take(cur)));
                     *cur_w = 0;
                 }
                 if iw <= cw {
@@ -284,7 +309,7 @@ fn break_anywhere(
                 continue;
             }
             if cur_w.saturating_add(gw) > cw {
-                out.push(Piece::Runs(std::mem::take(cur)));
+                out.push(Piece::Items(std::mem::take(cur)));
                 *cur_w = 0;
             }
             append_aux(cur, g, style, gw, link.clone());
@@ -304,15 +329,45 @@ pub(crate) fn cells(engine: &WidthEngine, s: &str) -> u16 {
     engine.display_width(s).min(u16::MAX as usize) as u16
 }
 
-/// Append text to the line, merging into the last run when style matches.
-pub(crate) fn append(cur: &mut Vec<Run>, text: &str, style_id: StyleId, width: u16) {
-    append_aux(cur, text, style_id, width, None);
+/// The run-merging rule, in one place: fold `text` into `last` when BOTH
+/// style and `aux` match (so two adjacent links with different destinations
+/// never coalesce into one hyperlink), otherwise hand back the fresh run for
+/// the caller to push. Shared by the `Vec<Run>` container (prefixes, table
+/// cells) and the `Vec<LineItem>` container (a wrapped line, which may also
+/// hold inline boxes).
+fn merge_or_new(
+    last: Option<&mut Run>,
+    text: &str,
+    style_id: StyleId,
+    width: u16,
+    aux: &Option<Box<str>>,
+) -> Option<Run> {
+    if let Some(run) = last
+        && run.style_id == style_id
+        && run.aux == *aux
+    {
+        run.text.push_str(text);
+        // Saturate: a merged run past u16::MAX is pathological, but
+        // clip_runs re-measures by cluster, so an honest-but-capped
+        // width still triggers clipping correctly.
+        run.width = run.width.saturating_add(width);
+        return None;
+    }
+    Some(Run {
+        text: text.to_string(),
+        style_id,
+        width,
+        aux: aux.clone(),
+    })
 }
 
-/// Like [`append`], but carries `aux` (the link URL) onto the run. Merges
-/// into the last run only when BOTH style and `aux` match, so two adjacent
-/// links with different destinations never coalesce into one hyperlink.
-pub(crate) fn append_aux(
+/// Append text to a run vector, merging into the last run when style matches.
+pub(crate) fn append_run(cur: &mut Vec<Run>, text: &str, style_id: StyleId, width: u16) {
+    append_run_aux(cur, text, style_id, width, None);
+}
+
+/// Like [`append_run`], but carries `aux` (the link URL) onto the run.
+pub(crate) fn append_run_aux(
     cur: &mut Vec<Run>,
     text: &str,
     style_id: StyleId,
@@ -322,20 +377,36 @@ pub(crate) fn append_aux(
     if text.is_empty() {
         return;
     }
-    match cur.last_mut() {
-        Some(run) if run.style_id == style_id && run.aux == aux => {
-            run.text.push_str(text);
-            // Saturate: a merged run past u16::MAX is pathological, but
-            // clip_runs re-measures by cluster, so an honest-but-capped
-            // width still triggers clipping correctly.
-            run.width = run.width.saturating_add(width);
-        }
-        _ => cur.push(Run {
-            text: text.to_string(),
-            style_id,
-            width,
-            aux,
-        }),
+    if let Some(run) = merge_or_new(cur.last_mut(), text, style_id, width, &aux) {
+        cur.push(run);
+    }
+}
+
+/// Append text to a wrapped line, merging into the last run when style
+/// matches.
+pub(crate) fn append(cur: &mut Vec<LineItem>, text: &str, style_id: StyleId, width: u16) {
+    append_aux(cur, text, style_id, width, None);
+}
+
+/// Like [`append`], but carries `aux` (the link URL) onto the run.
+pub(crate) fn append_aux(
+    cur: &mut Vec<LineItem>,
+    text: &str,
+    style_id: StyleId,
+    width: u16,
+    aux: Option<Box<str>>,
+) {
+    if text.is_empty() {
+        return;
+    }
+    // An inline box ends the mergeable run: text following it starts a fresh
+    // run rather than silently absorbing into the run that preceded the box.
+    let last = match cur.last_mut() {
+        Some(LineItem::Run(run)) => Some(run),
+        _ => None,
+    };
+    if let Some(run) = merge_or_new(last, text, style_id, width, &aux) {
+        cur.push(LineItem::Run(run));
     }
 }
 
@@ -377,11 +448,11 @@ pub(crate) fn clip_runs(
             text.push_str(g);
             tw += gw;
         }
-        append_aux(&mut out, &text, run.style_id, tw, run.aux.clone());
+        append_run_aux(&mut out, &text, run.style_id, tw, run.aux.clone());
         break;
     }
     if indicate && iw <= max_width {
-        append(
+        append_run(
             &mut out,
             INDICATOR,
             StyleId::Semantic(Semantic::OverflowIndicator),

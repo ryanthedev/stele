@@ -4,8 +4,8 @@
 
 use ast::{Document, InlineKind, NodeId, NodeRef};
 use layout::{
-    CellSize, IntrinsicSizer, LayoutConfig, LayoutTree, Line, NullSizer, Run, Semantic, StyleId,
-    layout,
+    CellSize, IntrinsicSizer, LayoutConfig, LayoutTree, Line, LineItem, NullSizer, Run, Semantic,
+    StyleId, layout,
 };
 use width::{WidthConfig, WidthEngine};
 
@@ -20,7 +20,10 @@ fn lay(doc: &Document, width: u16) -> LayoutTree {
 fn all_runs(tree: &LayoutTree) -> Vec<&Run> {
     tree.lines(0..tree.line_count())
         .filter_map(|l| match l {
-            Line::Runs(runs) => Some(runs.iter()),
+            Line::Items(items) => Some(items.iter().filter_map(|item| match item {
+                LineItem::Run(run) => Some(run),
+                LineItem::Box(_) => None,
+            })),
             Line::Reserved(_) => None,
         })
         .flatten()
@@ -30,7 +33,15 @@ fn all_runs(tree: &LayoutTree) -> Vec<&Run> {
 fn text_of(tree: &LayoutTree) -> Vec<String> {
     tree.lines(0..tree.line_count())
         .map(|l| match l {
-            Line::Runs(runs) => runs.iter().map(|r| r.text.as_str()).collect::<String>(),
+            Line::Items(items) => items
+                .iter()
+                .map(|item| match item {
+                    LineItem::Run(run) => run.text.clone(),
+                    // Visible in goldens so an inline box can never slip into
+                    // a line unnoticed the way a silent skip would allow.
+                    LineItem::Box(b) => format!("<box {}x{}>", b.cols, b.rows),
+                })
+                .collect::<String>(),
             Line::Reserved(r) => format!("<reserved {}x{}>", r.cols, r.rows),
         })
         .collect()
@@ -489,4 +500,149 @@ fn test_many_column_table_neither_panics_nor_overflows() {
     let doc = Document::parse(&format!("{header}{delim}"));
     let tree = lay(&doc, 100);
     assert_bound_remeasured(&tree);
+}
+
+// ---- inline media boxes ----------------------------------------------
+
+/// Every `LineItem::Box` on the line, with the line index it sits on.
+fn inline_boxes(tree: &LayoutTree) -> Vec<(usize, layout::Reserved)> {
+    tree.lines(0..tree.line_count())
+        .enumerate()
+        .flat_map(|(i, l)| match l {
+            Line::Items(items) => items
+                .iter()
+                .filter_map(|item| match item {
+                    LineItem::Box(b) => Some((i, *b)),
+                    LineItem::Run(_) => None,
+                })
+                .collect::<Vec<_>>(),
+            Line::Reserved(_) => Vec::new(),
+        })
+        .collect()
+}
+
+#[test]
+fn test_one_row_inline_box_rides_the_baseline_inside_its_sentence() {
+    // The reported bug: a one-row formula used to flush the line before and
+    // after itself, shattering "before $x$ after" into three lines with the
+    // spaces swallowed. It must stay one flowing line.
+    let doc = Document::parse("Inline math like $e^{i\\pi}+1=0$ and more text.\n");
+    let tree = layout(
+        &doc,
+        80,
+        &LayoutConfig::default(),
+        &engine(),
+        &FixedSizer(CellSize { cols: 10, rows: 1 }),
+    );
+
+    let boxes = inline_boxes(&tree);
+    assert_eq!(boxes.len(), 1, "the formula is one inline box: {boxes:?}");
+    assert_eq!(boxes[0].1.rows, 1, "an inline box is always one row tall");
+
+    assert!(
+        !tree
+            .lines(0..tree.line_count())
+            .any(|l| matches!(l, Line::Reserved(_))),
+        "a box that fits the baseline must not claim its own rows"
+    );
+
+    let text = text_of(&tree);
+    let line = &text[boxes[0].0];
+    assert!(
+        line.contains("Inline math like <box 10x1> and more text."),
+        "text, box, and BOTH surrounding spaces stay on one line: {line:?}"
+    );
+}
+
+#[test]
+fn test_inline_box_taller_than_one_row_still_claims_its_own_rows() {
+    // Display math and block images want their own rows; only the baseline
+    // case changed. A 2-row box must still reserve 2 whole lines.
+    let doc = Document::parse("Before $$\\int_0^\\infty$$ after.\n");
+    let tree = layout(
+        &doc,
+        80,
+        &LayoutConfig::default(),
+        &engine(),
+        &FixedSizer(CellSize { cols: 10, rows: 2 }),
+    );
+    assert!(inline_boxes(&tree).is_empty(), "not an inline box");
+    let reserved: Vec<_> = tree
+        .lines(0..tree.line_count())
+        .filter_map(|l| match l {
+            Line::Reserved(r) => Some(*r),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reserved.len(), 2, "one Reserved line per row");
+}
+
+#[test]
+fn test_inline_box_wider_than_the_content_column_claims_its_own_rows() {
+    // It cannot share a line with anything, so the standalone path (which
+    // also scales it to fit) is the only correct answer.
+    let doc = Document::parse("Text $wide$ text.\n");
+    let tree = layout(
+        &doc,
+        24,
+        &LayoutConfig::default(),
+        &engine(),
+        &FixedSizer(CellSize { cols: 90, rows: 1 }),
+    );
+    assert!(inline_boxes(&tree).is_empty(), "too wide to ride a line");
+    assert!(
+        tree.lines(0..tree.line_count())
+            .any(|l| matches!(l, Line::Reserved(_))),
+        "falls back to a standalone reserved box"
+    );
+}
+
+#[test]
+fn test_inline_box_wraps_to_the_next_line_when_it_does_not_fit() {
+    // It wraps like a word rather than overflowing the content column.
+    let doc = Document::parse("aaaaaaaaaa bbbbbbbbbb $x$ cccc\n");
+    let tree = layout(
+        &doc,
+        24,
+        &LayoutConfig::default(),
+        &engine(),
+        &FixedSizer(CellSize { cols: 8, rows: 1 }),
+    );
+    let boxes = inline_boxes(&tree);
+    assert_eq!(boxes.len(), 1, "still exactly one box: {boxes:?}");
+    assert!(
+        boxes[0].0 > 0,
+        "the box wrapped onto a later line instead of overflowing"
+    );
+    assert_bound(&tree);
+}
+
+#[test]
+fn test_inline_box_does_not_merge_the_runs_on_either_side_of_it() {
+    // Text after a box must start a fresh run, never fold into the run that
+    // preceded the box (which would silently reorder the line's content).
+    let doc = Document::parse("aa $x$ bb\n");
+    let tree = layout(
+        &doc,
+        80,
+        &LayoutConfig::default(),
+        &engine(),
+        &FixedSizer(CellSize { cols: 4, rows: 1 }),
+    );
+    let items: Vec<_> = tree
+        .lines(0..tree.line_count())
+        .filter_map(|l| match l {
+            Line::Items(items) if !items.is_empty() => Some(items.clone()),
+            _ => None,
+        })
+        .next()
+        .expect("one content line");
+    let box_at = items
+        .iter()
+        .position(|i| matches!(i, LineItem::Box(_)))
+        .expect("a box on the line");
+    assert!(box_at > 0, "text precedes the box");
+    assert!(box_at + 1 < items.len(), "text follows the box");
+    assert!(matches!(items[box_at - 1], LineItem::Run(_)));
+    assert!(matches!(items[box_at + 1], LineItem::Run(_)));
 }

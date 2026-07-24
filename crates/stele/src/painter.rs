@@ -12,7 +12,7 @@
 use std::io::{self, Write};
 
 use highlight::{HYPERLINK_CLOSE, hyperlink_open};
-use layout::{LayoutTree, Line, Reserved, Run, Semantic, StyleId};
+use layout::{LayoutTree, Line, LineItem, Reserved, Run, Semantic, StyleId};
 use width::WidthEngine;
 
 use crate::decor::{Decor, StructuralDecor};
@@ -39,6 +39,20 @@ pub struct CellRect {
     pub y: u16,
     pub width: u16,
     pub height: u16,
+}
+
+/// What painting one run consumed, so the caller can keep the running column
+/// (an inline media box needs to know where on the row it starts) and know
+/// whether the line ended mid-run.
+#[derive(Debug, Clone, Copy, Default)]
+struct PaintedRun {
+    /// Cells consumed.
+    width: u16,
+    /// Whether any glyphs were actually written (a run can consume zero
+    /// cells and still need an SGR reset behind it).
+    wrote_text: bool,
+    /// The run hit the end of the row: stop painting this line.
+    line_full: bool,
 }
 
 /// A truecolor RGB triple.
@@ -146,7 +160,7 @@ impl Painter {
         out: &mut dyn Write,
     ) -> io::Result<()> {
         match line {
-            Line::Runs(runs) => self.paint_runs(runs, width, out),
+            Line::Items(items) => self.paint_items(items, row, width, out),
             Line::Reserved(reserved) => self.paint_reserved(reserved, row, width, out),
         }
     }
@@ -168,70 +182,142 @@ impl Painter {
         Ok(())
     }
 
-    fn paint_runs(&mut self, runs: &[Run], width: u16, out: &mut dyn Write) -> io::Result<()> {
-        let mut remaining = width;
+    /// Paint one line's items left to right, tracking the absolute column so
+    /// an inline media box knows where on the row it starts.
+    fn paint_items(
+        &mut self,
+        items: &[LineItem],
+        row: u16,
+        width: u16,
+        out: &mut dyn Write,
+    ) -> io::Result<()> {
+        let mut col: u16 = 0;
         let mut painted_any = false;
-        'line: for run in runs {
+        for item in items {
+            let remaining = width.saturating_sub(col);
             if remaining == 0 {
                 break;
             }
-            // `Decor::highlight` is code-block-specific (see the decor
-            // module docs): every other run passes through unchanged.
-            let expanded = if run.style_id == StyleId::Semantic(Semantic::CodeBlock) {
-                // `run.aux` carries the code fence's language (threaded from
-                // layout), so the highlighter can pick a grammar instead of
-                // always falling back to a plain block.
-                self.decor.highlight(&run.text, run.aux.as_deref())
-            } else {
-                vec![run.clone()]
-            };
-            for expanded_run in &expanded {
-                if remaining == 0 {
-                    break 'line;
-                }
-                let sanitized = sanitize(&expanded_run.text);
-                let (clipped_text, clipped_width) =
-                    clip_to_width(&sanitized, &self.width_engine, remaining);
-                if clipped_text.is_empty() {
-                    // A non-empty run that painted nothing means its next
-                    // cluster is wider than the cells left: the line is
-                    // full. Stop here — a narrower later run must not fill
-                    // the straggler cell out of document order.
-                    if !sanitized.is_empty() {
-                        break 'line;
+            match item {
+                LineItem::Run(run) => {
+                    let painted = self.paint_run(run, remaining, out)?;
+                    col = col.saturating_add(painted.width);
+                    painted_any |= painted.wrote_text;
+                    if painted.line_full {
+                        break;
                     }
-                    continue;
                 }
-                let truncated = clipped_text.len() < sanitized.len();
-                // A link run carries its destination in `aux`; wrap the text
-                // in an OSC 8 hyperlink. `hyperlink::open` sanitizes the URL
-                // (scheme allowlist, control/`;` bytes stripped) and returns
-                // None for a hostile or disallowed URL, so nothing is emitted
-                // and the text still renders as plain styled text.
-                let link_open = if expanded_run.style_id == StyleId::Semantic(Semantic::Link) {
-                    expanded_run.aux.as_deref().and_then(hyperlink_open)
-                } else {
-                    None
-                };
-                if let Some(seq) = &link_open {
-                    out.write_all(seq.as_bytes())?;
-                }
-                let style = self.decor.resolve(expanded_run.style_id);
-                write_sgr(out, &style)?;
-                out.write_all(clipped_text.as_bytes())?;
-                if link_open.is_some() {
-                    out.write_all(HYPERLINK_CLOSE.as_bytes())?;
-                }
-                painted_any = true;
-                remaining = remaining.saturating_sub(clipped_width);
-                if truncated {
-                    break 'line;
+                LineItem::Box(reserved) => {
+                    let cols = reserved.cols.min(remaining);
+                    self.paint_inline_box(reserved, col, row, cols, out)?;
+                    col = col.saturating_add(cols);
+                    painted_any = true;
                 }
             }
         }
         if painted_any {
             out.write_all(SGR_RESET)?;
         }
+        Ok(())
+    }
+
+    /// Paint one text run into at most `remaining` cells, reporting how much
+    /// of the row it consumed and whether the line is finished.
+    fn paint_run(
+        &mut self,
+        run: &Run,
+        remaining: u16,
+        out: &mut dyn Write,
+    ) -> io::Result<PaintedRun> {
+        // `Decor::highlight` is code-block-specific (see the decor
+        // module docs): every other run passes through unchanged.
+        let expanded = if run.style_id == StyleId::Semantic(Semantic::CodeBlock) {
+            // `run.aux` carries the code fence's language (threaded from
+            // layout), so the highlighter can pick a grammar instead of
+            // always falling back to a plain block.
+            self.decor.highlight(&run.text, run.aux.as_deref())
+        } else {
+            vec![run.clone()]
+        };
+        let mut painted = PaintedRun::default();
+        for expanded_run in &expanded {
+            let left = remaining.saturating_sub(painted.width);
+            if left == 0 {
+                painted.line_full = true;
+                return Ok(painted);
+            }
+            let sanitized = sanitize(&expanded_run.text);
+            let (clipped_text, clipped_width) = clip_to_width(&sanitized, &self.width_engine, left);
+            if clipped_text.is_empty() {
+                // A non-empty run that painted nothing means its next
+                // cluster is wider than the cells left: the line is
+                // full. Stop here — a narrower later run must not fill
+                // the straggler cell out of document order.
+                if !sanitized.is_empty() {
+                    painted.line_full = true;
+                    return Ok(painted);
+                }
+                continue;
+            }
+            let truncated = clipped_text.len() < sanitized.len();
+            // A link run carries its destination in `aux`; wrap the text
+            // in an OSC 8 hyperlink. `hyperlink::open` sanitizes the URL
+            // (scheme allowlist, control/`;` bytes stripped) and returns
+            // None for a hostile or disallowed URL, so nothing is emitted
+            // and the text still renders as plain styled text.
+            let link_open = if expanded_run.style_id == StyleId::Semantic(Semantic::Link) {
+                expanded_run.aux.as_deref().and_then(hyperlink_open)
+            } else {
+                None
+            };
+            if let Some(seq) = &link_open {
+                out.write_all(seq.as_bytes())?;
+            }
+            let style = self.decor.resolve(expanded_run.style_id);
+            write_sgr(out, &style)?;
+            out.write_all(clipped_text.as_bytes())?;
+            if link_open.is_some() {
+                out.write_all(HYPERLINK_CLOSE.as_bytes())?;
+            }
+            painted.wrote_text = true;
+            painted.width = painted.width.saturating_add(clipped_width);
+            if truncated {
+                painted.line_full = true;
+                return Ok(painted);
+            }
+        }
+        Ok(painted)
+    }
+
+    /// Paint an inline media box riding this row's baseline at column `col`.
+    ///
+    /// The box's cells are blanked first and unconditionally. `paint_frame`
+    /// only issues `CLEAR_TO_EOL` *after* a line is painted, so cells the
+    /// cursor skips keep the previous frame's glyphs — and a math raster is
+    /// rendered on a transparent background, so anything stale underneath
+    /// shows straight through it.
+    fn paint_inline_box(
+        &mut self,
+        reserved: &Reserved,
+        col: u16,
+        row: u16,
+        cols: u16,
+        out: &mut dyn Write,
+    ) -> io::Result<()> {
+        out.write_all(SGR_RESET)?;
+        for _ in 0..cols {
+            out.write_all(b" ")?;
+        }
+        let rect = CellRect {
+            x: col,
+            y: row,
+            width: cols,
+            height: 1,
+        };
+        self.media.paint(reserved, rect, out);
+        // The sink parks the cursor wherever placing left it; put it back at
+        // the cell after the box so the rest of the line paints in order.
+        write!(out, "\x1b[{};{}H", row + 1, col.saturating_add(cols) + 1)?;
         Ok(())
     }
 }
@@ -407,7 +493,10 @@ mod tests {
     #[test]
     fn test_reserved_line_dispatches_to_registered_media_sink() {
         let doc = Document::parse("![alt](pic.png)\n");
-        let sizer = AlwaysSizes(CellSize { cols: 10, rows: 1 });
+        // Two rows deliberately: a one-row box now rides a text line as a
+        // `LineItem::Box`, so only a taller box still takes the standalone
+        // `Line::Reserved` path this test is about.
+        let sizer = AlwaysSizes(CellSize { cols: 10, rows: 2 });
         let tree = layout(&doc, 80, &LayoutConfig::default(), &engine(), &sizer);
         let mut painter = Painter::new(engine());
         let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
@@ -428,9 +517,53 @@ mod tests {
             .unwrap();
         // The true no-op default would never invoke a sink at all; a
         // registered sink must actually be called when a Reserved line is
-        // visible in the frame.
-        assert_eq!(calls.borrow().len(), 1);
+        // visible in the frame — once per reserved row.
+        assert_eq!(calls.borrow().len(), 2);
         assert_eq!(calls.borrow()[0].width, 10);
+        assert_eq!(calls.borrow()[0].x, 0, "a block box starts at column 0");
+    }
+
+    #[test]
+    fn test_inline_box_places_at_its_own_column_and_text_resumes_after_it() {
+        // The whole point of the baseline path: the sink is handed the box's
+        // real column (not 0), and the run following the box is painted after
+        // it rather than on a line of its own.
+        let doc = Document::parse("ab $x$ cd\n");
+        let sizer = AlwaysSizes(CellSize { cols: 4, rows: 1 });
+        let tree = layout(&doc, 40, &LayoutConfig::default(), &engine(), &sizer);
+        let mut painter = Painter::new(engine());
+        let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        painter.register_media(Box::new(SpyMedia {
+            paint_calls: calls.clone(),
+        }));
+        let mut buf = Vec::new();
+        painter
+            .frame(
+                &tree,
+                0,
+                Size {
+                    width: 40,
+                    height: 3,
+                },
+                &mut buf,
+            )
+            .unwrap();
+
+        let calls = calls.borrow();
+        assert_eq!(calls.len(), 1, "one inline box painted");
+        assert_eq!(calls[0].x, 3, "placed after \"ab \", not at column 0");
+        assert_eq!(calls[0].width, 4);
+        assert_eq!(calls[0].height, 1, "an inline box is one row");
+
+        let text = String::from_utf8_lossy(&buf);
+        assert!(text.contains("ab "), "text before the box: {text:?}");
+        assert!(text.contains(" cd"), "text after the box: {text:?}");
+        // The cursor is put back at the cell after the box (0-indexed col 7
+        // -> 1-indexed 8) so the trailing run lands in the right place.
+        assert!(
+            text.contains("\x1b[1;8H"),
+            "cursor restored after the box: {text:?}"
+        );
     }
 
     #[test]

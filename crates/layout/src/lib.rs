@@ -171,19 +171,54 @@ pub struct Reserved {
     pub rows: u16,
 }
 
-/// One terminal row: either styled text runs or one row of a reserved
-/// media box.
+/// One item on a text line: a styled text fragment, or an inline media box
+/// sitting on that line's baseline.
+///
+/// The box case is what makes `$e^{i\pi}+1=0$` render *inside* its sentence
+/// instead of interrupting it. An inline box is always exactly **one row**
+/// tall — [`LayoutTree`] is a flat list where one [`Line`] is one terminal
+/// row and scrolling addresses it by line index, so a taller line box would
+/// break scroll math everywhere. A formula whose natural height exceeds one
+/// row therefore keeps the standalone [`Line::Reserved`] path (display math,
+/// which wants its own rows anyway).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum LineItem {
+    Run(Run),
+    /// An inline media box occupying `cols` columns of this row. `rows` is
+    /// always 1; the field is kept so P6's `paint(reserved, rect)` seam takes
+    /// the same [`Reserved`] value for inline and block media alike.
+    Box(Reserved),
+}
+
+impl LineItem {
+    /// Cell width this item occupies on its line.
+    pub fn width(&self) -> u16 {
+        match self {
+            LineItem::Run(run) => run.width,
+            LineItem::Box(reserved) => reserved.cols,
+        }
+    }
+}
+
+/// One terminal row: either a sequence of line items (styled text and any
+/// inline media boxes riding the baseline) or one row of a standalone
+/// reserved media box.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Line {
-    Runs(Vec<Run>),
+    Items(Vec<LineItem>),
     Reserved(Reserved),
 }
 
 impl Line {
-    /// Total cell width of this line.
+    /// Total cell width of this line. Saturating, matching the rest of the
+    /// width arithmetic here: a line past `u16::MAX` is pathological, and an
+    /// honest-but-capped width still drives clipping correctly, whereas a
+    /// summing overflow would panic in a debug build.
     pub fn width(&self) -> u16 {
         match self {
-            Line::Runs(runs) => runs.iter().map(|r| r.width).sum(),
+            Line::Items(items) => items
+                .iter()
+                .fold(0u16, |acc, item| acc.saturating_add(item.width())),
             Line::Reserved(r) => r.cols,
         }
     }

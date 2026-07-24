@@ -7,7 +7,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::PathBuf;
 
 use ast::Document;
-use layout::{LayoutConfig, LayoutTree, Line, NullSizer, layout};
+use layout::{LayoutConfig, LayoutTree, Line, LineItem, NullSizer, layout};
 use width::{WidthConfig, WidthEngine};
 
 fn fixture_paths() -> Vec<PathBuf> {
@@ -42,9 +42,17 @@ fn render(tree: &LayoutTree) -> String {
     let mut out = String::new();
     for line in tree.lines(0..tree.line_count()) {
         match line {
-            Line::Runs(runs) => {
-                for run in runs {
-                    out.push_str(&run.text);
+            Line::Items(items) => {
+                for item in items {
+                    match item {
+                        LineItem::Run(run) => out.push_str(&run.text),
+                        LineItem::Box(b) => out.push_str(&format!(
+                            "[inline-box node={} {}x{}]",
+                            b.node_id.index(),
+                            b.cols,
+                            b.rows
+                        )),
+                    }
                 }
             }
             Line::Reserved(r) => out.push_str(&format!(

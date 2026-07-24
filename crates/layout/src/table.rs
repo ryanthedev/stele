@@ -17,7 +17,7 @@ use ast::{Alignment, Block, BlockKind};
 
 use crate::block::Ctx;
 use crate::inline::{self, Atom, Piece};
-use crate::{Run, Semantic, StyleId};
+use crate::{LineItem, Run, Semantic, StyleId};
 
 /// Rung-2 floor: the narrowest a column may be squeezed.
 const COL_FLOOR: u16 = 3;
@@ -97,8 +97,19 @@ pub(crate) fn layout_table(ctx: &mut Ctx<'_>, alignments: &[Alignment], rows: &[
                 let atoms = cells.get(col).map(|a| collect_atoms(a)).unwrap_or_default();
                 let mut lines: Vec<Vec<Run>> = inline::wrap(atoms, widths[col], ctx.engine)
                     .into_iter()
+                    // Cells are flattened with `allow_box: false`, so the
+                    // sizer never speaks inside one and neither box form can
+                    // reach here — media in a cell is already text by now.
                     .map(|p| match p {
-                        Piece::Runs(runs) => runs,
+                        Piece::Items(items) => items
+                            .into_iter()
+                            .map(|item| match item {
+                                LineItem::Run(run) => run,
+                                LineItem::Box(..) => {
+                                    unreachable!("boxes disabled in cells")
+                                }
+                            })
+                            .collect(),
                         Piece::Box(..) => unreachable!("boxes disabled in cells"),
                     })
                     .collect();
@@ -120,13 +131,13 @@ pub(crate) fn layout_table(ctx: &mut Ctx<'_>, alignments: &[Alignment], rows: &[
                 pad_cell(&mut runs, content, widths[col], align);
             }
             let runs = inline::clip_runs(runs, avail, true, ctx.engine);
-            ctx.emit(runs);
+            ctx.emit_runs(runs);
         }
         // Rule under the last header row.
         if ri + 1 == header_rows {
             let rule = header_rule(&widths, ctx);
             let rule = inline::clip_runs(rule, avail, true, ctx.engine);
-            ctx.emit(rule);
+            ctx.emit_runs(rule);
         }
     }
 }
@@ -266,14 +277,14 @@ fn pad_cell(runs: &mut Vec<Run>, content: Vec<Run>, width: u16, align: Alignment
     };
     push_pad(runs, left);
     for run in content {
-        inline::append(runs, &run.text, run.style_id, run.width);
+        inline::append_run(runs, &run.text, run.style_id, run.width);
     }
     push_pad(runs, right);
 }
 
 fn push_pad(runs: &mut Vec<Run>, n: u16) {
     if n > 0 {
-        inline::append(
+        inline::append_run(
             runs,
             &" ".repeat(usize::from(n)),
             StyleId::Semantic(Semantic::Text),
@@ -292,11 +303,11 @@ fn header_rule(widths: &[u16], ctx: &Ctx<'_>) -> Vec<Run> {
     for (col, &w) in widths.iter().enumerate() {
         if col > 0 {
             let cw = ctx.engine.display_width(cross) as u16;
-            inline::append(&mut runs, cross, style, cw);
+            inline::append_run(&mut runs, cross, style, cw);
         }
         let seg = dash.repeat(usize::from(w / dw));
         let sw = ctx.engine.display_width(&seg) as u16;
-        inline::append(&mut runs, &seg, style, sw);
+        inline::append_run(&mut runs, &seg, style, sw);
     }
     runs
 }

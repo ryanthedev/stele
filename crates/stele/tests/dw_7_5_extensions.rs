@@ -8,7 +8,7 @@
 //! produces, not just `crates/highlight` in isolation.
 
 use ast::{Document, NodeId};
-use layout::{AlertTone, CellSize, IntrinsicSizer, Line, Run, Semantic, StyleId};
+use layout::{AlertTone, CellSize, IntrinsicSizer, Line, LineItem, Run, Semantic, StyleId};
 use stele::decor::Decor;
 use stele::decor::frontmatter;
 use stele::decor::themed::ThemedDecor;
@@ -33,7 +33,13 @@ fn all_runs(source: &str) -> Vec<Run> {
     let tree = layout::layout(&doc, 80, &config, &engine, &NullSizer);
     tree.lines(0..tree.line_count())
         .flat_map(|line| match line {
-            Line::Runs(runs) => runs.clone(),
+            Line::Items(items) => items
+                .iter()
+                .filter_map(|item| match item {
+                    LineItem::Run(run) => Some(run.clone()),
+                    LineItem::Box(_) => None,
+                })
+                .collect(),
             Line::Reserved(_) => Vec::new(),
         })
         .collect()

@@ -10,7 +10,9 @@ use ast::{AlertKind, Block, BlockKind, Document, ListKind};
 use width::WidthEngine;
 
 use crate::inline::{self, Piece};
-use crate::{AlertTone, CellSize, IntrinsicSizer, Line, Reserved, Run, Semantic, StyleId};
+use crate::{
+    AlertTone, CellSize, IntrinsicSizer, Line, LineItem, Reserved, Run, Semantic, StyleId,
+};
 
 /// Minimum content columns the prefix may never consume (clamped to the
 /// layout width itself at pathological widths).
@@ -114,16 +116,25 @@ impl<'a> Ctx<'a> {
             let text = if seg.used { &seg.rest } else { &seg.first };
             seg.used = true;
             let w = self.engine.display_width(text) as u16;
-            inline::append(&mut runs, text, StyleId::Semantic(seg.style), w);
+            inline::append_run(&mut runs, text, StyleId::Semantic(seg.style), w);
         }
         inline::clip_runs(runs, self.prefix_budget(), false, self.engine)
     }
 
-    /// Emit one content line under the current prefix.
-    pub(crate) fn emit(&mut self, content: Vec<Run>) {
-        let mut runs = self.prefix_runs();
-        runs.extend(content);
-        self.push_line(Line::Runs(runs));
+    /// Emit one content line under the current prefix. The prefix is always
+    /// plain text (gutter bars, list markers), so it composes as runs; only
+    /// the content can carry an inline media box.
+    pub(crate) fn emit(&mut self, content: Vec<LineItem>) {
+        let mut items: Vec<LineItem> = self.prefix_runs().into_iter().map(LineItem::Run).collect();
+        items.extend(content);
+        self.push_line(Line::Items(items));
+    }
+
+    /// [`emit`](Self::emit) for content that is text by construction — rules,
+    /// alert titles, table rows. Saves every such caller from restating the
+    /// lift into [`LineItem`].
+    pub(crate) fn emit_runs(&mut self, content: Vec<Run>) {
+        self.emit(content.into_iter().map(LineItem::Run).collect());
     }
 
     /// Vertical spacing: a prefix-only line.
@@ -163,7 +174,7 @@ impl<'a> Ctx<'a> {
         }
         for piece in pieces {
             match piece {
-                Piece::Runs(runs) => self.emit(runs),
+                Piece::Items(items) => self.emit(items),
                 Piece::Box(node, size) => self.emit_box(node, size),
             }
         }
@@ -203,7 +214,7 @@ impl<'a> Ctx<'a> {
                 aux: aux.clone(),
             }];
             let runs = inline::clip_runs(runs, cw, true, self.engine);
-            self.emit(runs);
+            self.emit_runs(runs);
         }
     }
 }
@@ -238,7 +249,7 @@ fn walk_block(ctx: &mut Ctx<'_>, block: &Block) {
             let dw = ctx.engine.cluster_width(dash).max(1);
             let text = dash.repeat(usize::from(cw / dw));
             let w = ctx.engine.display_width(&text) as u16;
-            ctx.emit(vec![Run {
+            ctx.emit_runs(vec![Run {
                 text,
                 style_id: StyleId::Semantic(Semantic::Rule),
                 width: w,
@@ -262,7 +273,7 @@ fn walk_block(ctx: &mut Ctx<'_>, block: &Block) {
             );
             let (label, tone) = alert_label(*kind);
             let w = ctx.engine.display_width(label) as u16;
-            ctx.emit(vec![Run {
+            ctx.emit_runs(vec![Run {
                 text: label.to_string(),
                 style_id: StyleId::Semantic(Semantic::AlertTitle(tone)),
                 width: w,
