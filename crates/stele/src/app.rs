@@ -86,21 +86,29 @@ impl AppState {
         false
     }
 
-    /// Re-lays out the retained document at `width`/`new_size`, preserving
-    /// the scroll position as a fraction of the scrollable range (see the
-    /// phase discovery notes on why this is proportional, not block-exact:
-    /// `LayoutTree::Line::Runs` carries no per-line `NodeId` to anchor on).
+    /// Re-lays out the retained document at `width`/`new_size`, keeping the
+    /// block that was at the top of the viewport at the top afterward
+    /// (DW-5.3). Reflow changes line counts and wrap points, so a proportional
+    /// scroll ratio drifts; anchoring to the source block via the layout
+    /// tree's `line_blocks` map holds the reader's place exactly. Falls back
+    /// to a proportional estimate only when there is no block to anchor to
+    /// (an empty document).
     pub fn relayout(&mut self, ctx: &LayoutContext, width: u16, new_size: Size) {
+        let anchor = self.tree.block_at(self.scroll);
         let old_max = self.max_scroll();
         let ratio = if old_max == 0 {
             0.0
         } else {
             self.scroll as f64 / old_max as f64
         };
+
         self.tree = layout(ctx.doc, width, ctx.config, ctx.engine, ctx.sizer);
         self.size = new_size;
-        let new_max = self.max_scroll();
-        self.scroll = ((ratio * new_max as f64).round() as usize).min(new_max);
+
+        let target = anchor
+            .and_then(|block| self.tree.first_line_of(block))
+            .unwrap_or_else(|| (ratio * self.max_scroll() as f64).round() as usize);
+        self.set_scroll(target);
     }
 
     /// Applies a burst of resize events as the debounced event loop does:
@@ -248,6 +256,78 @@ mod tests {
 
         let topmost_after = topmost_line_text(&state);
         assert_eq!(topmost_before, topmost_after);
+    }
+
+    /// The stronger DW-5.3 case: a document whose paragraphs genuinely REFLOW
+    /// at different widths, so line counts and wrap points change across the
+    /// resize. Proportional scroll drifts here; block anchoring must land the
+    /// reader back on the exact same source block. Uses distinctly-numbered
+    /// long paragraphs so the topmost block's identity is checkable by text.
+    #[test]
+    fn test_dw_5_3_reflowing_document_anchors_to_the_same_block() {
+        // 60 long paragraphs (~20 words each) that wrap differently at 40 vs
+        // 90 cells — the exact case a proportional ratio gets wrong.
+        let source: String = (0..60)
+            .map(|i| {
+                format!(
+                    "Paragraph {i:02} begins here and continues with enough words to wrap \
+                     across several lines at a narrow width but far fewer at a wide one.\n\n"
+                )
+            })
+            .collect();
+        let doc = Document::parse(&source);
+        let config = LayoutConfig::default();
+        let engine = WidthEngine::new(WidthConfig::default());
+        let tree = layout(&doc, 90, &config, &engine, &NullSizer);
+        let mut state = AppState::new(
+            tree,
+            Size {
+                width: 90,
+                height: 10,
+            },
+        );
+        let ctx = LayoutContext {
+            doc: &doc,
+            config: &config,
+            engine: &engine,
+            sizer: &NullSizer,
+        };
+
+        // Scroll to somewhere in the middle and note which source block sits
+        // at the top of the viewport (by node identity, not by text — the top
+        // line may be a wrapped continuation line, not a paragraph start).
+        for _ in 0..40 {
+            state.handle_key(KeyCode::Down);
+        }
+        let anchor = state
+            .tree()
+            .block_at(state.scroll())
+            .expect("a scrolled-to line belongs to a block");
+
+        // Resize narrow (heavy reflow) then back wide — the burst ends at 40,
+        // a width at which every paragraph wraps to a different line count.
+        let sizes: Vec<Size> = [90u16, 30, 55, 40]
+            .iter()
+            .map(|&w| Size {
+                width: w,
+                height: 10,
+            })
+            .collect();
+        state.apply_resize_burst(&ctx, &sizes);
+
+        // The same block is now at the top, pinned to its first line — the
+        // reader's place is held exactly, which a proportional ratio cannot do
+        // once wrap points change.
+        assert_eq!(
+            state.tree().block_at(state.scroll()),
+            Some(anchor),
+            "the topmost block must be preserved across a reflowing resize"
+        );
+        assert_eq!(
+            state.scroll(),
+            state.tree().first_line_of(anchor).unwrap(),
+            "scroll must land on the anchored block's first line"
+        );
     }
 
     fn topmost_line_text(state: &AppState) -> String {

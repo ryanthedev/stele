@@ -34,6 +34,16 @@ pub(crate) struct Ctx<'a> {
     pub sizer: &'a dyn IntrinsicSizer,
     width: u16,
     lines: Vec<Line>,
+    /// The top-level block each emitted line belongs to, in lockstep with
+    /// `lines`. Lets the viewer re-anchor scroll to a source block on resize
+    /// instead of a proportional guess (DW-5.3).
+    line_blocks: Vec<Option<ast::NodeId>>,
+    /// The top-level block currently being walked; tags every line emitted
+    /// while inside it (including its nested descendants).
+    current_block: Option<ast::NodeId>,
+    /// Walk depth: 1 at the top-level `walk_blocks`, deeper inside
+    /// blockquotes/lists. Only depth 1 sets `current_block`.
+    depth: usize,
     prefix: Vec<Seg>,
 }
 
@@ -50,12 +60,22 @@ impl<'a> Ctx<'a> {
             sizer,
             width,
             lines: Vec::new(),
+            line_blocks: Vec::new(),
+            current_block: None,
+            depth: 0,
             prefix: Vec::new(),
         }
     }
 
-    pub fn into_lines(self) -> Vec<Line> {
-        self.lines
+    /// Push one line, tagging it with the current top-level block so
+    /// `lines` and `line_blocks` stay the same length.
+    fn push_line(&mut self, line: Line) {
+        self.lines.push(line);
+        self.line_blocks.push(self.current_block);
+    }
+
+    pub fn into_parts(self) -> (Vec<Line>, Vec<Option<ast::NodeId>>) {
+        (self.lines, self.line_blocks)
     }
 
     /// Push a container prefix; `first` shows on the next emitted line,
@@ -103,7 +123,7 @@ impl<'a> Ctx<'a> {
     pub(crate) fn emit(&mut self, content: Vec<Run>) {
         let mut runs = self.prefix_runs();
         runs.extend(content);
-        self.lines.push(Line::Runs(runs));
+        self.push_line(Line::Runs(runs));
     }
 
     /// Vertical spacing: a prefix-only line.
@@ -130,7 +150,7 @@ impl<'a> Ctx<'a> {
             rows,
         };
         for _ in 0..rows {
-            self.lines.push(Line::Reserved(reserved));
+            self.push_line(Line::Reserved(reserved));
         }
     }
 
@@ -189,13 +209,23 @@ impl<'a> Ctx<'a> {
 }
 
 /// Walk sibling blocks; with `separate`, one blank line goes between them.
+///
+/// At the top level (`depth == 1`) each block sets `current_block`, so every
+/// line it emits — including lines from nested blockquotes/lists — is tagged
+/// with that top-level block for scroll anchoring. Nested calls run deeper
+/// and leave the tag alone.
 pub(crate) fn walk_blocks(ctx: &mut Ctx<'_>, blocks: &[Block], separate: bool) {
+    ctx.depth += 1;
     for (i, block) in blocks.iter().enumerate() {
         if i > 0 && separate {
             ctx.blank_line();
         }
+        if ctx.depth == 1 {
+            ctx.current_block = Some(block.id);
+        }
         walk_block(ctx, block);
     }
+    ctx.depth -= 1;
 }
 
 fn walk_block(ctx: &mut Ctx<'_>, block: &Block) {

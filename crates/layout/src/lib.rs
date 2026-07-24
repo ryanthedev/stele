@@ -194,6 +194,11 @@ impl Line {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LayoutTree {
     lines: Vec<Line>,
+    /// The top-level source block each line belongs to, in lockstep with
+    /// `lines`. Powers block-anchored scroll on resize (DW-5.3): re-lay out at
+    /// a new width, then re-anchor to the block that was at the top rather
+    /// than guessing a proportional offset.
+    line_blocks: Vec<Option<NodeId>>,
     width: u16,
 }
 
@@ -220,6 +225,19 @@ impl LayoutTree {
     pub fn width(&self) -> u16 {
         self.width
     }
+
+    /// The top-level source block the line at `index` belongs to, or `None`
+    /// for an out-of-range index or a line with no owning block.
+    pub fn block_at(&self, index: usize) -> Option<NodeId> {
+        self.line_blocks.get(index).copied().flatten()
+    }
+
+    /// The first line index owned by `block`, or `None` if the block emitted
+    /// no lines in this tree. The scroll anchor for resize: relayout, then
+    /// scroll so the previously-topmost block is at the top again.
+    pub fn first_line_of(&self, block: NodeId) -> Option<usize> {
+        self.line_blocks.iter().position(|b| *b == Some(block))
+    }
 }
 
 /// Lay out a parsed document at `width` cells.
@@ -239,8 +257,10 @@ pub fn layout(
     let width = width.clamp(min, max);
     let mut ctx = block::Ctx::new(doc, engine, sizer, width);
     block::walk_blocks(&mut ctx, doc.blocks(), true);
+    let (lines, line_blocks) = ctx.into_parts();
     LayoutTree {
-        lines: ctx.into_lines(),
+        lines,
+        line_blocks,
         width,
     }
 }
