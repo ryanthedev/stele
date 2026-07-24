@@ -88,6 +88,7 @@ pub(crate) fn layout_table(ctx: &mut Ctx<'_>, alignments: &[Alignment], rows: &[
         text: SEPARATOR.to_string(),
         style_id: StyleId::Semantic(Semantic::TableBorder),
         width: sep_w,
+        aux: None,
     };
     let header_rows = grid.iter().filter(|(h, _)| *h).count();
     for (ri, (_, cells)) in grid.iter().enumerate() {
@@ -142,6 +143,7 @@ fn collect_atoms(atoms: &[Atom]) -> Vec<Atom> {
                     .map(|f| inline::Frag {
                         text: f.text.clone(),
                         style: f.style,
+                        link: f.link.clone(),
                     })
                     .collect(),
             ),

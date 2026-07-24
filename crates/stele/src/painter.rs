@@ -11,6 +11,7 @@
 
 use std::io::{self, Write};
 
+use highlight::{HYPERLINK_CLOSE, hyperlink_open};
 use layout::{LayoutTree, Line, Reserved, Run, Semantic, StyleId};
 use width::WidthEngine;
 
@@ -177,7 +178,10 @@ impl Painter {
             // `Decor::highlight` is code-block-specific (see the decor
             // module docs): every other run passes through unchanged.
             let expanded = if run.style_id == StyleId::Semantic(Semantic::CodeBlock) {
-                self.decor.highlight(&run.text, None)
+                // `run.aux` carries the code fence's language (threaded from
+                // layout), so the highlighter can pick a grammar instead of
+                // always falling back to a plain block.
+                self.decor.highlight(&run.text, run.aux.as_deref())
             } else {
                 vec![run.clone()]
             };
@@ -199,9 +203,25 @@ impl Painter {
                     continue;
                 }
                 let truncated = clipped_text.len() < sanitized.len();
+                // A link run carries its destination in `aux`; wrap the text
+                // in an OSC 8 hyperlink. `hyperlink::open` sanitizes the URL
+                // (scheme allowlist, control/`;` bytes stripped) and returns
+                // None for a hostile or disallowed URL, so nothing is emitted
+                // and the text still renders as plain styled text.
+                let link_open = if expanded_run.style_id == StyleId::Semantic(Semantic::Link) {
+                    expanded_run.aux.as_deref().and_then(hyperlink_open)
+                } else {
+                    None
+                };
+                if let Some(seq) = &link_open {
+                    out.write_all(seq.as_bytes())?;
+                }
                 let style = self.decor.resolve(expanded_run.style_id);
                 write_sgr(out, &style)?;
                 out.write_all(clipped_text.as_bytes())?;
+                if link_open.is_some() {
+                    out.write_all(HYPERLINK_CLOSE.as_bytes())?;
+                }
                 painted_any = true;
                 remaining = remaining.saturating_sub(clipped_width);
                 if truncated {

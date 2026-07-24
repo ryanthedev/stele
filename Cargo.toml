@@ -3,8 +3,10 @@ resolver = "3"
 members = [
     "crates/ast",
     "crates/gfx",
+    "crates/highlight",
     "crates/layout",
     "crates/math",
+    "crates/mermaid",
     "crates/probe",
     "crates/stele",
     "crates/width",

@@ -17,8 +17,10 @@ path = "src/main.rs"
 [dependencies]
 ast = { path = "../ast" }
 gfx = { path = "../gfx" }
+highlight = { path = "../highlight" }
 layout = { path = "../layout" }
 math = { path = "../math" }
+mermaid = { path = "../mermaid" }
 width = { path = "../width" }
 crossterm = "0.29"
 clap = { version = "4", features = ["derive"] }

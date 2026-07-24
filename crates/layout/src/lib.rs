@@ -150,6 +150,14 @@ pub struct Run {
     pub text: String,
     pub style_id: StyleId,
     pub width: u16,
+    /// Auxiliary paint-time data whose meaning is fixed by `style_id`, since
+    /// a run is exactly one kind: the code-fence info string (language) for a
+    /// `Semantic::CodeBlock` run, or the destination URL for a `Semantic::Link`
+    /// run. `None` for every other run. This is the channel the painter needs
+    /// to pass a language to `Decor::highlight` and to wrap link text in an
+    /// OSC 8 hyperlink — layout is the only place that still has the AST's
+    /// `info`/`dest` in hand.
+    pub aux: Option<Box<str>>,
 }
 
 /// A cell region reserved for media (P6 paints into it). A box `rows` tall

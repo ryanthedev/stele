@@ -15,7 +15,7 @@ use width::{WidthConfig, WidthEngine};
 
 use stele::app::{AppState, LayoutContext};
 use stele::cli::Cli;
-use stele::decor::StructuralDecor;
+use stele::decor::themed::ThemedDecor;
 use stele::loader;
 use stele::media::{GfxMediaSink, ImageSizer, NoopMediaSink};
 use stele::painter::{Painter, Size};
@@ -40,6 +40,11 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    // Source preprocessing before parse: hide a leading frontmatter block
+    // unless --frontmatter, then render top-level mermaid fences to grids.
+    let source = stele::decor::frontmatter::apply(&source, cli.frontmatter).into_owned();
+    let source = stele::decor::mermaid::preprocess(&source).into_owned();
 
     let doc = Document::parse(&source);
     let engine = WidthEngine::new(WidthConfig::default());
@@ -109,7 +114,10 @@ fn main() -> ExitCode {
         // paths and math sources by `NodeId` at paint time.
         painter.register_media(Box::new(GfxMediaSink::new(doc.clone(), &base_dir)));
     }
-    painter.register_decor(Box::new(StructuralDecor));
+    // The themed decor provides real syntax highlighting and theme colors.
+    // Background is not OSC 11-probed here (that needs a pre-alt-screen query
+    // round-trip); detect() falls back to the dark theme and honors NO_COLOR.
+    painter.register_decor(Box::new(ThemedDecor::detect(None)));
 
     let result = run_session(&ctx, &mut state, &mut painter);
 

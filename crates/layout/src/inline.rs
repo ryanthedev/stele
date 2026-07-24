@@ -7,6 +7,8 @@
 //! clusters — never byte or char counts. A word group wider than the
 //! content width falls back to break-anywhere at cluster boundaries.
 
+use std::rc::Rc;
+
 use ast::{Document, Inline, InlineKind};
 use width::{WidthEngine, graphemes};
 
@@ -20,6 +22,16 @@ pub(crate) const INDICATOR: &str = "\u{2026}"; // …
 pub(crate) struct Frag {
     pub text: String,
     pub style: Semantic,
+    /// Destination URL when this fragment is inside a link (`Semantic::Link`),
+    /// carried onto the emitted run's `aux` so the painter can wrap it in an
+    /// OSC 8 hyperlink. `Rc` because every fragment of one link shares it.
+    pub link: Option<Rc<str>>,
+}
+
+impl Frag {
+    fn link_box(&self) -> Option<Box<str>> {
+        self.link.as_ref().map(|s| Box::from(&**s))
+    }
 }
 
 /// One wrappable unit.
@@ -57,6 +69,7 @@ pub(crate) fn flatten(
         allow_box,
         atoms: Vec::new(),
         word: Vec::new(),
+        link: None,
     };
     fl.visit_all(inlines, base);
     fl.flush_word();
@@ -69,6 +82,9 @@ struct Flattener<'a> {
     allow_box: bool,
     atoms: Vec<Atom>,
     word: Vec<Frag>,
+    /// The enclosing link's destination while visiting its children, so text
+    /// fragments inside it carry the URL. Save/restore around the subtree.
+    link: Option<Rc<str>>,
 }
 
 impl Flattener<'_> {
@@ -99,7 +115,15 @@ impl Flattener<'_> {
             InlineKind::Strikethrough(children) => {
                 self.visit_all(children, Semantic::Strikethrough)
             }
-            InlineKind::Link { children, .. } => self.visit_all(children, Semantic::Link),
+            InlineKind::Link { children, dest, .. } => {
+                // Carry the raw destination while visiting the link's text;
+                // the painter sanitizes it before it reaches an OSC 8
+                // sequence. Save/restore handles the (rare) nested case.
+                let saved = self.link.take();
+                self.link = Some(Rc::from(dest.as_str()));
+                self.visit_all(children, Semantic::Link);
+                self.link = saved;
+            }
             InlineKind::Image { children, .. } => match self.try_size(inline) {
                 Some(size) => self.push_box(inline, size),
                 None => self.visit_all(children, Semantic::ImageAlt),
@@ -136,10 +160,11 @@ impl Flattener<'_> {
                 self.push_space();
             } else {
                 match self.word.last_mut() {
-                    Some(f) if f.style == style => f.text.push(ch),
+                    Some(f) if f.style == style && f.link == self.link => f.text.push(ch),
                     _ => self.word.push(Frag {
                         text: ch.to_string(),
                         style,
+                        link: self.link.clone(),
                     }),
                 }
             }
@@ -205,7 +230,13 @@ pub(crate) fn wrap(atoms: Vec<Atom>, content_width: u16, engine: &WidthEngine) -
                 } else {
                     for f in &frags {
                         let w = cells(engine, &f.text);
-                        append(&mut cur, &f.text, StyleId::Semantic(f.style), w);
+                        append_aux(
+                            &mut cur,
+                            &f.text,
+                            StyleId::Semantic(f.style),
+                            w,
+                            f.link_box(),
+                        );
                     }
                     cur_w = cur_w.saturating_add(word_w);
                 }
@@ -232,6 +263,7 @@ fn break_anywhere(
 ) {
     for f in frags {
         let style = StyleId::Semantic(f.style);
+        let link = f.link_box();
         for g in graphemes(&f.text) {
             let gw = engine.cluster_width(g);
             if gw > cw {
@@ -255,7 +287,7 @@ fn break_anywhere(
                 out.push(Piece::Runs(std::mem::take(cur)));
                 *cur_w = 0;
             }
-            append(cur, g, style, gw);
+            append_aux(cur, g, style, gw, link.clone());
             *cur_w = cur_w.saturating_add(gw);
         }
     }
@@ -272,13 +304,26 @@ pub(crate) fn cells(engine: &WidthEngine, s: &str) -> u16 {
     engine.display_width(s).min(u16::MAX as usize) as u16
 }
 
-/// Append text to the line, merging into the last run when styles match.
+/// Append text to the line, merging into the last run when style matches.
 pub(crate) fn append(cur: &mut Vec<Run>, text: &str, style_id: StyleId, width: u16) {
+    append_aux(cur, text, style_id, width, None);
+}
+
+/// Like [`append`], but carries `aux` (the link URL) onto the run. Merges
+/// into the last run only when BOTH style and `aux` match, so two adjacent
+/// links with different destinations never coalesce into one hyperlink.
+pub(crate) fn append_aux(
+    cur: &mut Vec<Run>,
+    text: &str,
+    style_id: StyleId,
+    width: u16,
+    aux: Option<Box<str>>,
+) {
     if text.is_empty() {
         return;
     }
     match cur.last_mut() {
-        Some(run) if run.style_id == style_id => {
+        Some(run) if run.style_id == style_id && run.aux == aux => {
             run.text.push_str(text);
             // Saturate: a merged run past u16::MAX is pathological, but
             // clip_runs re-measures by cluster, so an honest-but-capped
@@ -289,6 +334,7 @@ pub(crate) fn append(cur: &mut Vec<Run>, text: &str, style_id: StyleId, width: u
             text: text.to_string(),
             style_id,
             width,
+            aux,
         }),
     }
 }
@@ -331,7 +377,7 @@ pub(crate) fn clip_runs(
             text.push_str(g);
             tw += gw;
         }
-        append(&mut out, &text, run.style_id, tw);
+        append_aux(&mut out, &text, run.style_id, tw, run.aux.clone());
         break;
     }
     if indicate && iw <= max_width {

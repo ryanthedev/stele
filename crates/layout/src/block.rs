@@ -159,7 +159,11 @@ impl<'a> Ctx<'a> {
     /// Emit literal text line by line: clipped with an indicator, never
     /// wrapped (code blocks, HTML blocks, frontmatter). Tabs expand to
     /// four spaces (the width engine measures cells, not control bytes).
-    fn literal_block(&mut self, literal: &str, style: Semantic) {
+    ///
+    /// `aux` carries the code fence's info string (language) onto every
+    /// emitted line's run, so the painter can hand it to `Decor::highlight`;
+    /// HTML and frontmatter blocks pass `None`.
+    fn literal_block(&mut self, literal: &str, style: Semantic, aux: Option<Box<str>>) {
         let cw = self.content_width();
         let mut src_lines: Vec<&str> = literal.split('\n').collect();
         if src_lines.last() == Some(&"") {
@@ -176,6 +180,7 @@ impl<'a> Ctx<'a> {
                 text,
                 style_id: StyleId::Semantic(style),
                 width: w,
+                aux: aux.clone(),
             }];
             let runs = inline::clip_runs(runs, cw, true, self.engine);
             self.emit(runs);
@@ -207,6 +212,7 @@ fn walk_block(ctx: &mut Ctx<'_>, block: &Block) {
                 text,
                 style_id: StyleId::Semantic(Semantic::Rule),
                 width: w,
+                aux: None,
             }]);
         }
         BlockKind::BlockQuote { children } => {
@@ -230,6 +236,7 @@ fn walk_block(ctx: &mut Ctx<'_>, block: &Block) {
                 text: label.to_string(),
                 style_id: StyleId::Semantic(Semantic::AlertTitle(tone)),
                 width: w,
+                aux: None,
             }]);
             if !children.is_empty() {
                 ctx.blank_line();
@@ -248,9 +255,21 @@ fn walk_block(ctx: &mut Ctx<'_>, block: &Block) {
         // A ListItem outside a List cannot come out of the parser; lay its
         // children out rather than silently dropping content if it ever does.
         BlockKind::ListItem { children, .. } => walk_blocks(ctx, children, true),
-        BlockKind::CodeBlock { literal, .. } => ctx.literal_block(literal, Semantic::CodeBlock),
-        BlockKind::HtmlBlock { literal } => ctx.literal_block(literal, Semantic::Html),
-        BlockKind::FrontMatter { literal } => ctx.literal_block(literal, Semantic::FrontMatter),
+        BlockKind::CodeBlock { literal, info, .. } => {
+            let lang = info
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                // The info string is "lang extra words"; only the first token
+                // is the language tag (CommonMark 0.31.2 §4.5).
+                .and_then(|s| s.split_whitespace().next())
+                .map(|s| s.to_owned().into_boxed_str());
+            ctx.literal_block(literal, Semantic::CodeBlock, lang);
+        }
+        BlockKind::HtmlBlock { literal } => ctx.literal_block(literal, Semantic::Html, None),
+        BlockKind::FrontMatter { literal } => {
+            ctx.literal_block(literal, Semantic::FrontMatter, None)
+        }
         BlockKind::Table { alignments, rows } => crate::table::layout_table(ctx, alignments, rows),
         // Rows/cells only occur under Table and are handled there.
         BlockKind::TableRow { .. } | BlockKind::TableCell { .. } => {}

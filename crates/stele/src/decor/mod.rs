@@ -8,6 +8,18 @@ use layout::{Run, Semantic, StyleId};
 
 use crate::painter::Style;
 
+/// `--frontmatter` visibility (parsed in `cli.rs`; this module makes the
+/// flag do something): strips a leading YAML frontmatter block from the
+/// source before parsing, unless the flag says to show it.
+pub mod frontmatter;
+/// Renders ` ```mermaid ` fences to box-drawing grids as a source-text
+/// preprocessor run before `Document::parse`.
+pub mod mermaid;
+/// P7's implementation: bridges `crates/highlight`'s theme/highlighter
+/// onto this trait. Registrable in one line via [`crate::painter::Painter::register_decor`]:
+/// `painter.register_decor(Box::new(themed::ThemedDecor::detect(bg_reply)))`.
+pub mod themed;
+
 /// P7's hook: turns a code-block line into syntax-highlighted runs, and
 /// resolves any [`StyleId`] to concrete SGR attributes.
 pub trait Decor {
@@ -35,6 +47,7 @@ impl Decor for StructuralDecor {
             text: line_text.to_string(),
             style_id: StyleId::Semantic(Semantic::CodeBlock),
             width: 0,
+            aux: None,
         }]
     }
 

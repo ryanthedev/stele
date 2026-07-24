@@ -1,0 +1,9 @@
+Hostile links
+
+A safe link, for contrast: safe.
+
+A javascript: scheme link: click me.
+
+A data: URI link: click me.
+
+A bare vbscript: scheme link: click me.

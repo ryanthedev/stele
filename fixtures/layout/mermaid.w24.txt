@@ -1,0 +1,17 @@
+Mermaid fences
+
+A flowchart with a
+decision node, rendered
+as a text block:
+
+graph TD
+  A[Start] --> B{Decisi…
+  B -->|Yes| C[Do thing]
+  B -->|No| D[Skip]
+
+An unsupported diagram
+type, which must fall
+back to a plain code
+block:
+
+unknownDiagramType titl…
