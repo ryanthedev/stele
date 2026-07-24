@@ -31,7 +31,17 @@ flowchart the two lines render as *two extra floating boxes* reading
 `accTitle: …` and `accDescr: …`; in an `erDiagram` and a `sequenceDiagram`
 they are hard parse errors that send the whole fence to the code-block
 fallback. Accessibility metadata that breaks the render is not accessibility.
-Those 18 warnings are expected output for this file, not defects.
+Those 14 warnings are expected output for this file, not defects.
+
+Current validator score for this file: **33 diagrams extracted, 28 clean, 5
+errors, 18 warnings**. All 5 errors are the deliberately-broken fences in
+Part 4. Of the 18 warnings, 14 are the `accTitle` advice above, 3 are the
+intentionally over-long labels in Part 3, and 1 is a lint false positive — the
+static rule reads the `||--o{` crow's foot in the ER diagram as a node named
+`o` with a 142-character label. Four further fences (the blockquote-nested
+ones and the two non-`mermaid` info strings in Part 6) are not extracted by
+the markdown scanner at all; those were validated separately as standalone
+`.mmd` files and all four pass.
 
 ---
 
@@ -522,7 +532,8 @@ flowchart LR
 *expect: renders as a text grid, ~91 columns × 160 rows. Well past siren's
 15–25 node readability ceiling on purpose: this is a layout stress test, not
 a diagram anyone should copy. Expect long vertical runs and edge stems
-threading between box columns; validate.mjs: pass, with a complexity warning.*
+threading between box columns; validate.mjs: pass — worth noting that the
+static lint has no node-count rule, so nothing here flags the size.*
 
 ```mermaid
 flowchart TD
@@ -630,26 +641,44 @@ flowchart TD
 
 ### Quotes, parentheses, unicode and emoji
 
-*expect: renders as a text grid — and renders it **wrong** in two specific,
-known ways. Neither is a stele bug; both are `mermaid-text` 0.57.0 behaviour,
-and both are the reason this case is in the doc; validate.mjs: pass.*
+*expect: renders as a text grid, 48 columns × 29 rows — and renders it
+**wrong** in two specific, measured ways. Neither is a stele bug; both are
+`mermaid-text` 0.57.0 behaviour, and both are why this case is in the doc;
+validate.mjs: pass.*
 
 1. **Quotes are not stripped from flowchart node labels.** `A["Quoted"]`
    renders as `│ "Quoted" │`, quote marks included. Edge labels and pie slice
    labels *are* unquoted; node labels are not. Since siren (correctly)
-   requires quoting any label containing `()`, `""` or `<>`, every such label
+   requires quoting any label containing `()`, `[]` or `<>`, every such label
    shows its quotes in the terminal while rendering clean on GitHub.
-2. **Box borders drift on wide graphemes.** The node box is *sized* in display
-   columns, but painted into a per-character canvas, so every width-2
-   grapheme pushes the right border one cell past where it belongs. Measured
-   on this diagram: the `🧵` row is 1 column wider than its border, and the
-   CJK + flag-emoji row is 3 columns wider. Expect visibly ragged right edges
-   on those two boxes only.
+2. **Box borders drift right on wide graphemes.** Measured on this exact
+   diagram: the `🧵` box has a 45-column border and a 46-column content row —
+   1 over. The `日本語 🇯🇵` box has a 45-column border and a 48-column content
+   row — 3 over. Expect visibly ragged right edges on those two boxes and no
+   others. The CJK run also renders with spurious gaps (`日 本 語`). Both
+   symptoms are consistent with the box being *sized* in display columns and
+   then *painted* into a per-character canvas; stele's own `width` crate is
+   Ghostty-correct, and the grid it receives is already ragged before it
+   arrives.
+
+Two escaping routes that siren's `gotchas.md` recommends are unusable here,
+which is why neither appears below:
+
+- **HTML entities (`&quot;`, `#quot;`) silently shred the diagram.** A
+  semicolon is a statement separator in flowcharts, so `&quot;` splits the
+  label mid-token; `mermaid-text` then emits three garbage nodes
+  (`C["Handles &quot`, `quoted&quot`, `bracketed] ones"`) and reports success.
+  A silent defect, not an error.
+- **Single-quoted labels (`A['has "quotes"']`) are a hard parse error in
+  mmdc 11.16.0**, even though `mermaid-text` accepts them.
+
+Typographic `“ ”` are the one form that survives both: no semicolon, no
+delimiter clash, and width-1 so they cause no border drift.
 
 ```mermaid
-flowchart LR
+flowchart TD
     A["Reads a byte at a time (never buffered)"] --> B["Emits ⟨grapheme, cell-count⟩ pairs 🧵"]
-    B --> C["Handles &quot;quoted&quot; runs and [bracketed] ones"]
+    B --> C["Handles “curly quoted” and [bracketed] runs"]
     C --> D["Café — naïve — 日本語 — 🇯🇵 — U+FFFD �"]
 ```
 
