@@ -120,13 +120,26 @@ impl Emitter {
     /// `delete` + a fresh `transmit`/`place`) every frame a Reserved box is
     /// visible, so painting the surrounding text on top of/around it is
     /// exactly the same full-repaint model the rest of the painter uses.
+    ///
+    /// **Placement id (`p=`) is load-bearing.** The put carries an explicit,
+    /// stable placement id equal to the image id, because stele keeps exactly
+    /// one placement per image. Per the kitty graphics protocol, "if you send
+    /// two placements with the same `image id` and `placement id` the second
+    /// one will replace the first" — so re-placing on the next frame *moves*
+    /// the image to its new row without flicker. Omitting `p=` (or `p=0`)
+    /// does the opposite: the spec states it "results in multiple placements
+    /// [of] the image," so every scroll frame would leave a stale copy behind
+    /// — the exact vertical trail of ghost images the repaint-behind model is
+    /// meant to avoid. The one-placement-per-image invariant makes reusing the
+    /// image id as the placement id both safe and sufficient.
     pub fn place(&mut self, id: ImageId, rect: CellRect, out: &mut dyn Write) {
         let row = rect.y.saturating_add(1);
         let col = rect.x.saturating_add(1);
         let _ = write!(out, "\x1b[{row};{col}H");
         let _ = write!(
             out,
-            "\x1b_Ga=p,i={},c={},r={},q=2\x1b\\",
+            "\x1b_Ga=p,i={},p={},c={},r={},q=2\x1b\\",
+            id.get(),
             id.get(),
             rect.width.max(1),
             rect.height.max(1)
@@ -146,6 +159,22 @@ impl Emitter {
     /// own storage quota and began silently rejecting new transmits.
     pub fn delete(&mut self, id: ImageId, out: &mut dyn Write) {
         let _ = write!(out, "\x1b_Ga=d,d=I,i={},q=2\x1b\\", id.get());
+    }
+
+    /// Deletes image `id`'s **placements only** (`a=d,d=i` — lowercase),
+    /// leaving its transmitted pixel data resident so an immediately
+    /// following [`place`](Self::place) can redraw it without re-transmitting.
+    ///
+    /// This is the backstop for the repaint-behind model when the terminal
+    /// does not honor same-`(i, p)` put replacement: emitting this before each
+    /// re-place guarantees the previous frame's placement is gone before the
+    /// new one is drawn, so a still-visible image cannot accumulate a stacked
+    /// trail regardless of whether the terminal treats a repeated put as a
+    /// move or as a new placement. Kept distinct from [`delete`](Self::delete)
+    /// (`d=I`, which also frees the pixel data) precisely because the per-frame
+    /// path must NOT drop the raster it is about to reuse.
+    pub fn clear_placements(&mut self, id: ImageId, out: &mut dyn Write) {
+        let _ = write!(out, "\x1b_Ga=d,d=i,i={},q=2\x1b\\", id.get());
     }
 }
 
@@ -240,7 +269,54 @@ mod tests {
             height: 3,
         };
         let out = captured(|buf| Emitter::new().place(ImageId::new(9), rect, buf));
-        assert_eq!(out, "\x1b[3;5H\x1b_Ga=p,i=9,c=10,r=3,q=2\x1b\\");
+        assert_eq!(out, "\x1b[3;5H\x1b_Ga=p,i=9,p=9,c=10,r=3,q=2\x1b\\");
+    }
+
+    /// Regression for the ghost-image trail: re-placing the same image at a
+    /// new row on a later frame must reuse the SAME `(i, p)` pair so kitty
+    /// replaces (moves) the placement instead of stacking a second one. A
+    /// missing or `0` placement id silently reintroduces the trail, so this
+    /// asserts a stable, nonzero `p=` equal to the image id on every place.
+    #[test]
+    fn test_place_emits_stable_placement_id_so_replace_moves_not_stacks() {
+        let frame1 = captured(|buf| {
+            Emitter::new().place(
+                ImageId::new(7),
+                CellRect {
+                    x: 0,
+                    y: 2,
+                    width: 8,
+                    height: 4,
+                },
+                buf,
+            )
+        });
+        let frame2 = captured(|buf| {
+            Emitter::new().place(
+                ImageId::new(7),
+                CellRect {
+                    x: 0,
+                    y: 5,
+                    width: 8,
+                    height: 4,
+                },
+                buf,
+            )
+        });
+        assert!(
+            frame1.contains("i=7,p=7,"),
+            "frame 1 missing stable p=: {frame1:?}"
+        );
+        assert!(
+            frame2.contains("i=7,p=7,"),
+            "frame 2 missing stable p=: {frame2:?}"
+        );
+        // The put commands are identical apart from the cursor move — same
+        // (i, p) pair, so kitty treats frame 2 as a move of frame 1's
+        // placement, not a new one.
+        let put1 = &frame1[frame1.find("\x1b_G").unwrap()..];
+        let put2 = &frame2[frame2.find("\x1b_G").unwrap()..];
+        assert_eq!(put1, put2, "put command must be identical across frames");
     }
 
     #[test]
@@ -259,5 +335,12 @@ mod tests {
     fn test_delete_emits_a_d_d_i() {
         let out = captured(|buf| Emitter::new().delete(ImageId::new(3), buf));
         assert_eq!(out, "\x1b_Ga=d,d=I,i=3,q=2\x1b\\");
+    }
+
+    #[test]
+    fn test_clear_placements_emits_lowercase_d_i_keeping_pixel_data() {
+        let out = captured(|buf| Emitter::new().clear_placements(ImageId::new(3), buf));
+        // Lowercase d=i: placements gone, transmitted raster kept for reuse.
+        assert_eq!(out, "\x1b_Ga=d,d=i,i=3,q=2\x1b\\");
     }
 }
