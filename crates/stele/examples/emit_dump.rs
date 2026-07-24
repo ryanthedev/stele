@@ -144,6 +144,110 @@ fn main() {
     for s in re.0.iter().take(10) {
         println!("    {s}");
     }
+
+    barricade_report(&buf);
+}
+
+/// Reports any escape sequence on the wire that the painter itself does not
+/// emit — i.e. one that leaked out of the document.
+///
+/// This is the automated half of the injection barricade. `sanitize()` strips
+/// C0/DEL/C1 and bidi formatting from every run before it is written, so a
+/// hostile document's payloads should arrive as inert literal text. Anything
+/// here that is not a painter shape means that guarantee broke.
+///
+/// The allowlist is wider than the one in `tests/painter_frame.rs` because
+/// that test runs with no media sink and no links: a real frame legitimately
+/// carries kitty graphics APCs and OSC 8 hyperlinks too.
+fn barricade_report(bytes: &[u8]) {
+    let mut leaked: Vec<(usize, String)> = Vec::new();
+    let mut raw_control: Vec<(usize, u8)> = Vec::new();
+    let mut i = 0;
+    let mut accounted = 0usize;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        // A raw control byte on the wire is a leak regardless of what follows.
+        if b != 0x1B && (b < 0x20 || b == 0x7F) && !matches!(b, b'\n' | b'\r' | b'\t') {
+            raw_control.push((i, b));
+            i += 1;
+            continue;
+        }
+        if b != 0x1B {
+            i += 1;
+            continue;
+        }
+        let rest = &bytes[i + 1..];
+        let consumed = match rest.first() {
+            // Kitty graphics APC: ESC _ G ... ESC \
+            Some(b'_') => find_st(rest).map(|n| n + 1),
+            // OSC: ESC ] ... (ESC \ | BEL)
+            Some(b']') => find_osc_end(rest).map(|n| n + 1),
+            // String terminator on its own.
+            Some(b'\\') => Some(2),
+            Some(b'[') => {
+                let mut j = 1;
+                // `?` only for the private modes the painter itself uses.
+                if rest.get(j) == Some(&b'?') {
+                    j += 1;
+                }
+                while j < rest.len() && matches!(rest[j], b'0'..=b'9' | b';') {
+                    j += 1;
+                }
+                match rest.get(j) {
+                    Some(b'H') | Some(b'm') | Some(b'K') | Some(b'h') | Some(b'l') => Some(j + 2),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        match consumed {
+            Some(n) => {
+                accounted += 1;
+                i += n;
+            }
+            None => {
+                let end = (i + 16).min(bytes.len());
+                leaked.push((i, String::from_utf8_lossy(&bytes[i..end]).into_owned()));
+                i += 1;
+            }
+        }
+    }
+
+    println!("\n=== injection barricade ===");
+    println!("  painter escape sequences (accounted): {accounted}");
+    if raw_control.is_empty() && leaked.is_empty() {
+        println!("  LEAKED: none — every escape on the wire is a painter shape");
+        return;
+    }
+    println!("  RAW CONTROL BYTES: {}", raw_control.len());
+    for (at, b) in raw_control.iter().take(5) {
+        println!("    byte {at}: {b:#04x}");
+    }
+    println!("  UNRECOGNIZED SEQUENCES: {}", leaked.len());
+    for (at, s) in leaked.iter().take(5) {
+        println!("    byte {at}: {s:?}");
+    }
+}
+
+/// Offset just past an `ESC \` string terminator, if present.
+fn find_st(rest: &[u8]) -> Option<usize> {
+    (0..rest.len().saturating_sub(1))
+        .find(|&k| rest[k] == 0x1B && rest[k + 1] == b'\\')
+        .map(|k| k + 2)
+}
+
+/// Offset just past an OSC terminator — `ESC \` or a bare BEL.
+fn find_osc_end(rest: &[u8]) -> Option<usize> {
+    for k in 0..rest.len() {
+        if rest[k] == 0x07 {
+            return Some(k + 1);
+        }
+        if rest[k] == 0x1B && rest.get(k + 1) == Some(&b'\\') {
+            return Some(k + 2);
+        }
+    }
+    None
 }
 
 /// Tiny hand-rolled scan for `ESC [ row ; col H ESC _ G a=p,...` — avoids

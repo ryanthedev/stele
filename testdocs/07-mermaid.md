@@ -21,8 +21,17 @@ Two things worth knowing before reading the expectations:
   replacement can then never overlap a parent block's span.
 
 Every diagram below was rendered through `mermaid-text` 0.57.0 before being
-committed here, and checked with siren's `validate.mjs`. Where the two
-disagree, the note says so.
+committed here, and checked with siren's `validate.mjs` (static lint plus a
+real `mmdc` v11.16.0 render). Where the two disagree, the note says so.
+
+**No diagram here carries `accTitle`/`accDescr`, and that is deliberate.**
+`validate.mjs` warns about their absence on every diagram — good advice for a
+web target, wrong for this one. Measured against `mermaid-text` 0.57.0: in a
+flowchart the two lines render as *two extra floating boxes* reading
+`accTitle: …` and `accDescr: …`; in an `erDiagram` and a `sequenceDiagram`
+they are hard parse errors that send the whole fence to the code-block
+fallback. Accessibility metadata that breaks the render is not accessibility.
+Those 18 warnings are expected output for this file, not defects.
 
 ---
 
@@ -339,19 +348,19 @@ for elements) with a plain `Relationships:` list underneath; long `text:` and
 ```mermaid
 requirementDiagram
     requirement fence_fallback {
-        id: DW-7.3
+        id: "DW-7.3"
         text: A mermaid fence that fails to parse falls back to a code fence
         risk: high
         verifymethod: test
     }
     functionalRequirement grid_render {
-        id: DW-7.3a
+        id: "DW-7.3a"
         text: A valid mermaid fixture renders as a text grid
         risk: medium
         verifymethod: test
     }
     performanceRequirement no_crash {
-        id: DW-7.3b
+        id: "DW-7.3b"
         text: No render path may panic on hostile input
         risk: high
         verifymethod: analysis
@@ -369,6 +378,12 @@ requirementDiagram
     mermaid_crate - verifies -> no_crash
     preprocessor - traces -> mermaid_crate
 ```
+
+The `id:` values are quoted because a bare `DW-7.3` is a hard parse error in
+mermaid proper — a hyphen inside an unquoted requirement id ends the token.
+`mermaid-text` accepts either form but does not strip the quotes, so `"DW-7.3"`
+prints with its quote marks in the grid. Quoted is the right trade: valid
+everywhere, cosmetically imperfect in one place.
 
 ### sankey-beta — where the terminal columns go
 
