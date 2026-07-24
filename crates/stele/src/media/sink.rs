@@ -47,6 +47,7 @@ use layout::Reserved;
 use width::WidthEngine;
 
 use crate::media::MediaSink;
+use crate::media::sizer::MATH_BASELINE_PX_HEIGHT;
 use crate::painter::CellRect;
 
 /// Kitty protocol / DW-6.1 cap: at most this many placements stay live at
@@ -371,7 +372,21 @@ impl GfxMediaSink {
                     .place(id, Self::to_gfx_rect(rect, reserved.rows), out);
                 return Resolved::Graphics;
             }
-            if let Ok(png) = math::render(&tex, target.1.max(1)) {
+            // Render at the SAME em the sizer measured this box with, and let
+            // the math crate letterbox the raster onto the box's aspect.
+            //
+            // This used to pass `target.1` — the box's total pixel height —
+            // into an argument that means *em size*, so every formula
+            // rasterized oversized (by its own em-height factor) and the
+            // terminal scaled it back down, burning resolution and stretching
+            // the glyphs by whatever the cell rounding left over. Deriving the
+            // em from the box instead is no better: it makes glyph size depend
+            // on whether a formula happens to have a superscript, so `a+b=c`
+            // and `e^{i\pi}+1=0` would render at visibly different sizes on
+            // the same line. A fixed em is what keeps a formula looking like
+            // the text around it.
+            if let Ok(png) = math::render_fitted(&tex, MATH_BASELINE_PX_HEIGHT, target.0, target.1)
+            {
                 self.evict_lru_if_needed(node_id, out);
                 let id = self
                     .placements

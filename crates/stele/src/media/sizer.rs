@@ -37,7 +37,7 @@ const ASSUMED_CELL_PX: (u32, u32) = (24, 48);
 /// sizer converts em units against. Matches `crates/math`'s own baseline so
 /// a size probed here and a raster later rendered at the same nominal size
 /// agree.
-const MATH_BASELINE_PX_HEIGHT: u32 = 40;
+pub(crate) const MATH_BASELINE_PX_HEIGHT: u32 = 40;
 
 /// Upper bound on a single reserved box's cell extent, independent of the
 /// probed pixel/em size — a legitimately large (within `gfx::Limits`)

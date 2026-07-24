@@ -27,9 +27,9 @@
 //! the document: a `DisplayList` cache keyed by the exact TeX source
 //! (reused across a `px_height` change — no re-parse, no re-layout, only a
 //! re-rasterization at the new size) and a final-PNG cache keyed by
-//! `(tex, px_height)` (skips rasterization entirely on a byte-identical
-//! repeat request). [`cache_stats`] exposes hit/miss counters so this is
-//! asserted deterministically rather than by timing.
+//! `(tex, px_height, padding)` (skips rasterization entirely on a
+//! byte-identical repeat request). [`cache_stats`] exposes hit/miss counters
+//! so this is asserted deterministically rather than by timing.
 
 #![forbid(unsafe_code)]
 
@@ -52,6 +52,16 @@ const MAX_TEX_LEN: usize = 4_096;
 /// enormous pixmap.
 const MIN_PX_HEIGHT: u32 = 4;
 const MAX_PX_HEIGHT: u32 = 512;
+
+/// Default blank margin the rasterizer adds on every side, in pixels. Part
+/// of the raster's final size, so [`render_fitted`] solves for it rather
+/// than treating it as free.
+const PADDING: f32 = 4.0;
+
+/// Ceiling on the solved letterbox margin. A degenerate box aspect could
+/// otherwise ask for an enormous transparent border, and padding counts
+/// toward the pixmap budget like any other pixel.
+const MAX_PADDING: f32 = 512.0;
 
 const CACHE_CAP: usize = 256;
 
@@ -192,16 +202,29 @@ fn fit_font_size(
 }
 
 pub fn render(tex: &str, px_height: u32) -> Result<Png, MathError> {
+    render_padded(tex, px_height, PADDING)
+}
+
+/// [`render`] with an explicit transparent margin. Used by
+/// [`render_fitted`] to letterbox a formula onto its cell box's aspect ratio
+/// without touching the em size.
+fn render_padded(tex: &str, px_height: u32, padding: f32) -> Result<Png, MathError> {
     if tex.len() > MAX_TEX_LEN {
         return Err(MathError::TooLarge { len: tex.len() });
     }
     let px_height = px_height.clamp(MIN_PX_HEIGHT, MAX_PX_HEIGHT);
+    // Padding is part of the raster's identity, so it belongs in the cache
+    // key — the same formula at the same em but a different letterbox is a
+    // different image. Quantized to whole pixels so f32 noise cannot spawn
+    // unbounded near-duplicate cache entries.
+    let padding = if padding.is_finite() {
+        padding.clamp(0.0, MAX_PADDING).round()
+    } else {
+        PADDING
+    };
+    let cache_key = (tex.to_string(), px_height, padding as u32);
 
-    if let Some(png) = png_cache()
-        .lock()
-        .unwrap()
-        .get(&(tex.to_string(), px_height))
-    {
+    if let Some(png) = png_cache().lock().unwrap().get(&cache_key) {
         record_png_hit();
         return Ok(png.clone());
     }
@@ -218,7 +241,7 @@ pub fn render(tex: &str, px_height: u32) -> Result<Png, MathError> {
 
     let render_options = ratex_render::RenderOptions {
         font_size: px_height as f32,
-        padding: 4.0,
+        padding,
         background_color: TRANSPARENT,
         font_dir: String::new(),
         device_pixel_ratio: 1.0,
@@ -229,7 +252,7 @@ pub fn render(tex: &str, px_height: u32) -> Result<Png, MathError> {
 
     insert_bounded(
         &mut png_cache().lock().unwrap(),
-        (tex.to_string(), px_height),
+        (tex.to_string(), px_height, padding as u32),
         png.clone(),
     );
     Ok(png)
@@ -354,8 +377,14 @@ fn display_list_cache() -> &'static Mutex<BoundedMap<String, ratex_types::displa
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn png_cache() -> &'static Mutex<BoundedMap<(String, u32), Png>> {
-    static CACHE: OnceLock<Mutex<BoundedMap<(String, u32), Png>>> = OnceLock::new();
+/// A rendered PNG's full identity: `(tex, em size, letterbox padding)`.
+/// Padding belongs here because [`render_fitted`] varies it per target box —
+/// the same formula at the same em but a different letterbox is a different
+/// raster, and keying without it would serve the wrong one.
+type PngKey = (String, u32, u32);
+
+fn png_cache() -> &'static Mutex<BoundedMap<PngKey, Png>> {
+    static CACHE: OnceLock<Mutex<BoundedMap<PngKey, Png>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -449,6 +478,55 @@ pub fn intrinsic_em_size(tex: &str) -> Option<(f64, f64)> {
     Some((list.width, list.height + list.depth))
 }
 
+/// Renders `tex` at a fixed `em_px`, padded so the raster's aspect ratio
+/// matches a `target_w` x `target_h` pixel box.
+///
+/// Both halves matter, and they pull against each other:
+///
+/// - **Fixed em.** The em size is what makes a formula's glyphs look like the
+///   body text around them. It must not be derived from the box, or `a+b=c`
+///   (0.78 em tall) and `e^{i\pi}+1=0` (0.96 em tall) would render at
+///   noticeably different glyph sizes just because one has a superscript.
+/// - **Matched aspect.** The kitty graphics protocol scales a placement to
+///   fill its `c=` x `r=` cell box *exactly*, so any mismatch between the
+///   raster's proportions and the box's shows up as stretched glyphs. Cell
+///   quantization guarantees a mismatch: a box is a whole number of cells,
+///   the ink is not.
+///
+/// Padding reconciles them. Growing the transparent margin moves the raster's
+/// aspect toward 1:1 without touching glyph size, so there is a padding that
+/// lands exactly on the box's aspect — solve
+/// `(ink_w + 2p) / (ink_h + 2p) = target_w / target_h` for `p`. The result is
+/// letterboxed, not stretched: the formula keeps its shape and sits centered
+/// in its cells.
+///
+/// When the box is proportionally *wider* than the ink, the required `p` is
+/// negative — padding can only ever move aspect toward square. There `p`
+/// clamps to [`PADDING`] and the residual mismatch stands; it is bounded by
+/// one cell of rounding.
+pub fn render_fitted(
+    tex: &str,
+    em_px: u32,
+    target_w: u32,
+    target_h: u32,
+) -> Result<Png, MathError> {
+    let (em_w, em_h) = intrinsic_em_size(tex).ok_or(MathError::TooLarge { len: tex.len() })?;
+    let ink_w = em_w * f64::from(em_px);
+    let ink_h = em_h * f64::from(em_px);
+    let (tw, th) = (f64::from(target_w.max(1)), f64::from(target_h.max(1)));
+
+    // p = (ink_h*tw - ink_w*th) / (2*(th - tw)); guard the degenerate square
+    // box, where the equation has no unique solution.
+    let denom = 2.0 * (th - tw);
+    let pad = if denom.abs() < f64::EPSILON {
+        f64::from(PADDING)
+    } else {
+        ((ink_h * tw - ink_w * th) / denom).max(f64::from(PADDING))
+    };
+    let pad = if pad.is_finite() { pad as f32 } else { PADDING };
+    render_padded(tex, em_px, pad)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -458,6 +536,18 @@ mod tests {
     // that assert on cache *counts* so they don't observe each other's
     // increments.
     static TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
+    /// Acquires [`TEST_LOCK`], ignoring poisoning.
+    ///
+    /// A bare `.lock().unwrap()` turns the *first* failing cache-count
+    /// assertion into a cascade: that test unwinds while holding the lock,
+    /// poisoning it, and every other serialized test then panics on the
+    /// unwrap instead of running. Seven "failures" for one real defect, and
+    /// the real one is not obviously the real one. The lock guards nothing
+    /// but test ordering, so a poisoned guard is still perfectly usable.
+    fn test_guard() -> std::sync::MutexGuard<'static, ()> {
+        TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     fn decode_png_dims(bytes: &[u8]) -> (u32, u32) {
         image_dims_via_png_crate(bytes)
@@ -475,7 +565,7 @@ mod tests {
 
     #[test]
     fn test_dw_6_2_ratex_rung_renders_a_fixture_set() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = test_guard();
         reset_caches_for_test();
         for tex in [
             "x^2 + y^2 = z^2",
@@ -492,7 +582,7 @@ mod tests {
 
     #[test]
     fn test_dw_6_2_ratex_failure_falls_to_txm_rung() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = test_guard();
         // Genuinely invalid TeX: an unknown control sequence RaTeX rejects.
         let hostile = r"\thisisnotarealcommand{x}";
         let ratex_result = render(hostile, 40);
@@ -525,7 +615,7 @@ mod tests {
 
     #[test]
     fn test_render_never_uses_default_black_ink_on_transparent_background() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = test_guard();
         reset_caches_for_test();
         let png = render("x", 40).unwrap();
         let decoded = png_pixels_via_manual_decode(png.as_bytes());
@@ -564,7 +654,7 @@ mod tests {
 
     #[test]
     fn test_dw_6_5_display_list_cache_hit_on_px_height_change() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = test_guard();
         reset_caches_for_test();
         let tex = r"\sqrt{x+1}";
         render(tex, 40).unwrap();
@@ -587,7 +677,7 @@ mod tests {
 
     #[test]
     fn test_png_cache_hits_on_byte_identical_repeat_request() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = test_guard();
         reset_caches_for_test();
         let tex = "y = mx + b";
         render(tex, 40).unwrap();
@@ -609,7 +699,7 @@ mod tests {
 
     #[test]
     fn test_px_height_is_clamped_not_trusted_bare() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = test_guard();
         reset_caches_for_test();
         // A hostile/huge px_height must not make the rasterizer attempt an
         // unbounded pixmap allocation; clamped to MAX_PX_HEIGHT internally.
@@ -623,7 +713,7 @@ mod tests {
 
     #[test]
     fn test_intrinsic_em_size_is_cheap_and_non_rasterizing() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = test_guard();
         reset_caches_for_test();
         let (w, h) = intrinsic_em_size("x+1").expect("valid TeX must size");
         assert!(w > 0.0 && h > 0.0);
@@ -636,6 +726,10 @@ mod tests {
 
     #[test]
     fn test_intrinsic_em_size_none_on_parse_failure() {
+        // Takes the lock despite asserting no counts: it still walks the
+        // shared display-list cache, so without it this races the tests that
+        // DO assert on miss counts.
+        let _g = test_guard();
         assert!(intrinsic_em_size(r"\notarealcommand").is_none());
     }
 
@@ -643,5 +737,50 @@ mod tests {
     fn test_strip_ansi_sgr_removes_only_sgr_sequences() {
         let styled = "\x1b[1mbold\x1b[0m plain";
         assert_eq!(strip_ansi_sgr(styled), "bold plain");
+    }
+
+    /// The kitty protocol stretches a placement to fill its `c=` x `r=` cell
+    /// box exactly, so a raster whose proportions disagree with the box shows
+    /// up as visibly stretched glyphs. `render_fitted` letterboxes instead:
+    /// same em (so glyph size stays consistent between formulas), padding
+    /// solved so the aspect lands on the box's.
+    #[test]
+    fn test_render_fitted_matches_the_target_box_aspect_without_changing_em() {
+        let _g = test_guard();
+        reset_caches_for_test();
+        // A formula with a superscript and one without: their em heights
+        // differ a lot (0.96 vs 0.78), which is exactly what used to make a
+        // box-derived em render them at different glyph sizes.
+        for tex in [r"e^{i\pi}+1=0", "a+b=c"] {
+            for (tw, th) in [(192u32, 48u32), (168, 48), (312, 96)] {
+                let png = render_fitted(tex, 40, tw, th).expect("renders");
+                let (rw, rh) = decode_png_dims(png.as_bytes());
+                let raster_aspect = f64::from(rw) / f64::from(rh);
+                let box_aspect = f64::from(tw) / f64::from(th);
+                let err = (raster_aspect / box_aspect - 1.0).abs();
+                assert!(
+                    err < 0.10,
+                    "{tex} into {tw}x{th}: raster {rw}x{rh} aspect {raster_aspect:.3} \
+                     vs box {box_aspect:.3} ({:.1}% off)",
+                    err * 100.0
+                );
+            }
+        }
+    }
+
+    /// Padding can only push a raster's aspect toward square, so a box that is
+    /// proportionally wider than the ink has no solution. That must clamp to
+    /// the default margin and still produce a usable raster, never a negative
+    /// padding or a panic.
+    #[test]
+    fn test_render_fitted_clamps_when_the_box_is_wider_than_the_ink() {
+        let _g = test_guard();
+        reset_caches_for_test();
+        let png = render_fitted("a+b=c", 40, 4_000, 48).expect("still renders");
+        let (rw, rh) = decode_png_dims(png.as_bytes());
+        assert!(rw > 0 && rh > 0);
+        // Unsolvable, so it falls back to the plain default-padding raster.
+        let plain = render("a+b=c", 40).expect("renders");
+        assert_eq!(decode_png_dims(plain.as_bytes()), (rw, rh));
     }
 }
