@@ -5,11 +5,21 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
+/// Commit + build time this binary was produced from, stamped by `build.rs`.
+/// Shown by `--version` and painted in the viewport corner, so "the fix does
+/// not work" can always be told apart from "that is not the fix you built."
+pub const BUILD: &str = env!("STELE_BUILD");
+
+/// Just the short sha (plus `-dirty`), for the in-viewport stamp where
+/// columns are scarce.
+pub const BUILD_SHA: &str = env!("STELE_BUILD_SHA");
+
 /// `stele <file.md>` — a terminal markdown viewer.
 #[derive(Debug, Parser)]
 #[command(
     name = "stele",
     version,
+    long_version = BUILD,
     about = "A terminal markdown viewer for Ghostty"
 )]
 pub struct Cli {

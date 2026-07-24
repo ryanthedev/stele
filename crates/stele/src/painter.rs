@@ -148,8 +148,38 @@ impl Painter {
             }
             out.write_all(CLEAR_TO_EOL)?;
         }
+        self.paint_build_stamp(size, out)?;
         out.write_all(SYNC_END)?;
         out.flush()
+    }
+
+    /// Paints the build's commit sha dim in the bottom-right corner.
+    ///
+    /// This viewer's entire output is pixels in a terminal — there is nothing
+    /// to grep and no log to read, so "the fix doesn't work" and "that binary
+    /// predates the fix" look identical from the outside. Both cost real
+    /// debugging time when confused. The stamp makes them distinguishable at a
+    /// glance, and a `-dirty` suffix says the tree had uncommitted edits.
+    ///
+    /// Painted after the content and inside the synchronized-update block, so
+    /// it never tears and never shifts a document line. It is skipped entirely
+    /// rather than truncated when the viewport is too narrow to hold it
+    /// without colliding with text.
+    fn paint_build_stamp(&mut self, size: Size, out: &mut dyn Write) -> io::Result<()> {
+        let stamp = crate::cli::BUILD_SHA;
+        let width = self
+            .width_engine
+            .display_width(stamp)
+            .min(u16::MAX as usize) as u16;
+        // +1 so it never butts directly against content on the same row.
+        if size.height == 0 || width == 0 || size.width <= width.saturating_add(1) {
+            return Ok(());
+        }
+        write!(out, "\x1b[{};{}H", size.height, size.width - width + 1)?;
+        write!(out, "\x1b[2m")?;
+        out.write_all(stamp.as_bytes())?;
+        out.write_all(SGR_RESET)?;
+        Ok(())
     }
 
     fn paint_line(

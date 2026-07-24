@@ -75,8 +75,27 @@ fn assert_only_known_escapes(bytes: &[u8]) {
         let terminator = rest[j];
         let params = &rest[1..j];
         let known = match terminator {
-            b'H' => params.ends_with(b";1"), // cursor home to column 1
-            b'm' => true,                    // SGR: digits/semicolons already checked
+            // Cursor position, `row;col`. This used to require `;1` — every
+            // cursor move went to column 1, because the painter only ever
+            // started a row. That is no longer true: an inline media box is
+            // placed at its own column mid-line and the cursor is restored to
+            // the cell after it, and the build stamp is painted in the
+            // bottom-right corner. Both are the painter's own arithmetic, not
+            // anything a document can reach.
+            //
+            // Restricting the column was never what made this barricade hold.
+            // Document text cannot inject an escape because `sanitize()`
+            // strips C0/DEL/C1 from every run before it is written — the raw
+            // control-byte check at the top of this loop is what asserts that.
+            // What matters here is that a CSI carries only well-formed numeric
+            // parameters, which the digits-and-semicolons scan above already
+            // guarantees; this adds that a cursor move is exactly two fields,
+            // so a malformed or overlong one still fails.
+            b'H' => {
+                let fields: Vec<&[u8]> = params.split(|&c| c == b';').collect();
+                fields.len() == 2 && fields.iter().all(|f| !f.is_empty())
+            }
+            b'm' => true, // SGR: digits/semicolons already checked
             _ => false,
         };
         assert!(
