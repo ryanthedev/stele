@@ -12,10 +12,14 @@
 //! Same idiom as `crates/ast/tests/hardening.rs::test_dw_2_5_forbid_unsafe_present`,
 //! which reads its own `lib.rs` so removing the attribute fails CI.
 //!
-//! **Scoped to `src/**` deliberately.** `tests/signal_restore.rs` legitimately
+//! **Scoped to `src/**` deliberately.** `tests/common/pty.rs` legitimately
 //! carries a test-scope `#![allow(unsafe_code)]` — it drives the real binary on
 //! a real pty, which needs raw `posix_openpt`/`ioctl`/`kill`. Test code is not
 //! shipped in the binary, so it is out of scope here; only `src/**` is asserted.
+//! (That harness used to be duplicated verbatim in `tests/quit_restore.rs` and
+//! `tests/signal_restore.rs`; consolidating it into one module removed a
+//! test-scope unsafe surface rather than adding one, and moved none of it into
+//! `src/**`, so the count below is unchanged at one.)
 
 use std::path::{Path, PathBuf};
 

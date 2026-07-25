@@ -166,6 +166,43 @@ pub fn read_until(master: RawFd, needle: &[u8], deadline: Duration) -> Vec<u8> {
     buf
 }
 
+/// Read and discard everything already on the wire, then wait for it to fall
+/// quiet.
+///
+/// Load-bearing, and proved so by mutation. An ordinary frame ends with the
+/// synchronized-update end `\x1b[?2026l`, and `RESTORE_SEQUENCE` *begins* with
+/// the same bytes — deliberately, because a global mode left set outlives the
+/// alternate screen. With the startup frame still sitting in the buffer, a
+/// wire reading `…?2026l` + `?25h?1049l` contains the full restore sequence as
+/// a substring even when the restore itself never emitted the `?2026l` at all:
+/// deleting it from `RESTORE_SEQUENCE` left the keystroke half of this harness
+/// green. Draining first is what makes the assertion "this ending emitted the
+/// restore sequence" instead of "these bytes appear somewhere on the wire".
+fn drain_quiet(master: RawFd) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut idle = 0;
+    while Instant::now() < deadline && idle < 3 {
+        let mut pfd = libc::pollfd {
+            fd: master,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one initialised `pollfd`, count 1, 50 ms timeout.
+        let ready = unsafe { libc::poll(&mut pfd, 1, 50) };
+        if ready <= 0 {
+            idle += 1;
+            continue;
+        }
+        idle = 0;
+        let mut chunk = [0u8; 8192];
+        // SAFETY: reading into a stack buffer we own, bounded by its length.
+        let n = unsafe { libc::read(master, chunk.as_mut_ptr().cast(), chunk.len()) };
+        if n <= 0 {
+            break;
+        }
+    }
+}
+
 pub fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
@@ -239,6 +276,10 @@ pub fn assert_restores_the_terminal(label: &str, exit: Exit) {
         "stele must be in raw mode before {label} is delivered"
     );
 
+    // Everything the startup frame put on the wire is still buffered; take it
+    // out of the way so the assertion below is about the *ending* alone.
+    drain_quiet(master);
+
     match exit {
         // SAFETY: `kill` on a pid we just spawned and have not reaped.
         Exit::Signal(signo) => {
@@ -249,17 +290,14 @@ pub fn assert_restores_the_terminal(label: &str, exit: Exit) {
     }
 
     let after = read_until(master, RESTORE, Duration::from_secs(10));
-    let at = after.windows(RESTORE.len()).position(|w| w == RESTORE);
-    assert!(
-        at.is_some(),
-        "{label} must put the restore sequence on the wire.\n  \
-         expected: {RESTORE:?}\n  after {label} the wire was: {after:?}"
-    );
-    // Nothing may follow it: restoring is the last thing the process does.
-    let tail = &after[at.unwrap() + RESTORE.len()..];
+    // Equality, not "contains", and not "ends with": after the wire was drained
+    // the *only* bytes this ending may produce are the restore sequence — in
+    // that order, with nothing before it and nothing after it. Restoring is the
+    // last thing the process does.
     assert_eq!(
-        tail, b"",
-        "the restore sequence must be the last bytes on the wire after {label}"
+        after, RESTORE,
+        "{label} must put exactly the restore sequence on the wire and nothing \
+         else.\n  expected: {RESTORE:?}\n  got:      {after:?}"
     );
 
     let status = child.wait().expect("wait");
