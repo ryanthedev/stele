@@ -21,7 +21,7 @@ mod common;
 use ast::Document;
 use crossterm::event::{KeyCode, KeyEvent};
 use layout::{LayoutConfig, NullSizer, layout};
-use stele::app::AppState;
+use stele::app::{AppState, FileInfo};
 use stele::painter::Size;
 
 use common::fixtures::engine;
@@ -44,7 +44,7 @@ fn test_scroll_clamps_at_both_ends_for_every_document_height() {
             &NullSizer,
         );
         let n = tree.line_count();
-        let mut state = AppState::new(tree, VIEWPORT);
+        let mut state = AppState::new(tree, VIEWPORT, FileInfo::default());
         let height = usize::from(VIEWPORT.height);
         let expected_max = n.saturating_sub(height);
         assert_eq!(state.max_scroll(), expected_max, "{lines} lines");

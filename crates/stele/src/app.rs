@@ -38,6 +38,67 @@ struct Anchor {
     span: usize,
 }
 
+/// Static per-session facts about the open document: its display name, and
+/// the raw file's byte size and line count as loaded — *before*
+/// frontmatter/mermaid preprocessing, since that is what a reader means by
+/// "this file" when they ask [`AppState::show_file_info`]. `line_count`
+/// uses [`str::lines`], which is invariant to a trailing newline's presence
+/// (a file ending `"a\nb"` and one ending `"a\nb\n"` both count 2), rather
+/// than counting `\n` bytes, which would differ by one between them.
+#[derive(Debug, Clone, Default)]
+pub struct FileInfo {
+    pub name: String,
+    pub byte_size: u64,
+    pub line_count: usize,
+}
+
+/// A transient status-row message with a frame-count time-to-live, set via
+/// [`AppState::set_status`]. The TTL itself is [`AppState`]'s concern (it
+/// owns the frame counter); this type only carries the text.
+#[derive(Debug, Clone)]
+pub struct StatusMessage {
+    text: String,
+}
+
+impl StatusMessage {
+    pub fn new(text: impl Into<String>) -> Self {
+        StatusMessage { text: text.into() }
+    }
+}
+
+/// How many [`AppState::status`] calls (i.e. frames) a [`StatusMessage`]
+/// stays visible for before reverting to the permanent ruler. Not
+/// wall-clock time — this app repaints on events, not a timer — so the
+/// budget is expressed in the unit that is actually meaningful here.
+const STATUS_MESSAGE_TTL_FRAMES: u32 = 100;
+
+/// One line of terminal-facing chrome: painted by [`crate::painter::Painter`]
+/// into the row it reserves. Either the permanent ruler (document name +
+/// scroll position) or a transient message that temporarily replaces it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StatusLine {
+    /// Scroll position as a percentage: 0 at the top, 100 at `max_scroll` —
+    /// including when `max_scroll` is 0, since a document that fits the
+    /// whole viewport has already shown the reader all of it.
+    pub position_pct: u8,
+    /// The open document's display name.
+    pub name: String,
+    /// A transient message set by [`AppState::set_status`] (e.g. `Ctrl-G`'s
+    /// file info), overriding the ruler until its frame budget runs out.
+    pub message: Option<String>,
+}
+
+impl StatusLine {
+    /// The exact text to paint into the reserved row.
+    pub(crate) fn render(&self) -> String {
+        match &self.message {
+            Some(text) => text.clone(),
+            None if self.name.is_empty() => format!("{}%", self.position_pct),
+            None => format!("{} — {}%", self.name, self.position_pct),
+        }
+    }
+}
+
 /// The viewer's mutable state: the current layout tree, scroll offset, and
 /// viewport size. Navigation and resize are pure state transitions, driven
 /// directly from tests without a real terminal or timers.
@@ -45,14 +106,33 @@ pub struct AppState {
     tree: LayoutTree,
     scroll: usize,
     size: Size,
+    /// The layout width `+`/`-` adjust, independent of the terminal's own
+    /// width — see [`AppState::relayout_preserving_anchor`]. Resynced to
+    /// `tree.width()` at the end of every [`AppState::relayout`], so a real
+    /// terminal resize always wins over a stale toggle.
+    content_width: u16,
+    file_info: FileInfo,
+    /// `(text, frames remaining)`. `None` once the TTL has been exhausted or
+    /// no message has been set.
+    status_message: Option<(String, u32)>,
 }
 
 impl AppState {
-    pub fn new(tree: LayoutTree, size: Size) -> Self {
+    /// `WIDTH_STEP` cells per `+`/`-` press — coarse enough that a handful
+    /// of presses crosses the useful range of a typical `LayoutConfig`
+    /// clamp (24-100), fine enough that a single press is a visible but not
+    /// jarring change.
+    const WIDTH_STEP: u16 = 4;
+
+    pub fn new(tree: LayoutTree, size: Size, file_info: FileInfo) -> Self {
+        let content_width = tree.width();
         AppState {
             tree,
             scroll: 0,
             size,
+            content_width,
+            file_info,
+            status_message: None,
         }
     }
 
@@ -75,6 +155,112 @@ impl AppState {
         self.tree
             .line_count()
             .saturating_sub(self.size.height.max(1) as usize)
+    }
+
+    /// The layout width currently in effect — `tree.width()` at construction,
+    /// then kept in sync by every [`AppState::relayout`] afterward.
+    pub fn content_width(&self) -> u16 {
+        self.content_width
+    }
+
+    /// Scroll position as a percentage (DW-1.2): 0 at the top, 100 at
+    /// `max_scroll`. A document that fits the viewport (`max_scroll == 0`)
+    /// reads 100 — the reader has already seen all of it — rather than 0,
+    /// which would otherwise be indistinguishable from "just opened".
+    fn position_pct(&self) -> u8 {
+        let max = self.max_scroll();
+        if max == 0 {
+            100
+        } else {
+            ((self.scroll as u64 * 100) / max as u64) as u8
+        }
+    }
+
+    /// Sets a transient status-row message, replacing the permanent ruler
+    /// for [`STATUS_MESSAGE_TTL_FRAMES`] calls to [`AppState::status`].
+    pub fn set_status(&mut self, message: StatusMessage) {
+        self.status_message = Some((message.text, STATUS_MESSAGE_TTL_FRAMES));
+    }
+
+    /// `Ctrl-g`'s action (DW-1.3): shows the open document's name, byte
+    /// size, and line count as a transient status message.
+    fn show_file_info(&mut self) {
+        let info = self.file_info.clone();
+        self.set_status(StatusMessage::new(format!(
+            "{} — {} bytes, {} lines",
+            info.name, info.byte_size, info.line_count
+        )));
+    }
+
+    /// The status row's current content (DW-1.1/1.2/1.3), and the entry
+    /// point that ages a transient message toward its TTL by one frame.
+    ///
+    /// Must be called **at most once per painted frame** — the event loop is
+    /// the only real caller — since every call spends one frame of the
+    /// active message's remaining budget. A message set via
+    /// [`AppState::set_status`] is returned on this and the next
+    /// `STATUS_MESSAGE_TTL_FRAMES - 1` calls, then reverts to the permanent
+    /// ruler.
+    pub fn status(&mut self) -> StatusLine {
+        let message = match self.status_message.take() {
+            Some((text, ttl)) => {
+                if ttl > 1 {
+                    self.status_message = Some((text.clone(), ttl - 1));
+                }
+                Some(text)
+            }
+            None => None,
+        };
+        StatusLine {
+            position_pct: self.position_pct(),
+            name: self.file_info.name.clone(),
+            message,
+        }
+    }
+
+    /// `+`/`-` (DW-1.4): widens/narrows [`AppState::content_width`] by
+    /// [`AppState::WIDTH_STEP`], clamped to `ctx.config`'s range, and
+    /// relays out preserving the scroll anchor.
+    pub fn widen(&mut self, ctx: &LayoutContext) {
+        self.adjust_width(i32::from(Self::WIDTH_STEP), ctx);
+    }
+
+    /// The narrowing half of [`AppState::widen`].
+    pub fn narrow(&mut self, ctx: &LayoutContext) {
+        self.adjust_width(-i32::from(Self::WIDTH_STEP), ctx);
+    }
+
+    /// Applies `delta` to `content_width`, clamping *before* relaying out —
+    /// not after — so repeated presses at a clamp boundary compose
+    /// correctly: without the eager clamp, several `+` presses past
+    /// `max_width` would each leave `content_width` growing unboundedly
+    /// while the laid-out tree stays pinned, and the next `-` press would
+    /// need several presses of its own before the tree visibly narrows.
+    fn adjust_width(&mut self, delta: i32, ctx: &LayoutContext) {
+        let requested = i32::from(self.content_width) + delta;
+        let clamped = requested.clamp(
+            i32::from(ctx.config.min_width),
+            i32::from(ctx.config.max_width),
+        );
+        // Safe: `clamped` is bounded by two `u16` values.
+        self.content_width = clamped as u16;
+        self.relayout_preserving_anchor(ctx, *ctx.config);
+    }
+
+    /// The entry point every later phase calls after a width, theme, fold,
+    /// or reload change (see the plan's Phase 1 `Produces`): relays out at
+    /// [`AppState::content_width`] — clamped to `config` — while preserving
+    /// the scroll anchor and leaving the viewport [`Size`] untouched.
+    ///
+    /// For a change that does not touch layout width at all (a theme swap),
+    /// this still recomputes the tree at the *same* width, which
+    /// [`AppState::relayout`]'s `no_reflow_occurred` check turns into a
+    /// no-op scroll adjustment — cheap, and it keeps every chrome-mutating
+    /// key on one anchor-preserving path instead of a bespoke one per key.
+    pub fn relayout_preserving_anchor(&mut self, ctx: &LayoutContext, config: LayoutConfig) {
+        let width = self.content_width.clamp(config.min_width, config.max_width);
+        let size = self.size;
+        self.relayout(ctx, width, size);
     }
 
     fn set_scroll(&mut self, value: usize) {
@@ -134,6 +320,15 @@ impl AppState {
             KeyCode::Char('u') => self.scroll_by(-(self.half_page() as isize)),
             KeyCode::Char('f') => self.scroll_by(self.page_size() as isize),
             KeyCode::Char('b') => self.scroll_by(-(self.page_size() as isize)),
+            // Ctrl-g (DW-1.3): file info. Before this phase, lowercase
+            // Ctrl-g meant nothing to us and fell through to the unmodified
+            // `'g'` binding (jump to top) — an accident of the "strictly
+            // additive" fallthrough this function's own doc comment
+            // describes, preserved only for pre-Ctrl-aware compatibility,
+            // never a deliberate feature. Now that Ctrl-g means something,
+            // it stops falling through, exactly like every other chord in
+            // this match. Ctrl-G (uppercase, jump to end) is untouched.
+            KeyCode::Char('g') => self.show_file_info(),
             _ => return None,
         }
         Some(false)
@@ -195,6 +390,12 @@ impl AppState {
 
         self.tree = layout(ctx.doc, width, ctx.config, ctx.engine, ctx.sizer);
         self.size = new_size;
+        // Resync to what layout actually used (already clamped), not the
+        // raw `width` argument — the two agree today but this is the
+        // authoritative value regardless. A caller-driven toggle
+        // (`AppState::widen`/`narrow`) and a real terminal resize both go
+        // through here, so a resize always overrides a stale toggle.
+        self.content_width = self.tree.width();
 
         let target = if self.no_reflow_occurred(previous_width) {
             previous_scroll
@@ -295,7 +496,12 @@ mod tests {
         let engine = WidthEngine::new(WidthConfig::default());
         let tree = layout(&doc, width, &config, &engine, &NullSizer);
         let size = Size { width, height };
-        let state = AppState::new(tree, size);
+        let file_info = FileInfo {
+            name: "test.md".to_string(),
+            byte_size: source.len() as u64,
+            line_count: source.lines().count(),
+        };
+        let state = AppState::new(tree, size, file_info);
         (doc, config, engine, state)
     }
 
@@ -469,6 +675,7 @@ mod tests {
                 width: 90,
                 height: 10,
             },
+            FileInfo::default(),
         );
         let ctx = LayoutContext {
             doc: &doc,
@@ -913,8 +1120,11 @@ mod tests {
         assert!(!state.handle_key_event(ctrl('G')));
         assert_eq!(state.scroll(), tail, "Ctrl-G must still jump to the end");
 
-        assert!(!state.handle_key_event(ctrl('g')));
-        assert_eq!(state.scroll(), 0, "Ctrl-g must still jump to the top");
+        // Ctrl-g (lowercase) is deliberately NOT covered here as of Phase 1:
+        // DW-1.3 claims that chord for file info (see
+        // `test_dw_1_3_ctrl_g_shows_file_name_byte_size_and_line_count`), so
+        // it now stops falling through to the unmodified `'g'` binding,
+        // exactly like every other chord this function already owns.
 
         assert!(state.handle_key_event(ctrl('q')), "Ctrl-q must still quit");
     }
@@ -933,6 +1143,271 @@ mod tests {
             assert!(!state.handle_key_event(plain(KeyCode::Char(c))));
             assert_eq!(state.scroll(), start, "bare `{c}` must not be a motion");
         }
+    }
+
+    // ---- Status row: position %, Ctrl-g file info, width toggle (Phase 1) --
+
+    #[test]
+    fn test_dw_1_2_status_position_percentage_reads_0_at_top_and_100_at_max_scroll() {
+        let (_doc, _config, _engine, mut state) = build(&non_reflowing_source(50), 40, 10);
+        assert_eq!(state.status().position_pct, 0, "scroll 0 must read 0%");
+
+        state.handle_key_event(plain(KeyCode::Char('G')));
+        assert!(state.max_scroll() > 0, "fixture must actually scroll");
+        assert_eq!(
+            state.status().position_pct,
+            100,
+            "max_scroll must read 100%"
+        );
+    }
+
+    /// Dirty case: a document that fits the viewport has `max_scroll == 0`,
+    /// so "top" and "max_scroll" are literally the same position. The reader
+    /// has already seen the whole document, so this reads 100, not 0.
+    #[test]
+    fn test_dw_1_2_position_percentage_reads_100_when_the_document_fits_the_viewport() {
+        let (_doc, _config, _engine, mut state) = build("short\n", 40, 100);
+        assert_eq!(state.max_scroll(), 0);
+        assert_eq!(state.status().position_pct, 100);
+    }
+
+    #[test]
+    fn test_dw_1_3_ctrl_g_shows_file_name_byte_size_and_line_count() {
+        let source = "line one\nline two\nline three\n";
+        let (_doc, _config, _engine, mut state) = build(source, 40, 10);
+        assert!(!state.handle_key_event(ctrl('g')), "Ctrl-g must not quit");
+        let message = state
+            .status()
+            .message
+            .expect("Ctrl-g must set a status message");
+        assert!(message.contains("test.md"), "{message:?}");
+        assert!(
+            message.contains(&format!("{} bytes", source.len())),
+            "{message:?}"
+        );
+        assert!(
+            message.contains(&format!("{} lines", source.lines().count())),
+            "{message:?}"
+        );
+    }
+
+    /// Dirty: a zero-byte file. Byte size and line count must both read 0,
+    /// not panic on an empty document.
+    #[test]
+    fn test_dw_1_3_ctrl_g_on_a_zero_byte_file_reports_zero_bytes_and_zero_lines() {
+        let (_doc, _config, _engine, mut state) = build("", 40, 10);
+        state.handle_key_event(ctrl('g'));
+        let message = state.status().message.unwrap();
+        assert!(message.contains("0 bytes"), "{message:?}");
+        assert!(message.contains("0 lines"), "{message:?}");
+    }
+
+    /// Dirty: no trailing newline. `str::lines` (not `\n`-counting) is what
+    /// keeps this at 2 rather than 1.
+    #[test]
+    fn test_dw_1_3_ctrl_g_on_a_file_with_no_trailing_newline_counts_lines_correctly() {
+        let (_doc, _config, _engine, mut state) = build("a\nb", 40, 10);
+        state.handle_key_event(ctrl('g'));
+        let message = state.status().message.unwrap();
+        assert!(message.contains("2 lines"), "{message:?}");
+    }
+
+    #[test]
+    fn test_dw_1_3_status_message_clears_after_its_frame_budget() {
+        let (_doc, _config, _engine, mut state) = build("hello\n", 40, 10);
+        state.handle_key_event(ctrl('g'));
+        for frame in 0..STATUS_MESSAGE_TTL_FRAMES {
+            assert!(
+                state.status().message.is_some(),
+                "message must still be visible on frame {frame}"
+            );
+        }
+        assert!(
+            state.status().message.is_none(),
+            "message must be gone once its frame budget ({STATUS_MESSAGE_TTL_FRAMES} frames) is spent"
+        );
+    }
+
+    #[test]
+    fn test_dw_1_4_widen_preserves_the_top_visible_block() {
+        let source: String = (0..60)
+            .map(|i| {
+                format!("Paragraph {i:02} word word word word word word word word word word.\n\n")
+            })
+            .collect();
+        let (doc, config, engine, mut state) = build(&source, 60, 10);
+        let ctx = LayoutContext {
+            doc: &doc,
+            config: &config,
+            engine: &engine,
+            sizer: &NullSizer,
+        };
+
+        for _ in 0..30 {
+            state.handle_key_event(plain(KeyCode::Down));
+        }
+        let anchor = state
+            .tree()
+            .block_at(state.scroll())
+            .expect("a scrolled-to line has a block");
+        let before_width = state.content_width();
+
+        state.widen(&ctx);
+
+        assert!(
+            state.content_width() > before_width,
+            "widen must actually widen"
+        );
+        assert_eq!(
+            state.tree().block_at(state.scroll()),
+            Some(anchor),
+            "widening must preserve the top visible block"
+        );
+    }
+
+    #[test]
+    fn test_dw_1_4_narrow_preserves_the_top_visible_block() {
+        let source: String = (0..60)
+            .map(|i| {
+                format!("Paragraph {i:02} word word word word word word word word word word.\n\n")
+            })
+            .collect();
+        let (doc, config, engine, mut state) = build(&source, 90, 10);
+        let ctx = LayoutContext {
+            doc: &doc,
+            config: &config,
+            engine: &engine,
+            sizer: &NullSizer,
+        };
+
+        for _ in 0..30 {
+            state.handle_key_event(plain(KeyCode::Down));
+        }
+        let anchor = state
+            .tree()
+            .block_at(state.scroll())
+            .expect("a scrolled-to line has a block");
+        let before_width = state.content_width();
+
+        state.narrow(&ctx);
+
+        assert!(
+            state.content_width() < before_width,
+            "narrow must actually narrow"
+        );
+        assert_eq!(
+            state.tree().block_at(state.scroll()),
+            Some(anchor),
+            "narrowing must preserve the top visible block"
+        );
+    }
+
+    /// The clamp boundary (dirty case): many `+` presses past `max_width`
+    /// must not leave `content_width` growing past the ceiling — and a
+    /// single subsequent `-` must move immediately, not need several
+    /// presses to "unstick" from an overshoot.
+    #[test]
+    fn test_dw_1_4_widen_clamps_at_max_width_and_narrow_moves_immediately_from_there() {
+        let (doc, config, engine, mut state) = build(&non_reflowing_source(10), 40, 10);
+        let ctx = LayoutContext {
+            doc: &doc,
+            config: &config,
+            engine: &engine,
+            sizer: &NullSizer,
+        };
+
+        for _ in 0..50 {
+            state.widen(&ctx);
+        }
+        assert_eq!(state.content_width(), config.max_width);
+
+        state.narrow(&ctx);
+        assert_eq!(
+            state.content_width(),
+            config.max_width - AppState::WIDTH_STEP
+        );
+    }
+
+    /// The other clamp boundary, symmetric.
+    #[test]
+    fn test_dw_1_4_narrow_clamps_at_min_width_and_widen_moves_immediately_from_there() {
+        let (doc, config, engine, mut state) = build(&non_reflowing_source(10), 40, 10);
+        let ctx = LayoutContext {
+            doc: &doc,
+            config: &config,
+            engine: &engine,
+            sizer: &NullSizer,
+        };
+
+        for _ in 0..50 {
+            state.narrow(&ctx);
+        }
+        assert_eq!(state.content_width(), config.min_width);
+
+        state.widen(&ctx);
+        assert_eq!(
+            state.content_width(),
+            config.min_width + AppState::WIDTH_STEP
+        );
+    }
+
+    /// Edge case named in the plan: a theme toggle relays out at an
+    /// *unchanged* width (`relayout_preserving_anchor` called with the same
+    /// `content_width` — exactly what `T` does, since nothing about theme
+    /// touches layout). A reserved image box's `NodeId` must come out
+    /// identical, since that identity is the only thing the media sink (out
+    /// of this phase's file scope) uses to decide whether a placement can be
+    /// reused rather than re-transmitted.
+    #[test]
+    fn test_theme_toggle_style_relayout_preserves_reserved_box_node_identity() {
+        use layout::{CellSize, IntrinsicSizer, Line};
+
+        struct AlwaysSizes;
+        impl IntrinsicSizer for AlwaysSizes {
+            fn size(&self, _node: NodeId, _doc: &Document) -> Option<CellSize> {
+                // Two rows: a one-row box rides a text line as a
+                // `LineItem::Box`, so only a taller box takes the standalone
+                // `Line::Reserved` path this test needs (see
+                // `painter.rs`'s own tests for the same distinction).
+                Some(CellSize { cols: 10, rows: 2 })
+            }
+        }
+
+        fn reserved_node_id(tree: &LayoutTree) -> Option<NodeId> {
+            (0..tree.line_count()).find_map(|i| match tree.lines(i..i + 1).next() {
+                Some(Line::Reserved(line)) => Some(line.boxed.node_id),
+                _ => None,
+            })
+        }
+
+        let doc = Document::parse("before\n\n![alt](pic.png)\n\nafter\n");
+        let config = LayoutConfig::default();
+        let engine = WidthEngine::new(WidthConfig::default());
+        let tree = layout(&doc, 40, &config, &engine, &AlwaysSizes);
+        let before_id = reserved_node_id(&tree).expect("fixture reserves an image box");
+
+        let mut state = AppState::new(
+            tree,
+            Size {
+                width: 40,
+                height: 10,
+            },
+            FileInfo::default(),
+        );
+        let ctx = LayoutContext {
+            doc: &doc,
+            config: &config,
+            engine: &engine,
+            sizer: &AlwaysSizes,
+        };
+
+        state.relayout_preserving_anchor(&ctx, config);
+
+        let after_id = reserved_node_id(state.tree()).expect("the box must still be reserved");
+        assert_eq!(
+            before_id, after_id,
+            "a same-width relayout must not change the reserved box's node identity"
+        );
     }
 
     fn topmost_line_text(state: &AppState) -> String {

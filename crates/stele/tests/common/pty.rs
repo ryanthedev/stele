@@ -95,6 +95,13 @@ impl Pty {
         }
     }
 
+    /// The master descriptor, for a test that needs to drive [`read_until`]
+    /// (or its own bespoke read loop) directly rather than through
+    /// [`assert_restores_the_terminal`].
+    pub fn master_fd(&self) -> RawFd {
+        self.master.as_raw_fd()
+    }
+
     /// A fresh descriptor for the slave, for one of the child's stdio slots.
     pub fn slave_dup(&self) -> OwnedFd {
         // SAFETY: `dup` of a descriptor we own; the result is handed straight

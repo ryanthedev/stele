@@ -1,6 +1,8 @@
 # Plan: stele viewer features — navigation, search, links, and the frame budget
 **Created:** 2026-07-25
-**Status:** ready
+**Status:** in-progress
+**Started:** 2026-07-25 12:40
+**Current Phase:** 1
 **Complexity:** complex
 **Review cadence:** 2
 ---
@@ -96,7 +98,7 @@ Separately, a measure-first audit found frames 40× slower than necessary on cod
 **Uncertainty:** Whether crossterm's event source can be pointed at `/dev/tty` cleanly when stdin is a pipe.
 
 ### Phase 3: Heading navigation — jump, TOC overlay, and image residency
-**Model:** fable
+**Model:** opus
 **Skills:** code-foundations:aposd-designing-deep-modules, code-foundations:performance-optimization
 **Gate:** Full
 
@@ -127,7 +129,7 @@ Separately, a measure-first audit found frames 40× slower than necessary on cod
 **Uncertainty:** How much of the 99–102 ms is the off-by-one versus genuine decode cost; the two-stage downscale's benefit at the real ~2400 px target is unmeasured.
 
 ### Phase 4: Incremental search
-**Model:** fable
+**Model:** opus
 **Skills:** code-foundations:cc-control-flow-quality, code-foundations:performance-optimization
 **Gate:** Full
 
@@ -191,7 +193,7 @@ Separately, a measure-first audit found frames 40× slower than necessary on cod
 **Uncertainty:** Whether fold-aware layout is cheaper as a layout-walk filter or a post-layout line filter.
 
 ### Phase 6: Mouse, link following, and clipboard
-**Model:** fable
+**Model:** opus
 **Skills:** code-foundations:cc-defensive-programming, code-foundations:ca-architecture-boundaries
 **Gate:** Full
 **Security-sensitive:** yes

@@ -6,6 +6,7 @@
 use std::io::{self, IsTerminal, Write};
 use std::os::fd::AsFd as _;
 use std::panic;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
@@ -677,13 +678,74 @@ mod signals {
     }
 }
 
+/// Set by [`install_panic_hook`]'s closure, before it does anything else, and
+/// read by every [`PanicGuardedWriter`] the running session constructed
+/// against [`frame_poison_flag`]. See [`PanicGuardedWriter`] for why this
+/// exists; kept private specifically so nothing outside this module can
+/// poison the *process-wide* instance from a unit test and leak that state
+/// into an unrelated one — tests construct their own local `AtomicBool` and
+/// pass a reference to it instead.
+static FRAME_POISONED: AtomicBool = AtomicBool::new(false);
+
+/// The process-wide flag [`install_panic_hook`] poisons. `main.rs` passes
+/// this to the [`PanicGuardedWriter`] wrapped around the real `stdout` —
+/// there is exactly one real session per process, so a single `'static`
+/// flag is correct for production; [`PanicGuardedWriter::new`] itself is
+/// generic over the flag precisely so tests need not share it.
+pub fn frame_poison_flag() -> &'static AtomicBool {
+    &FRAME_POISONED
+}
+
+/// A [`Write`] that silently discards every byte once `poisoned` reads
+/// `true` (DW-1.6).
+///
+/// `run_session` wraps its `BufWriter` around one of these rather than
+/// around stdout directly. Without it, a panic that unwinds through a
+/// half-written frame leaves that frame's bytes sitting in the
+/// `BufWriter`'s own internal buffer; `BufWriter`'s `Drop` best-effort
+/// flushes that buffer regardless of *why* the stack is unwinding, so those
+/// stale escape bytes would land on stdout **after** [`on_panic`] has
+/// already written [`RESTORE_SEQUENCE`] — a half-painted frame appearing on
+/// a terminal the user has just been told is restored. Poisoning happens
+/// before `on_panic` runs (see [`install_panic_hook`]), so by the time
+/// unwinding reaches the `BufWriter`'s `drop`, every write it attempts
+/// (including that flush) is already a no-op here.
+pub struct PanicGuardedWriter<'a, W> {
+    inner: W,
+    poisoned: &'a AtomicBool,
+}
+
+impl<'a, W> PanicGuardedWriter<'a, W> {
+    pub fn new(inner: W, poisoned: &'a AtomicBool) -> Self {
+        PanicGuardedWriter { inner, poisoned }
+    }
+}
+
+impl<W: Write> Write for PanicGuardedWriter<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.poisoned.load(Ordering::Acquire) {
+            return Ok(buf.len());
+        }
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if self.poisoned.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        self.inner.flush()
+    }
+}
+
 /// Installs a panic hook that restores the terminal before running the
 /// previously installed hook, so a panic's message prints to a normal,
 /// readable terminal instead of being lost inside the alternate screen /
-/// raw mode.
+/// raw mode. Also poisons [`frame_poison_flag`] first — see
+/// [`PanicGuardedWriter`] for why that order matters.
 pub fn install_panic_hook() {
     let previous = panic::take_hook();
     panic::set_hook(Box::new(move |info| {
+        FRAME_POISONED.store(true, Ordering::Release);
         on_panic(&mut io::stdout());
         previous(info);
     }));
@@ -859,5 +921,32 @@ mod tests {
         let mut buf = Vec::new();
         on_panic(&mut buf);
         assert_eq!(buf, RESTORE_SEQUENCE);
+    }
+
+    /// DW-1.6, the writer in isolation: a *local* `AtomicBool`, never
+    /// `FRAME_POISONED` — sharing the process-wide flag across parallel
+    /// `cargo test` threads would make this test's poisoning leak into an
+    /// unrelated one.
+    #[test]
+    fn test_dw_1_6_panic_guarded_writer_passes_bytes_through_until_poisoned_then_discards() {
+        let mut buf = Vec::new();
+        let poisoned = AtomicBool::new(false);
+        {
+            let mut w = PanicGuardedWriter::new(&mut buf, &poisoned);
+            w.write_all(b"before").unwrap();
+            w.flush().unwrap();
+        }
+        assert_eq!(buf, b"before");
+
+        poisoned.store(true, Ordering::Release);
+        {
+            let mut w = PanicGuardedWriter::new(&mut buf, &poisoned);
+            w.write_all(b"after-poison").unwrap();
+            w.flush().unwrap();
+        }
+        assert_eq!(
+            buf, b"before",
+            "a poisoned writer must silently discard, never append, to the wire underneath it"
+        );
     }
 }

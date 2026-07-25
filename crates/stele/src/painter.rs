@@ -15,6 +15,7 @@ use highlight::{HYPERLINK_CLOSE, hyperlink_open};
 use layout::{LayoutTree, Line, LineItem, Reserved, ReservedLine, Run, Semantic, StyleId};
 use width::WidthEngine;
 
+use crate::app::StatusLine;
 use crate::decor::{Decor, StructuralDecor};
 use crate::media::{MediaSink, NoopMediaSink};
 
@@ -142,10 +143,66 @@ impl Painter {
         size: Size,
         out: &mut dyn Write,
     ) -> io::Result<()> {
+        self.frame_with_status(tree, scroll, size, &StatusLine::default(), out)
+    }
+
+    /// [`Painter::frame`] plus a reserved status row (DW-1.1) painted from
+    /// `status`, one row below `size.height` content rows — so `size` here
+    /// is the *content* viewport (what [`crate::app::AppState::size`]
+    /// already is once the caller has subtracted the status row from the
+    /// real terminal height), not the full terminal.
+    ///
+    /// This is the real implementation; [`Painter::frame`] is this call with
+    /// an empty [`StatusLine`], which is why every frame — not just the ones
+    /// that bother to pass real status content — reserves the row.
+    pub fn frame_with_status(
+        &mut self,
+        tree: &LayoutTree,
+        scroll: usize,
+        size: Size,
+        status: &StatusLine,
+        out: &mut dyn Write,
+    ) -> io::Result<()> {
         out.write_all(SYNC_BEGIN)?;
-        let painted = self.frame_body(tree, scroll, size, out);
+        let painted = self
+            .frame_body(tree, scroll, size, out)
+            .and_then(|()| self.paint_status_row(status, size, out));
         let closed = out.write_all(SYNC_END).and_then(|()| out.flush());
         painted.and(closed)
+    }
+
+    /// Paints `status` into the row immediately below the `size.height`
+    /// content rows (DW-1.1: content occupies `0..size.height`, the status
+    /// row is the one after it — never inside that range, so it can never
+    /// overpaint content).
+    ///
+    /// Row arithmetic is done in `u32` specifically so `size.height ==
+    /// u16::MAX` cannot wrap the 1-indexed row number back to 0 — a
+    /// degenerate viewport this painter otherwise promises never to panic
+    /// on (see [`Painter::frame`]'s doc comment).
+    fn paint_status_row(
+        &mut self,
+        status: &StatusLine,
+        size: Size,
+        out: &mut dyn Write,
+    ) -> io::Result<()> {
+        if size.width == 0 {
+            return Ok(());
+        }
+        let row = u32::from(size.height) + 1;
+        write!(out, "\x1b[{row};1H")?;
+        let text = status.render();
+        if !text.is_empty() {
+            let sanitized = sanitize(&text);
+            let (clipped, _) = clip_to_width(&sanitized, &self.width_engine, size.width);
+            if !clipped.is_empty() {
+                write!(out, "\x1b[2m")?;
+                out.write_all(clipped.as_bytes())?;
+                out.write_all(SGR_RESET)?;
+            }
+        }
+        out.write_all(CLEAR_TO_EOL)?;
+        Ok(())
     }
 
     /// The body of [`frame`](Self::frame), between the synchronized-update

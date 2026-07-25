@@ -5,23 +5,23 @@
 //! it is covered black-box, through the real binary, by
 //! `tests/cli_errors.rs`, `tests/quit_restore.rs` and `tests/signal_restore.rs`.
 
-use std::io;
+use std::io::{self, Write};
 use std::process::ExitCode;
 use std::time::Duration;
 
 use ast::Document;
 use clap::Parser;
-use crossterm::event::{self, Event, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use layout::{LayoutConfig, layout};
 use width::{WidthConfig, WidthEngine};
 
-use stele::app::{AppState, LayoutContext};
+use stele::app::{AppState, FileInfo, LayoutContext};
 use stele::cli::Cli;
 use stele::decor::themed::ThemedDecor;
 use stele::loader;
 use stele::media::{GfxMediaSink, ImageSizer, NoopMediaSink};
 use stele::painter::{Painter, Size};
-use stele::terminal::{CellQuery, TerminalGuard, install_panic_hook};
+use stele::terminal::{CellQuery, PanicGuardedWriter, TerminalGuard, install_panic_hook};
 
 /// How long a resize burst is drained for before committing to one
 /// relayout — long enough to coalesce a storm of SIGWINCH-driven `Resize`
@@ -41,6 +41,15 @@ fn main() -> ExitCode {
             eprintln!("stele: {err}");
             return ExitCode::FAILURE;
         }
+    };
+
+    // Captured from the raw file, before preprocessing touches it (DW-1.3):
+    // `Ctrl-G`'s byte size and line count describe the file on disk, not the
+    // frontmatter-stripped / mermaid-rendered text the layout engine sees.
+    let file_info = FileInfo {
+        name: cli.file.display().to_string(),
+        byte_size: source.len() as u64,
+        line_count: source.lines().count(),
     };
 
     // Source preprocessing before parse: hide a leading frontmatter block
@@ -80,9 +89,13 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // One row reserved for the status line (DW-1.1): `size` here is the
+    // *content* viewport `AppState`/`layout` see, always one row shorter
+    // than the real terminal. `Painter::frame_with_status` paints the
+    // status row immediately below it.
     let size = Size {
         width: cols,
-        height: rows,
+        height: rows.saturating_sub(1),
     };
 
     install_panic_hook();
@@ -124,7 +137,7 @@ fn main() -> ExitCode {
         sizer: sizer.as_ref(),
     };
     let tree = layout(ctx.doc, size.width, ctx.config, ctx.engine, ctx.sizer);
-    let mut state = AppState::new(tree, size);
+    let mut state = AppState::new(tree, size, file_info);
 
     let mut painter = Painter::new(WidthEngine::new(WidthConfig::default()));
     if graphics_disabled {
@@ -138,10 +151,37 @@ fn main() -> ExitCode {
     }
     // The themed decor provides real syntax highlighting and theme colors.
     // Background is not OSC 11-probed here (that needs a pre-alt-screen query
-    // round-trip); detect() falls back to the dark theme and honors NO_COLOR.
-    painter.register_decor(Box::new(ThemedDecor::detect(None)));
+    // round-trip); the fallback is the dark variant, and `T` (DW-1.5) flips
+    // between it and light from here on. Kept as an explicit `ThemeState`
+    // rather than `ThemedDecor::detect(None)` (equivalent for this initial
+    // frame) so `run_session` has the variant/color-mode pair to flip.
+    let mut theme = ThemeState {
+        variant: highlight::Variant::Dark,
+        color_mode: highlight::ColorMode::from_env(),
+    };
+    painter.register_decor(Box::new(ThemedDecor::new(highlight::Theme::new(
+        theme.variant,
+        theme.color_mode,
+    ))));
 
-    let result = run_session(&ctx, &mut state, &mut painter);
+    // stdout, wrapped for two reasons (DW-1.6): `BufWriter` so a frame's many
+    // small writes cost one syscall instead of dozens, and
+    // `PanicGuardedWriter` so a panic mid-frame can never let that buffer's
+    // own best-effort flush leak stale escape bytes onto a terminal
+    // `install_panic_hook` has already restored. See `terminal::PanicGuardedWriter`.
+    let buffered = io::BufWriter::new(PanicGuardedWriter::new(
+        io::stdout().lock(),
+        stele::terminal::frame_poison_flag(),
+    ));
+    let mut out: Box<dyn Write> = match test_panic_after_bytes() {
+        Some(remaining) => Box::new(PanicAfterBytes {
+            inner: buffered,
+            remaining,
+        }),
+        None => Box::new(buffered),
+    };
+
+    let result = run_session(&ctx, &mut state, &mut painter, &mut theme, out.as_mut());
 
     // Leave the alternate screen (drop restores the terminal) BEFORE printing
     // any error — an `eprintln!` while the alt screen is active is wiped out
@@ -157,30 +197,50 @@ fn main() -> ExitCode {
     }
 }
 
+/// The running theme toggle state (DW-1.5): which built-in variant is
+/// active, and the color mode resolved once at startup (`NO_COLOR`,
+/// truecolor vs. 256-color) that stays fixed across a `T` press.
+struct ThemeState {
+    variant: highlight::Variant,
+    color_mode: highlight::ColorMode,
+}
+
 /// The interactive session: initial paint, then the scroll/resize/paint event
 /// loop. Returns `Ok(())` on a clean quit and any terminal I/O error to the
 /// caller, which restores the terminal before surfacing it.
-fn run_session(ctx: &LayoutContext, state: &mut AppState, painter: &mut Painter) -> io::Result<()> {
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
-
-    painter.frame(state.tree(), state.scroll(), state.size(), &mut out)?;
+fn run_session(
+    ctx: &LayoutContext,
+    state: &mut AppState,
+    painter: &mut Painter,
+    theme: &mut ThemeState,
+    out: &mut dyn Write,
+) -> io::Result<()> {
+    let status = state.status();
+    painter.frame_with_status(state.tree(), state.scroll(), state.size(), &status, out)?;
 
     loop {
         match event::read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
-                if state.handle_key_event(key) {
+                if !handle_chrome_key(key, ctx, state, painter, theme)
+                    && state.handle_key_event(key)
+                {
                     break;
                 }
             }
             Event::Resize(width, height) => {
-                let mut sizes = vec![Size { width, height }];
+                // Same reservation as the initial `Size` in `main` — see its
+                // comment. `height` here is the raw terminal row count
+                // crossterm reports on a resize.
+                let mut sizes = vec![Size {
+                    width,
+                    height: height.saturating_sub(1),
+                }];
                 let mut quit = false;
                 while event::poll(RESIZE_DEBOUNCE).unwrap_or(false) {
                     match event::read() {
                         Ok(Event::Resize(w, h)) => sizes.push(Size {
                             width: w,
-                            height: h,
+                            height: h.saturating_sub(1),
                         }),
                         // A keypress mid-storm (notably `q` or Ctrl-C) must
                         // not be swallowed by the debounce drain — honor a
@@ -203,8 +263,106 @@ fn run_session(ctx: &LayoutContext, state: &mut AppState, painter: &mut Painter)
             _ => continue,
         }
 
-        painter.frame(state.tree(), state.scroll(), state.size(), &mut out)?;
+        let status = state.status();
+        painter.frame_with_status(state.tree(), state.scroll(), state.size(), &status, out)?;
     }
 
     Ok(())
+}
+
+/// Bottom-row chrome and layout-affecting toggles that need resources
+/// `AppState::handle_key_event` does not have: `ctx` for a relayout, and
+/// `painter`/`theme` for the theme swap. (`Ctrl-g`'s file info needs
+/// neither — it lives entirely inside `AppState::handle_control_chord`,
+/// since `FileInfo` is static per-session data baked into `AppState` at
+/// construction.) Returns whether `key` was one of these — when `true`,
+/// the caller must not also pass `key` to `AppState::handle_key_event`.
+fn handle_chrome_key(
+    key: KeyEvent,
+    ctx: &LayoutContext,
+    state: &mut AppState,
+    painter: &mut Painter,
+    theme: &mut ThemeState,
+) -> bool {
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        return false;
+    }
+    match key.code {
+        KeyCode::Char('+') => state.widen(ctx),
+        KeyCode::Char('-') => state.narrow(ctx),
+        KeyCode::Char('T') => {
+            theme.variant = toggled_variant(theme.variant);
+            painter.register_decor(Box::new(ThemedDecor::new(highlight::Theme::new(
+                theme.variant,
+                theme.color_mode,
+            ))));
+            state.relayout_preserving_anchor(ctx, *ctx.config);
+        }
+        _ => return false,
+    }
+    true
+}
+
+/// The pure half of `T`'s action. Exhaustive match — no wildcard arm — so a
+/// third built-in `Variant` fails to compile here instead of silently
+/// leaving `T` a no-op.
+fn toggled_variant(variant: highlight::Variant) -> highlight::Variant {
+    match variant {
+        highlight::Variant::Dark => highlight::Variant::Light,
+        highlight::Variant::Light => highlight::Variant::Dark,
+    }
+}
+
+/// Test-only fault injection (DW-1.6): a writer that panics once
+/// `remaining` bytes have passed through it, deliberately mid-frame, with
+/// content already sitting unflushed inside the `BufWriter`/
+/// `PanicGuardedWriter` wrapped around it. Configured via env var — set only
+/// by `tests/panic_mid_frame.rs` — rather than a method call, because the
+/// only way to inject this into the exact writer stack under test is across
+/// the process boundary the pty test spawns `stele` over; existing pty tests
+/// configure the child the same way, through `Command::env`.
+struct PanicAfterBytes<W> {
+    inner: W,
+    remaining: usize,
+}
+
+impl<W: Write> Write for PanicAfterBytes<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if buf.len() >= self.remaining {
+            panic!("stele: test-injected panic mid-frame (STELE_TEST_PANIC_AFTER_BYTES)");
+        }
+        self.remaining -= buf.len();
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+fn test_panic_after_bytes() -> Option<usize> {
+    std::env::var("STELE_TEST_PANIC_AFTER_BYTES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_toggled_variant_swaps_dark_and_light_and_is_its_own_inverse() {
+        assert_eq!(
+            toggled_variant(highlight::Variant::Dark),
+            highlight::Variant::Light
+        );
+        assert_eq!(
+            toggled_variant(highlight::Variant::Light),
+            highlight::Variant::Dark
+        );
+        assert_eq!(
+            toggled_variant(toggled_variant(highlight::Variant::Dark)),
+            highlight::Variant::Dark
+        );
+    }
 }
