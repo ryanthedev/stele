@@ -93,13 +93,19 @@ impl std::fmt::Display for DecodeError {
 
 impl std::error::Error for DecodeError {}
 
-/// A decoded image, scaled and re-encoded as PNG at the caller's requested
-/// target cell-pixel size. `width`/`height` are the *original* decoded
-/// dimensions (before scaling) — useful for logging/diagnostics.
+/// A decoded image, scaled and letterboxed onto the caller's requested target
+/// cell-pixel size, re-encoded as PNG.
+///
+/// The dimension fields are named for what they are — the **source file's**
+/// dimensions, before any scaling — because the obvious reading of a bare
+/// `width`/`height` next to a `png` field is "the raster's size", and that is
+/// the one thing they are not. A caller that needs the transmitted raster's
+/// pixel size must read it from `png` (or know it equals the `target_px` it
+/// asked for).
 #[derive(Debug, Clone)]
 pub struct DecodedImage {
-    pub width: u32,
-    pub height: u32,
+    pub source_width: u32,
+    pub source_height: u32,
     pub png: Vec<u8>,
 }
 
@@ -174,22 +180,57 @@ pub fn decode_and_scale(
     })?;
 
     let (target_w, target_h) = (target_px.0.max(1), target_px.1.max(1));
-    let scaled = image::imageops::resize(
-        &img.to_rgba8(),
-        target_w,
-        target_h,
-        image::imageops::FilterType::Triangle,
-    );
+    let letterboxed = letterbox(&img.to_rgba8(), target_w, target_h);
     let mut png = Vec::new();
-    image::DynamicImage::ImageRgba8(scaled)
+    image::DynamicImage::ImageRgba8(letterboxed)
         .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
         .map_err(|e| DecodeError::Malformed(e.to_string()))?;
 
     Ok(DecodedImage {
-        width: img.width(),
-        height: img.height(),
+        source_width: img.width(),
+        source_height: img.height(),
         png,
     })
+}
+
+/// Scales `src` down/up to fit *inside* `target_w` x `target_h` preserving its
+/// aspect ratio, then centers it on a fully transparent canvas of exactly
+/// `target_w` x `target_h`.
+///
+/// **Why the padding is not optional.** The kitty graphics protocol scales a
+/// placement to fill its `c=` x `r=` cell box *exactly*, so the raster's
+/// proportions are the on-screen proportions. A cell box is a whole number of
+/// cells and an image is not, so resizing straight onto the target — what this
+/// used to do — stretches every image whose pixel dimensions don't happen to
+/// land on the cell grid. Measured against the shipped fixtures
+/// (`cargo run -p gfx --example aspect_repro`) that was a 40x24 icon rendering
+/// as a square (-40%) and a 3000x100 banner rendering 80% too tall (-44%).
+///
+/// This is the image-side twin of [`math::render_fitted`]'s letterbox: same
+/// problem, same remedy, so a photo and a formula in the same document are
+/// both undistorted. The returned raster is still *exactly* `target_w` x
+/// `target_h`, so every caller that reasons about the raster's pixel geometry
+/// (placement sizing, and any source-rect crop over it) is unaffected.
+fn letterbox(src: &image::RgbaImage, target_w: u32, target_h: u32) -> image::RgbaImage {
+    // Fit: the smaller of the two axis ratios, in a wide-enough type that a
+    // 8192-px source against a 1-px target cannot round to zero.
+    let (sw, sh) = (src.width().max(1), src.height().max(1));
+    let scale = f64::from(target_w) / f64::from(sw);
+    let scale = scale.min(f64::from(target_h) / f64::from(sh));
+    let fit_w = ((f64::from(sw) * scale).round() as u32).clamp(1, target_w);
+    let fit_h = ((f64::from(sh) * scale).round() as u32).clamp(1, target_h);
+
+    let resized = image::imageops::resize(src, fit_w, fit_h, image::imageops::FilterType::Triangle);
+    if fit_w == target_w && fit_h == target_h {
+        // Already exactly on the box: no canvas copy, no wasted allocation.
+        return resized;
+    }
+    // Transparent, not a colored box — the terminal's own background must show
+    // through the margin, the same guarantee `crates/math` makes for formulas.
+    let mut canvas = image::RgbaImage::from_pixel(target_w, target_h, image::Rgba([0, 0, 0, 0]));
+    let (dx, dy) = ((target_w - fit_w) / 2, (target_h - fit_h) / 2);
+    image::imageops::replace(&mut canvas, &resized, i64::from(dx), i64::from(dy));
+    canvas
 }
 
 #[cfg(test)]
@@ -339,7 +380,7 @@ mod tests {
     fn test_decode_and_scale_produces_png_at_target_pixel_size() {
         let path = write_file("scale", &valid_tiny_png());
         let decoded = decode_and_scale(&path, (24, 48), Limits::default()).unwrap();
-        assert_eq!((decoded.width, decoded.height), (2, 2));
+        assert_eq!((decoded.source_width, decoded.source_height), (2, 2));
         let (w, h) = probe_reencoded_dimensions(&decoded.png);
         assert_eq!((w, h), (24, 48));
         std::fs::remove_file(&path).ok();
@@ -348,5 +389,121 @@ mod tests {
     fn probe_reencoded_dimensions(png: &[u8]) -> (u32, u32) {
         let img = image::load_from_memory(png).unwrap();
         (img.width(), img.height())
+    }
+
+    /// Regression: kitty stretches a placement to fill its `c=` x `r=` cell box
+    /// exactly, so the raster's proportions are what the viewer sees. Filling
+    /// the box by resizing straight onto it distorted every image whose pixel
+    /// size didn't land on the cell grid — a 40x24 icon rendered square, a
+    /// 3000x100 banner rendered 80% too tall.
+    ///
+    /// Asserting the raster is the target size (the test above) is exactly the
+    /// assertion that let that ship: it is true both before and after. This
+    /// asserts on the *ink*, which is the thing the viewer actually judges.
+    #[test]
+    fn test_decode_and_scale_letterboxes_instead_of_stretching_the_source() {
+        // Source aspect / target box / expected ink extent inside the box.
+        // Each case is a real `testdocs/img` geometry paired with the box
+        // `ImageSizer` + `layout::block::emit_box` actually reserve for it.
+        /// `(source px, target box px, expected ink extent inside the box)`.
+        struct Case {
+            source: (u32, u32),
+            target: (u32, u32),
+            ink: (u32, u32),
+        }
+        let case = |source, target, ink| Case {
+            source,
+            target,
+            ink,
+        };
+        let cases = [
+            // small.png: 40x24 into a 2x1 cell box (48x48 px) -> 48x29 ink.
+            case((40, 24), (48, 48), (48, 29)),
+            // wide.png: 3000x100 into a 100x3 cell box (2400x144 px).
+            case((3000, 100), (2400, 144), (2400, 80)),
+            // tall.png: 100x800 into a 5x17 cell box (120x816 px).
+            case((100, 800), (120, 816), (102, 816)),
+            // huge.png (square): 6000x6000 into the capped 100x63 box.
+            case((6000, 6000), (2400, 3024), (2400, 2400)),
+        ];
+        for &Case {
+            source: (sw, sh),
+            target,
+            ink: (ink_w, ink_h),
+        } in &cases
+        {
+            let img = image::RgbaImage::from_pixel(sw, sh, image::Rgba([200, 30, 30, 255]));
+            let mut bytes = Vec::new();
+            image::DynamicImage::ImageRgba8(img)
+                .write_to(&mut Cursor::new(&mut bytes), image::ImageFormat::Png)
+                .unwrap();
+            let path = write_file(&format!("letterbox-{sw}x{sh}"), &bytes);
+            let decoded = decode_and_scale(&path, target, Limits::default()).unwrap();
+            std::fs::remove_file(&path).ok();
+
+            // The raster still exactly fills the reserved box, so placement
+            // sizing (and any source-rect crop over it) is unchanged.
+            assert_eq!(
+                probe_reencoded_dimensions(&decoded.png),
+                target,
+                "{sw}x{sh} must still rasterize to exactly its {target:?} box"
+            );
+
+            // The ink inside it keeps the source's aspect ratio.
+            let raster = image::load_from_memory(&decoded.png).unwrap().to_rgba8();
+            let (measured_w, measured_h) = opaque_extent(&raster);
+            assert_eq!(
+                (measured_w, measured_h),
+                (ink_w, ink_h),
+                "{sw}x{sh} into {target:?}: ink {measured_w}x{measured_h}, expected {ink_w}x{ink_h}"
+            );
+            let src_aspect = f64::from(sw) / f64::from(sh);
+            let ink_aspect = f64::from(measured_w) / f64::from(measured_h);
+            assert!(
+                (ink_aspect / src_aspect - 1.0).abs() < 0.05,
+                "{sw}x{sh} into {target:?}: ink aspect {ink_aspect:.3} vs source {src_aspect:.3}"
+            );
+        }
+    }
+
+    /// Bounding-box extent of the non-transparent pixels — the letterboxed
+    /// image's actual ink, ignoring the transparent margin around it.
+    fn opaque_extent(img: &image::RgbaImage) -> (u32, u32) {
+        let (mut min_x, mut min_y) = (u32::MAX, u32::MAX);
+        let (mut max_x, mut max_y) = (0u32, 0u32);
+        for (x, y, px) in img.enumerate_pixels() {
+            if px.0[3] > 0 {
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(x);
+                max_y = max_y.max(y);
+            }
+        }
+        if min_x == u32::MAX {
+            return (0, 0);
+        }
+        (max_x - min_x + 1, max_y - min_y + 1)
+    }
+
+    /// The letterbox margin must be genuinely transparent, not an opaque black
+    /// bar — the terminal's own background has to show through it, the same
+    /// guarantee `crates/math` makes for a formula's padding.
+    #[test]
+    fn test_letterbox_margin_is_transparent_not_an_opaque_bar() {
+        let img = image::RgbaImage::from_pixel(40, 24, image::Rgba([200, 30, 30, 255]));
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut Cursor::new(&mut bytes), image::ImageFormat::Png)
+            .unwrap();
+        let path = write_file("letterbox-alpha", &bytes);
+        let decoded = decode_and_scale(&path, (48, 48), Limits::default()).unwrap();
+        std::fs::remove_file(&path).ok();
+        let raster = image::load_from_memory(&decoded.png).unwrap().to_rgba8();
+        assert_eq!(
+            raster.get_pixel(0, 0).0[3],
+            0,
+            "top-left margin pixel must be fully transparent"
+        );
+        assert_eq!(raster.get_pixel(0, 47).0[3], 0);
     }
 }

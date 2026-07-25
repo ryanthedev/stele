@@ -101,7 +101,17 @@ pub(crate) fn corrected_cluster_width(cluster: &str, ambiguous_wide: bool) -> u1
     // regression case `zerowidth_2` (a standalone U+200D, its own cluster
     // since there's nothing for it to join) is 0 in Ghostty, not 2 — the
     // general rule below already gets that right via `unicode-width`.
+    //
+    // The `Emoji=YES` gate is the same one the selector rules above use, and
+    // for the same reason: a joiner with no emoji to join renders nothing.
+    // UAX #29's GB9 keeps a *trailing* ZWJ attached to whatever precedes it
+    // even when GB11 refused the join — that is exactly why the cluster ended
+    // there — so `"a\u{200D}"` arrives here as a two-codepoint cluster with a
+    // ZWJ in it and no emoji anywhere. Without the gate it measured 2, i.e.
+    // an invisible formatting character doubled the width of an ASCII letter,
+    // which then under-pads every table cell to its right on that row.
     if cluster.chars().count() > 1
+        && cluster.chars().any(|c| c.is_emoji_char())
         && (cluster.chars().any(is_zwj) || cluster.chars().any(is_fitzpatrick_modifier))
     {
         // A ZWJ sequence or an emoji + skin-tone modifier renders as a
@@ -149,6 +159,30 @@ mod tests {
     fn vs15_demotes_default_emoji_presentation_to_narrow() {
         // WATCH + VS15 — Emoji=YES, so the selector applies.
         assert_eq!(corrected_cluster_width("\u{231A}\u{FE0E}", false), 1);
+    }
+
+    #[test]
+    fn a_dangling_zwj_does_not_widen_the_letter_it_clings_to() {
+        // GB9 keeps a trailing ZWJ in the preceding cluster even when GB11
+        // refused to join anything across it, so this cluster is `a` + ZWJ
+        // with no emoji in sight. It must stay one cell — an invisible
+        // joiner cannot make a letter wide.
+        assert_eq!(corrected_cluster_width("a\u{200D}", false), 1);
+        assert_eq!(corrected_cluster_width("\u{65E5}\u{200D}", false), 2);
+    }
+
+    #[test]
+    fn a_real_zwj_emoji_sequence_is_still_one_wide_glyph() {
+        // 👨‍👩‍👧‍👦 — the gate must not disturb the case it was built for.
+        assert_eq!(
+            corrected_cluster_width(
+                "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}",
+                false
+            ),
+            2
+        );
+        // 👍🏽 — emoji + Fitzpatrick modifier.
+        assert_eq!(corrected_cluster_width("\u{1F44D}\u{1F3FD}", false), 2);
     }
 
     #[test]

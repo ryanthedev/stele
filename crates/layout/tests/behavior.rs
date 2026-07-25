@@ -42,7 +42,19 @@ fn text_of(tree: &LayoutTree) -> Vec<String> {
                     LineItem::Box(b) => format!("<box {}x{}>", b.cols, b.rows),
                 })
                 .collect::<String>(),
-            Line::Reserved(r) => format!("<reserved {}x{}>", r.cols, r.rows),
+            // The container prefix is shown too: a reserved line carries the
+            // gutter bar / list marker for its row, and rendering the box
+            // alone is exactly how a list item whose only child is an image
+            // lost its marker unnoticed.
+            Line::Reserved(r) => format!(
+                "{}<reserved {}x{}>",
+                r.prefix
+                    .iter()
+                    .map(|run| run.text.as_str())
+                    .collect::<String>(),
+                r.cols,
+                r.rows
+            ),
         })
         .collect()
 }
@@ -152,12 +164,12 @@ fn test_image_scaled_to_fit_preserving_aspect() {
     let reserved: Vec<_> = tree
         .lines(0..tree.line_count())
         .filter_map(|l| match l {
-            Line::Reserved(r) => Some(*r),
+            Line::Reserved(r) => Some(r.clone()),
             _ => None,
         })
         .collect();
     assert!(!reserved.is_empty(), "sized image must reserve lines");
-    let r = reserved[0];
+    let r = &reserved[0];
     assert_eq!(r.cols, 100, "wider-than-viewport image scales to width");
     assert_eq!(r.rows, 25, "aspect ratio preserved (200x50 -> 100x25)");
     assert_eq!(
@@ -166,8 +178,20 @@ fn test_image_scaled_to_fit_preserving_aspect() {
         "one Reserved line per row"
     );
     assert!(
-        reserved.iter().all(|x| x == &r),
-        "all rows carry the identical Reserved value"
+        reserved
+            .iter()
+            .all(|x| (x.node_id, x.cols, x.rows) == (r.node_id, r.cols, r.rows)),
+        "all rows carry the same box identity and extent"
+    );
+    // ...but each names its own position in the box. A consumer that sees
+    // only a scrolled slice of these lines has no other way to tell "row 0
+    // of the box" from "row 7, the top 7 scrolled off"; the media sink needs
+    // exactly that to crop a top-truncated placement instead of painting the
+    // whole image downward over the text below it.
+    assert_eq!(
+        reserved.iter().map(|x| x.row).collect::<Vec<_>>(),
+        (0..r.rows).collect::<Vec<_>>(),
+        "row index must ascend 0..rows across the box's lines"
     );
 }
 
@@ -285,7 +309,7 @@ fn test_sizer_receives_resolvable_node_id() {
     let reserved: Vec<_> = tree
         .lines(0..tree.line_count())
         .filter_map(|l| match l {
-            Line::Reserved(r) => Some(*r),
+            Line::Reserved(r) => Some(r.clone()),
             _ => None,
         })
         .collect();
@@ -512,7 +536,7 @@ fn inline_boxes(tree: &LayoutTree) -> Vec<(usize, layout::Reserved)> {
             Line::Items(items) => items
                 .iter()
                 .filter_map(|item| match item {
-                    LineItem::Box(b) => Some((i, *b)),
+                    LineItem::Box(b) => Some((i, b.clone())),
                     LineItem::Run(_) => None,
                 })
                 .collect::<Vec<_>>(),
@@ -570,7 +594,7 @@ fn test_inline_box_taller_than_one_row_still_claims_its_own_rows() {
     let reserved: Vec<_> = tree
         .lines(0..tree.line_count())
         .filter_map(|l| match l {
-            Line::Reserved(r) => Some(*r),
+            Line::Reserved(r) => Some(r.clone()),
             _ => None,
         })
         .collect();
@@ -694,4 +718,259 @@ fn test_inline_math_of_the_same_size_still_rides_the_baseline() {
         line.contains("Einstein wrote <box 8x1> on the board."),
         "one flowing sentence: {line:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Container prefixes on reserved media rows, and containers with no content.
+//
+// All four of these are *position* assertions: which column the box starts at,
+// which marker text precedes it, which row an item occupies. The suite that
+// missed them asserted `line.width() <= tree.width()` — true of a box drawn
+// from column 0 across its own blockquote gutter — and "one Reserved line per
+// row", true of a box whose list marker was never emitted at all.
+
+#[test]
+fn test_reserved_box_in_a_blockquote_starts_after_the_gutter_on_every_row() {
+    let doc = Document::parse("> before\n>\n> ![tall](t.png)\n>\n> after\n");
+    let tree = layout(
+        &doc,
+        40,
+        &LayoutConfig::default(),
+        &engine(),
+        &FixedSizer(CellSize { cols: 6, rows: 4 }),
+    );
+    assert_bound(&tree);
+    let rows: Vec<(String, u16, u16)> = tree
+        .lines(0..tree.line_count())
+        .filter_map(|l| match l {
+            Line::Reserved(r) => Some((
+                r.prefix
+                    .iter()
+                    .map(|run| run.text.as_str())
+                    .collect::<String>(),
+                r.prefix
+                    .iter()
+                    .fold(0u16, |acc, run| acc.saturating_add(run.width)),
+                r.row,
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rows.len(), 4, "a 4-row box: {:?}", text_of(&tree));
+    for (i, (text, col, row)) in rows.iter().enumerate() {
+        assert_eq!(text, "\u{2502} ", "row {i} keeps the gutter bar");
+        assert_eq!(*col, 2, "row {i} starts the box at column 2, past the bar");
+        assert_eq!(*row, i as u16, "row {i} names its own index in the box");
+    }
+    // And the gutter must carry the blockquote role, not fall out as plain
+    // text — the painter dims it, which is how a quote reads as a quote.
+    let styles: Vec<StyleId> = tree
+        .lines(0..tree.line_count())
+        .filter_map(|l| match l {
+            Line::Reserved(r) => r.prefix.first().map(|run| run.style_id),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        styles
+            .iter()
+            .all(|s| *s == StyleId::Semantic(Semantic::BlockquoteMarker)),
+        "{styles:?}"
+    );
+}
+
+#[test]
+fn test_list_item_whose_only_child_is_a_box_still_emits_its_marker() {
+    // The reader-visible symptom: an ordered list that begins at "2.".
+    let doc = Document::parse("1. ![tall](t.png)\n2. second\n");
+    let tree = layout(
+        &doc,
+        40,
+        &LayoutConfig::default(),
+        &engine(),
+        &FixedSizer(CellSize { cols: 6, rows: 3 }),
+    );
+    let text = text_of(&tree);
+    assert_eq!(
+        text,
+        vec![
+            "1. <reserved 6x3>".to_string(),
+            "   <reserved 6x3>".to_string(),
+            "   <reserved 6x3>".to_string(),
+            "2. second".to_string(),
+        ],
+        "the marker rides the box's first row and the indent the rest"
+    );
+    // Spelled out, because "1." is the whole finding: the list must not
+    // renumber itself on screen.
+    assert!(
+        text[0].starts_with("1. "),
+        "item 1's marker vanished, so the list starts at 2: {text:?}"
+    );
+}
+
+#[test]
+fn test_nested_list_box_starts_past_both_markers() {
+    let doc = Document::parse("- outer\n  - ![tall](t.png)\n");
+    let tree = layout(
+        &doc,
+        40,
+        &LayoutConfig::default(),
+        &engine(),
+        &FixedSizer(CellSize { cols: 6, rows: 2 }),
+    );
+    assert_bound(&tree);
+    let cols: Vec<(String, u16)> = tree
+        .lines(0..tree.line_count())
+        .filter_map(|l| match l {
+            Line::Reserved(r) => Some((
+                r.prefix
+                    .iter()
+                    .map(|run| run.text.as_str())
+                    .collect::<String>(),
+                r.prefix
+                    .iter()
+                    .fold(0u16, |acc, run| acc.saturating_add(run.width)),
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        cols,
+        vec![("  \u{2022} ".to_string(), 4), ("    ".to_string(), 4),],
+        "outer indent + inner bullet, then pure indent: {:?}",
+        text_of(&tree)
+    );
+}
+
+#[test]
+fn test_empty_list_item_still_occupies_a_row_with_its_marker() {
+    let tree = lay(&Document::parse("1. one\n2.\n3. three\n"), 40);
+    let text = text_of(&tree);
+    assert_eq!(
+        text,
+        vec![
+            "1. one".to_string(),
+            "2. ".to_string(),
+            "3. three".to_string()
+        ],
+        "an empty item must not vanish and renumber the list"
+    );
+}
+
+#[test]
+fn test_empty_bullet_and_task_items_still_occupy_their_rows() {
+    let tree = lay(&Document::parse("- [ ] task\n-\n- [x] done\n"), 40);
+    assert_eq!(
+        text_of(&tree),
+        vec![
+            "[ ] task".to_string(),
+            "\u{2022} ".to_string(),
+            "[x] done".to_string()
+        ],
+        "three items in, three rows out"
+    );
+}
+
+/// A bare `>` is an empty *container*, and an empty container occupies its
+/// line — the same answer an empty list item now gives. Asserted on the
+/// rendered row and on where the gutter glyph sits, not on a line count: a
+/// count cannot tell "the quote row is present with its bar in columns 0..2"
+/// from "some blank row appeared somewhere".
+#[test]
+fn test_empty_blockquote_still_occupies_a_row_with_its_gutter() {
+    let tree = lay(&Document::parse("before\n\n>\n\nafter\n"), 40);
+    assert_eq!(
+        text_of(&tree),
+        vec![
+            "before".to_string(),
+            String::new(),
+            "\u{2502} ".to_string(),
+            String::new(),
+            "after".to_string(),
+        ],
+        "a bare `>` must render one gutter row, not vanish"
+    );
+    // The glyph is at column 0 and is 2 cells wide, and it is a blockquote
+    // marker rather than stray text — the painter dims it on that role, which
+    // is how the empty quote reads as a quote and not as an indented blank.
+    let Line::Items(items) = tree.lines(2..3).next().expect("the quote row") else {
+        panic!("the quote row is a text line, not a reserved one");
+    };
+    let runs: Vec<(&str, u16, StyleId)> = items
+        .iter()
+        .map(|item| match item {
+            LineItem::Run(r) => (r.text.as_str(), r.width, r.style_id),
+            LineItem::Box(_) => panic!("no media box on an empty quote row"),
+        })
+        .collect();
+    assert_eq!(
+        runs,
+        vec![(
+            "\u{2502} ",
+            2u16,
+            StyleId::Semantic(Semantic::BlockquoteMarker)
+        )],
+        "the row is exactly the gutter bar, starting at column 0"
+    );
+}
+
+/// Same defect, same function, reachable from ordinary markdown: an empty
+/// footnote definition dropped its `[^a] ` label entirely, so a document with
+/// a `[^a]` reference showed no definition at all.
+#[test]
+fn test_empty_footnote_definition_still_occupies_a_row_with_its_label() {
+    let tree = lay(&Document::parse("text[^a]\n\n[^a]:\n"), 40);
+    assert_eq!(
+        text_of(&tree),
+        vec!["text[^a]".to_string(), String::new(), "[^a] ".to_string(),],
+        "an empty footnote definition must still show its label"
+    );
+    let Line::Items(items) = tree.lines(2..3).next().expect("the definition row") else {
+        panic!("the definition row is a text line, not a reserved one");
+    };
+    let runs: Vec<(&str, u16, StyleId)> = items
+        .iter()
+        .map(|item| match item {
+            LineItem::Run(r) => (r.text.as_str(), r.width, r.style_id),
+            LineItem::Box(_) => panic!("no media box on an empty definition row"),
+        })
+        .collect();
+    assert_eq!(
+        runs,
+        vec![("[^a] ", 5u16, StyleId::Semantic(Semantic::FootnoteLabel))],
+        "the row is exactly the label, starting at column 0"
+    );
+}
+
+#[test]
+fn test_thematic_break_spans_the_content_width_exactly_under_ambiguous_wide() {
+    // `─` is East Asian *Ambiguous*: 2 cells under this policy, so an odd
+    // content width used to come out one cell short. The default-policy test
+    // (`test_thematic_break_spans_width_exactly`) cannot see it — there dw is
+    // 1 and the division is exact for every width.
+    let wide = WidthEngine::new(WidthConfig {
+        ambiguous_wide: true,
+    });
+    for width in [24u16, 25, 40, 41, 99] {
+        let doc = Document::parse("para\n\n---\n");
+        let tree = layout(&doc, width, &LayoutConfig::default(), &wide, &NullSizer);
+        let rule = tree
+            .lines(0..tree.line_count())
+            .find(|l| match l {
+                Line::Items(items) => items.iter().any(|i| match i {
+                    LineItem::Run(r) => r.style_id == StyleId::Semantic(Semantic::Rule),
+                    LineItem::Box(_) => false,
+                }),
+                Line::Reserved(_) => false,
+            })
+            .unwrap_or_else(|| panic!("no rule line at width {width}"));
+        assert_eq!(
+            rule.width(),
+            tree.width(),
+            "width {width}: rule is {} cells against a {}-cell content column",
+            rule.width(),
+            tree.width()
+        );
+    }
 }

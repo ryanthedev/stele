@@ -159,46 +159,63 @@ impl TextGrid {
 /// hard ceiling against a hostile one.
 const MAX_PIXMAP_PX: u64 = 8_000_000;
 
-/// Returns the largest font size `<= requested` whose projected pixmap stays
-/// within [`MAX_PIXMAP_PX`], or `PixmapTooLarge` if even [`MIN_PX_HEIGHT`]
-/// does not fit. Degenerate (zero / non-finite) extents pass through
-/// unchanged — there is nothing to bound, and the rasterizer handles them.
+/// Projected pixmap area, in pixels, for a layout of em extent
+/// `(em_w, em_h)` rendered at `font` with `padding` px of margin on every
+/// side. **The padding term is not optional:** [`render_fitted`] solves for a
+/// letterbox margin up to [`MAX_PADDING`] on each side, which adds up to
+/// `2 * MAX_PADDING` to *both* axes. Counting only `em * font` let a wide
+/// formula's solved margin blow the budget by 8x — measured 63.5 megapixels
+/// against a stated 8-megapixel ceiling on `testdocs/02-math.md`'s own
+/// 4 KiB formula (`cargo run -p math --example fitted_probe`).
+fn projected_px(em_w: f64, em_h: f64, font: u32, padding: f64) -> u64 {
+    let f = f64::from(font);
+    let margin = 2.0 * padding.max(0.0);
+    let w = (em_w * f + margin).ceil().max(1.0);
+    let h = (em_h * f + margin).ceil().max(1.0);
+    // Saturate rather than wrap on an absurd extent.
+    if w > u64::MAX as f64 || h > u64::MAX as f64 {
+        return u64::MAX;
+    }
+    (w as u64).saturating_mul(h as u64)
+}
+
+/// Returns the largest font size `<= requested` whose projected pixmap —
+/// **including `padding`** — stays within [`MAX_PIXMAP_PX`], or
+/// `PixmapTooLarge` if even [`MIN_PX_HEIGHT`] does not fit. Degenerate (zero /
+/// non-finite) extents pass through unchanged — there is nothing to bound, and
+/// the rasterizer handles them.
 fn fit_font_size(
     list: &ratex_types::display_item::DisplayList,
     requested: u32,
+    padding: f64,
 ) -> Result<u32, MathError> {
     let em_w = list.width;
     let em_h = list.height + list.depth;
     if !em_w.is_finite() || !em_h.is_finite() || em_w <= 0.0 || em_h <= 0.0 {
         return Ok(requested);
     }
-    let px_at = |font: u32| -> u64 {
-        let f = f64::from(font);
-        let w = (em_w * f).ceil().max(1.0);
-        let h = (em_h * f).ceil().max(1.0);
-        // Saturate rather than wrap on an absurd extent.
-        if w > u64::MAX as f64 || h > u64::MAX as f64 {
-            return u64::MAX;
-        }
-        (w as u64).saturating_mul(h as u64)
-    };
+    let px_at = |font: u32| projected_px(em_w, em_h, font, padding);
     if px_at(requested) <= MAX_PIXMAP_PX {
         return Ok(requested);
     }
-    // area ~ font^2, so solve for the largest font that fits.
-    let scale = (MAX_PIXMAP_PX as f64 / (em_w * em_h)).sqrt().floor();
-    let fitted = if scale.is_finite() && scale >= 1.0 {
-        (scale as u64).min(u64::from(requested)) as u32
-    } else {
-        0
-    };
-    if fitted >= MIN_PX_HEIGHT && px_at(fitted) <= MAX_PIXMAP_PX {
-        Ok(fitted)
-    } else {
-        Err(MathError::PixmapTooLarge {
-            px: px_at(MIN_PX_HEIGHT),
-        })
+    // `px_at` is monotone non-decreasing in `font`, so binary-search the
+    // largest fitting size rather than solving a closed form. The closed form
+    // this replaces (`sqrt(MAX / (em_w*em_h))`) silently assumed area scales
+    // as `font^2`, which stops being true the moment a constant padding term
+    // is in the product.
+    let (mut lo, mut hi) = (MIN_PX_HEIGHT, requested.max(MIN_PX_HEIGHT));
+    if px_at(lo) > MAX_PIXMAP_PX {
+        return Err(MathError::PixmapTooLarge { px: px_at(lo) });
     }
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        if px_at(mid) <= MAX_PIXMAP_PX {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    Ok(lo)
 }
 
 pub fn render(tex: &str, px_height: u32) -> Result<Png, MathError> {
@@ -233,11 +250,12 @@ fn render_padded(tex: &str, px_height: u32, padding: f32) -> Result<Png, MathErr
     let display_list = cached_display_list(tex)?;
 
     // Bound the *pixmap*, not just the font size. Area scales with the
-    // layout's em extent as well, so a wide/tall construct within the
-    // MAX_TEX_LEN budget can demand an enormous raster at a legal font size.
-    // Shrink the font to fit the pixel budget; only if even MIN_PX_HEIGHT
-    // overflows it do we fail, and then the caller falls to the txm rung.
-    let px_height = fit_font_size(&display_list, px_height)?;
+    // layout's em extent and with the letterbox padding as well, so a
+    // wide/tall construct within the MAX_TEX_LEN budget can demand an enormous
+    // raster at a legal font size. Shrink the font to fit the pixel budget;
+    // only if even MIN_PX_HEIGHT overflows it do we fail, and then the caller
+    // falls to the txm rung.
+    let px_height = fit_font_size(&display_list, px_height, f64::from(padding))?;
 
     let render_options = ratex_render::RenderOptions {
         font_size: px_height as f32,
@@ -250,11 +268,12 @@ fn render_padded(tex: &str, px_height: u32, padding: f32) -> Result<Png, MathErr
         ratex_render::render_to_png(&display_list, &render_options).map_err(MathError::Render)?;
     let png = Png(bytes);
 
-    insert_bounded(
-        &mut png_cache().lock().unwrap(),
-        (tex.to_string(), px_height, padding as u32),
-        png.clone(),
-    );
+    // Insert under the key the lookup above *used*, not under the
+    // pixmap-fitted font size. `fit_font_size` may have shrunk `px_height`,
+    // and keying the insert on the shrunk value meant a formula big enough to
+    // need shrinking could never hit its own cache entry: every repaint
+    // re-rasterized it from scratch.
+    insert_bounded(&mut png_cache().lock().unwrap(), cache_key, png.clone());
     Ok(png)
 }
 
@@ -504,6 +523,17 @@ pub fn intrinsic_em_size(tex: &str) -> Option<(f64, f64)> {
 /// negative — padding can only ever move aspect toward square. There `p`
 /// clamps to [`PADDING`] and the residual mismatch stands; it is bounded by
 /// one cell of rounding.
+///
+/// **The em is a ceiling, not a promise.** When the ink at `em_px` is *larger*
+/// than the box (layout scaled a wide formula down to the content column), the
+/// terminal is going to shrink the raster to fit regardless — rasterizing at
+/// the full em only buys a bigger pixmap, a bigger PNG on the wire, and a
+/// round of terminal resampling. `testdocs/02-math.md`'s 4 KiB formula measured
+/// a 59984x1058 raster (63.5 megapixels, a 2 MB PNG) for a box 2400x48 px
+/// wide. [`em_capped_to_box`] shrinks the em to whatever actually fits, which
+/// lands the same glyph size on screen at 1:1 instead of via a 25x downscale.
+/// Every formula that *does* fit its box is untouched, so the fixed-em promise
+/// holds exactly where it is observable.
 pub fn render_fitted(
     tex: &str,
     em_px: u32,
@@ -511,9 +541,10 @@ pub fn render_fitted(
     target_h: u32,
 ) -> Result<Png, MathError> {
     let (em_w, em_h) = intrinsic_em_size(tex).ok_or(MathError::TooLarge { len: tex.len() })?;
+    let (tw, th) = (f64::from(target_w.max(1)), f64::from(target_h.max(1)));
+    let em_px = em_capped_to_box(em_w, em_h, em_px, tw, th);
     let ink_w = em_w * f64::from(em_px);
     let ink_h = em_h * f64::from(em_px);
-    let (tw, th) = (f64::from(target_w.max(1)), f64::from(target_h.max(1)));
 
     // p = (ink_h*tw - ink_w*th) / (2*(th - tw)); guard the degenerate square
     // box, where the equation has no unique solution.
@@ -525,6 +556,28 @@ pub fn render_fitted(
     };
     let pad = if pad.is_finite() { pad as f32 } else { PADDING };
     render_padded(tex, em_px, pad)
+}
+
+/// The largest em `<= em_px` whose ink fits inside a `tw` x `th` pixel box,
+/// floored at [`MIN_PX_HEIGHT`]. Returns `em_px` unchanged when the ink
+/// already fits (the common case — the sizer reserves a box from the same em)
+/// or when the extent is degenerate.
+fn em_capped_to_box(em_w: f64, em_h: f64, em_px: u32, tw: f64, th: f64) -> u32 {
+    if !em_w.is_finite() || !em_h.is_finite() || em_w <= 0.0 || em_h <= 0.0 {
+        return em_px;
+    }
+    let (ink_w, ink_h) = (em_w * f64::from(em_px), em_h * f64::from(em_px));
+    if ink_w <= tw && ink_h <= th {
+        return em_px;
+    }
+    let scale = (tw / ink_w).min(th / ink_h);
+    if !scale.is_finite() || scale <= 0.0 {
+        return MIN_PX_HEIGHT;
+    }
+    ((f64::from(em_px) * scale)
+        .floor()
+        .max(f64::from(MIN_PX_HEIGHT)) as u32)
+        .min(em_px)
 }
 
 #[cfg(test)]
@@ -766,6 +819,94 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A formula whose ink is far wider than its cell box used to rasterize at
+    /// the full fixed em anyway and let the terminal scale it down. Measured on
+    /// `testdocs/02-math.md`'s own 4 KiB formula: a 59984x1058 raster — 63.5
+    /// megapixels against this crate's stated 8-megapixel ceiling, a 2 MB PNG
+    /// pushed down the wire, 345 ms to render (release) — for a box 2400x48 px.
+    ///
+    /// Why the suite missed it: `MAX_PIXMAP_PX` *was* enforced, by
+    /// `fit_font_size`, which computed area as `em * font` and never counted
+    /// the up-to-`2 * MAX_PADDING` the letterbox adds to each axis. The bound
+    /// was asserted at the wrong level: on the layout's em extent rather than
+    /// on the pixmap actually allocated.
+    #[test]
+    fn test_render_fitted_stays_inside_the_pixmap_budget_and_its_own_box() {
+        let _g = test_guard();
+        reset_caches_for_test();
+        // ~1470 em wide, well under MAX_TEX_LEN — the shape `02-math.md`'s
+        // "absurdly long formula near the pixmap bound" section exercises.
+        let wide = format!("x{}= y", " + 1".repeat(950));
+        assert!(wide.len() < MAX_TEX_LEN);
+        // The box layout lands on: 100 content columns, one row.
+        let (target_w, target_h) = (100 * 24, 48);
+        let png = render_fitted(&wide, 40, target_w, target_h).expect("must still render");
+        let (w, h) = decode_png_dims(png.as_bytes());
+        let px = u64::from(w) * u64::from(h);
+        assert!(
+            px <= MAX_PIXMAP_PX,
+            "raster {w}x{h} = {px} px exceeds the stated {MAX_PIXMAP_PX} px ceiling"
+        );
+        // And the em must actually have been capped toward the box. The only
+        // thing keeping this raster above `target_w` at all is the
+        // MIN_PX_HEIGHT floor (~1470 em of glyphs cannot fit 2400 px at a
+        // legible em), so that floor — plus one letterbox margin per side — is
+        // the real upper bound, and it is ~9x tighter than the uncapped em's
+        // 59984 px.
+        let (em_w, _) = intrinsic_em_size(&wide).unwrap();
+        let floor_w = (em_w * f64::from(MIN_PX_HEIGHT)).ceil() as u32 + 2 * MAX_PADDING as u32;
+        assert!(
+            w <= floor_w,
+            "raster width {w} exceeds the MIN_PX_HEIGHT floor bound {floor_w} \
+             (uncapped em would have rasterized {}px wide)",
+            (em_w * 40.0) as u32
+        );
+    }
+
+    /// The pixmap ceiling must be computed on the pixmap, padding included.
+    #[test]
+    fn test_pixmap_budget_counts_the_letterbox_padding() {
+        let list = ratex_types::display_item::DisplayList {
+            width: 100.0,
+            height: 1.0,
+            depth: 0.0,
+            ..Default::default()
+        };
+        // Without padding, font 40 projects 4000 x 40 = 160k px — trivially
+        // inside the budget. With a full MAX_PADDING letterbox it projects
+        // 5024 x 1064 = 5.3M, and at font 300 it projects 31024 x 1324 = 41M,
+        // which must be rejected down to something that fits.
+        let unpadded = fit_font_size(&list, 300, 0.0).unwrap();
+        let padded = fit_font_size(&list, 300, f64::from(MAX_PADDING)).unwrap();
+        assert!(
+            padded < unpadded,
+            "padding must tighten the fitted font size: {padded} vs {unpadded}"
+        );
+        assert!(projected_px(100.0, 1.0, padded, f64::from(MAX_PADDING)) <= MAX_PIXMAP_PX);
+    }
+
+    /// A formula big enough for `fit_font_size` to shrink used to be inserted
+    /// into the PNG cache under the *shrunk* font size while every lookup used
+    /// the *requested* one — so it could never hit its own entry and was
+    /// re-rasterized on every single repaint.
+    #[test]
+    fn test_png_cache_hits_even_when_the_pixmap_budget_shrank_the_font() {
+        let _g = test_guard();
+        reset_caches_for_test();
+        let tex = r"\cfrac{1}{1+\cfrac{1}{1+\cfrac{1}{1+\cfrac{1}{1+x}}}}";
+        // 512 px em on this layout projects past MAX_PIXMAP_PX once padding
+        // is counted, so `fit_font_size` genuinely shrinks it.
+        render(tex, MAX_PX_HEIGHT).unwrap();
+        assert_eq!(cache_stats().png_misses, 1);
+        render(tex, MAX_PX_HEIGHT).unwrap();
+        assert_eq!(
+            cache_stats().png_hits,
+            1,
+            "a pixmap-shrunk render must still populate its own cache key"
+        );
+        assert_eq!(cache_stats().png_misses, 1);
     }
 
     /// Padding can only push a raster's aspect toward square, so a box that is

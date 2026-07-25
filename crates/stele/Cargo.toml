@@ -25,6 +25,13 @@ width = { path = "../width" }
 crossterm = "0.29"
 clap = { version = "4", features = ["derive"] }
 
+# Signal handling for terminal restore (DW-5.1): SIGTERM/SIGHUP/SIGINT bypass
+# `Drop`, so the guard alone cannot honour "never leak raw mode / the alternate
+# screen". Needs raw `sigaction`/`write`/`tcsetattr`, which crossterm does not
+# expose. Already in the workspace lockfile via `crates/probe`.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 # Test-only: building synthetic PNG fixtures for media-module tests.
 image = { version = "0.25", default-features = false, features = ["png"] }

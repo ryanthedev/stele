@@ -147,12 +147,36 @@ fn resolve_path(base_dir: &Path, dest: &str) -> PathBuf {
 /// any dimension `gfx::Limits` would ever accept) and saturating only at
 /// the final cast to `u16` — never casting an unbounded pixel value to
 /// `u16` bare, per the width/cell-rect gotcha carried from earlier phases.
+///
+/// The [`MAX_RESERVED_COLS`]/[`MAX_RESERVED_ROWS`] caps scale **both** axes
+/// by the same factor rather than clamping each independently. Clamping them
+/// separately silently reshapes the box: a square 6000×6000 image measures
+/// 250×125 cells, only `cols` exceeds the cap, and the box lands at 200×125
+/// — aspect 0.8 for a 1.0 source. Downstream `layout::block::emit_box` then
+/// fits *that* shape to the content column, so a 100-column viewport
+/// reserved 100×63 where 100×50 is right. The image itself is letterboxed
+/// into whatever box it is given (`gfx::decode::decode_and_scale`), so the
+/// visible result is a band of dead transparent rows under the picture; a
+/// vertical stretch, before letterboxing existed.
 fn px_to_cells(px_w: u32, px_h: u32) -> CellSize {
-    let cols = px_w.div_ceil(ASSUMED_CELL_PX.0.max(1));
-    let rows = px_h.div_ceil(ASSUMED_CELL_PX.1.max(1));
+    // u64 throughout: the proportional rescale multiplies a cell count by a
+    // cap before dividing, and a cell count derived from an unbounded u32
+    // pixel dimension would overflow that product in u32.
+    let max_cols = u64::from(MAX_RESERVED_COLS);
+    let max_rows = u64::from(MAX_RESERVED_ROWS);
+    let mut cols = u64::from(px_w.div_ceil(ASSUMED_CELL_PX.0.max(1))).max(1);
+    let mut rows = u64::from(px_h.div_ceil(ASSUMED_CELL_PX.1.max(1))).max(1);
+    if cols > max_cols {
+        rows = (rows * max_cols).div_ceil(cols).max(1);
+        cols = max_cols;
+    }
+    if rows > max_rows {
+        cols = (cols * max_rows).div_ceil(rows).max(1);
+        rows = max_rows;
+    }
     CellSize {
-        cols: cols.min(MAX_RESERVED_COLS as u32).max(1) as u16,
-        rows: rows.min(MAX_RESERVED_ROWS as u32).max(1) as u16,
+        cols: cols as u16,
+        rows: rows as u16,
     }
 }
 
@@ -215,6 +239,71 @@ mod tests {
         assert_eq!(size, CellSize { cols: 10, rows: 10 });
         let _ = node;
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The cell caps rescale both axes together. Clamping them independently
+    /// silently reshaped every over-cap image: a square 6000×6000 became a
+    /// 200×125-cell box (aspect 0.8), which `emit_box` then fitted to the
+    /// content column as 100×63 instead of 100×50 — a 13-row band of dead
+    /// space under the picture once the raster is letterboxed rather than
+    /// stretched to fill it.
+    #[test]
+    fn test_over_cap_box_is_clamped_proportionally_not_per_axis() {
+        // Square, over the column cap: 6000/24 = 250 cols, 6000/48 = 125 rows.
+        assert_eq!(
+            px_to_cells(6000, 6000),
+            CellSize {
+                cols: 200,
+                rows: 100
+            },
+            "a square source must stay square when the column cap bites"
+        );
+        // Very wide, far over the column cap.
+        assert_eq!(px_to_cells(30_000, 480), CellSize { cols: 200, rows: 2 });
+        // Very tall: the row cap bites instead, and pulls cols with it.
+        assert_eq!(px_to_cells(480, 30_000), CellSize { cols: 7, rows: 200 });
+        // Over both caps at once.
+        assert_eq!(
+            px_to_cells(24_000, 48_000),
+            CellSize {
+                cols: 200,
+                rows: 200
+            }
+        );
+        // Under both caps: untouched, exactly as before.
+        assert_eq!(px_to_cells(240, 480), CellSize { cols: 10, rows: 10 });
+        // A degenerate axis still floors to one cell rather than zero.
+        assert_eq!(px_to_cells(1, 1), CellSize { cols: 1, rows: 1 });
+        assert_eq!(px_to_cells(u32::MAX, 1).cols, 200);
+        assert_eq!(px_to_cells(1, u32::MAX).rows, 200);
+    }
+
+    /// End to end on the real oversized fixture, through `layout` — the box
+    /// the reader actually gets, not just the sizer's intermediate.
+    #[test]
+    fn test_dw_6_over_cap_image_reserves_an_aspect_correct_box_in_the_layout_tree() {
+        let img_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdocs/img")
+            .canonicalize()
+            .expect("testdocs/img must exist");
+        // huge.png is 6000x6000 — square, and well over MAX_RESERVED_COLS.
+        let doc = Document::parse("![huge](huge.png)\n");
+        let sizer = ImageSizer::new(&img_dir);
+        let engine = WidthEngine::new(WidthConfig::default());
+        let tree = layout(&doc, 100, &LayoutConfig::default(), &engine, &sizer);
+        let reserved: Vec<(u16, u16)> = (0..tree.line_count())
+            .filter_map(|i| match tree.lines(i..i + 1).next() {
+                Some(layout::Line::Reserved(r)) => Some((r.cols, r.rows)),
+                _ => None,
+            })
+            .collect();
+        assert!(!reserved.is_empty(), "huge.png must reserve a box");
+        assert_eq!(
+            (reserved[0].0, reserved[0].1, reserved.len()),
+            (100, 50, 50),
+            "a square image in a 100-column viewport must reserve a 100x50 \
+             box (24x48 px cells), one Reserved line per row"
+        );
     }
 
     #[test]

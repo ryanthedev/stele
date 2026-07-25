@@ -147,7 +147,7 @@ fn run_session(ctx: &LayoutContext, state: &mut AppState, painter: &mut Painter)
     loop {
         match event::read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
-                if state.handle_key(key.code) {
+                if state.handle_key_event(key) {
                     break;
                 }
             }
@@ -160,11 +160,11 @@ fn run_session(ctx: &LayoutContext, state: &mut AppState, painter: &mut Painter)
                             width: w,
                             height: h,
                         }),
-                        // A keypress mid-storm (notably `q`) must not be
-                        // swallowed by the debounce drain — honor a quit,
-                        // otherwise fall through and repaint.
+                        // A keypress mid-storm (notably `q` or Ctrl-C) must
+                        // not be swallowed by the debounce drain — honor a
+                        // quit, otherwise fall through and repaint.
                         Ok(Event::Key(key))
-                            if key.kind == KeyEventKind::Press && state.handle_key(key.code) =>
+                            if key.kind == KeyEventKind::Press && state.handle_key_event(key) =>
                         {
                             quit = true;
                             break;

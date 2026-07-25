@@ -161,14 +161,55 @@ pub struct Run {
 }
 
 /// A cell region reserved for media (P6 paints into it). A box `rows` tall
-/// occupies `rows` consecutive [`Line::Reserved`] lines all carrying this
-/// same value — consumers find the box top by scanning back over equal
-/// `node_id`. `cols`/`rows` are already scaled to fit the layout width.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// occupies `rows` consecutive [`Line::Reserved`] lines carrying the same
+/// `node_id`/`cols`/`rows` and an ascending [`row`](Self::row).
+/// `cols`/`rows` are already scaled to fit the layout width.
+///
+/// The box's *column* is deliberately not a field of its own: for a standalone
+/// box it is the total width of [`prefix`](Self::prefix), and for an inline
+/// [`LineItem::Box`] it depends on the items to its left — the painter knows
+/// both and passes the answer as `CellRect::x`, so a `col` here could only
+/// restate it (and would have to lie in the inline case).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Reserved {
     pub node_id: NodeId,
     pub cols: u16,
     pub rows: u16,
+    /// 0-based index of *this* line within the box (`0..rows`).
+    ///
+    /// Load-bearing for scrolling, not bookkeeping: a viewport shows only a
+    /// contiguous slice of the box's lines, so a consumer that sees the box
+    /// start at its own first `paint` call cannot tell "row 0 of the box"
+    /// from "row 7, the top 7 having scrolled above the viewport" — and a
+    /// media sink that guesses the former anchors the whole image at the top
+    /// visible row and paints it down over the text below. Scanning back
+    /// over equal `node_id` is not an option either: the lines above the
+    /// viewport are simply not painted.
+    pub row: u16,
+    /// The container prefix painted to the left of this box row: the
+    /// blockquote gutter bar, the list marker on row 0 and the continuation
+    /// indent on the rows below it, a footnote label — already composed and
+    /// clipped by the same `prefix_runs()` a text line goes through. Empty at
+    /// the top level, and empty for an inline [`LineItem::Box`], whose line
+    /// carries the prefix as its own leading runs.
+    ///
+    /// It lives here for the same reason [`row`](Self::row) does: it is a
+    /// property of *this row of this box* that nothing downstream can
+    /// reconstruct. The painter needs the runs to paint the gutter, and their
+    /// total width **is** the column the box starts at — one source of truth
+    /// for both, rather than a `col` that could drift from the runs beside it.
+    pub prefix: Vec<Run>,
+}
+
+impl Reserved {
+    /// Total cell width of [`prefix`](Self::prefix) — the column this box row
+    /// starts at, for a standalone box. Saturating, matching the rest of the
+    /// width arithmetic here.
+    pub fn prefix_width(&self) -> u16 {
+        self.prefix
+            .iter()
+            .fold(0u16, |acc, run| acc.saturating_add(run.width))
+    }
 }
 
 /// One item on a text line: a styled text fragment, or an inline media box
@@ -185,8 +226,10 @@ pub struct Reserved {
 pub enum LineItem {
     Run(Run),
     /// An inline media box occupying `cols` columns of this row. `rows` is
-    /// always 1; the field is kept so P6's `paint(reserved, rect)` seam takes
-    /// the same [`Reserved`] value for inline and block media alike.
+    /// always 1 and [`Reserved::prefix`] is empty (this line's own leading
+    /// runs carry the container prefix); both fields are kept so P6's
+    /// `paint(reserved, rect)` seam takes the same [`Reserved`] value for
+    /// inline and block media alike.
     Box(Reserved),
 }
 
@@ -203,6 +246,12 @@ impl LineItem {
 /// One terminal row: either a sequence of line items (styled text and any
 /// inline media boxes riding the baseline) or one row of a standalone
 /// reserved media box.
+///
+/// A standalone box gets its own variant rather than becoming a
+/// [`LineItem::Box`] on an `Items` line because the two are painted by
+/// different machinery, and because the inline path is one row tall by
+/// construction and cannot describe a multi-row box. The row's container
+/// prefix rides along inside [`Reserved::prefix`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Line {
     Items(Vec<LineItem>),
@@ -219,7 +268,7 @@ impl Line {
             Line::Items(items) => items
                 .iter()
                 .fold(0u16, |acc, item| acc.saturating_add(item.width())),
-            Line::Reserved(r) => r.cols,
+            Line::Reserved(r) => r.prefix_width().saturating_add(r.cols),
         }
     }
 }

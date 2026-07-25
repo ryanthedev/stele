@@ -60,6 +60,25 @@ pub struct CellRect {
     pub height: u16,
 }
 
+/// A rectangle of the *source raster*, in image pixels: the sub-region of a
+/// transmitted image a placement should display (kitty's `x`/`y`/`w`/`h`
+/// keys on `a=p`). `(x, y)` is the top-left pixel.
+///
+/// This is what makes a scroll-truncated box paint correctly. A placement is
+/// sized in *cells* (`c`/`r`) and the terminal maps the chosen source
+/// rectangle linearly onto that cell box, so a caller that knows a box is
+/// `rows` cells tall and that its top `k` rows are above the viewport crops
+/// `k/rows` of the raster's height away and asks for `rows - k` cells. No
+/// terminal cell-pixel geometry query is needed for that: the ratio is taken
+/// against the raster's own pixel height.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceRect {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
 /// Emits kitty graphics-protocol escape sequences. Holds no state of its
 /// own — every method is a pure encode-and-write of its arguments; the
 /// caller (`MediaSink`) owns image-id allocation, the eviction policy, and
@@ -147,17 +166,54 @@ impl Emitter {
     /// `C=1` pins the cursor at the placement origin, so the caller keeps
     /// full control of where the next byte lands.
     pub fn place(&mut self, id: ImageId, rect: CellRect, out: &mut dyn Write) {
+        self.place_cropped(id, rect, None, out);
+    }
+
+    /// [`place`](Self::place), displaying only `src` of the source raster.
+    ///
+    /// `src == None` displays the whole image and emits byte-for-byte what
+    /// `place` always emitted — kitty's own defaults for the source keys are
+    /// "the entire image," so the keys are omitted rather than spelled out,
+    /// keeping the common case's wire format unchanged.
+    ///
+    /// `src == Some(..)` is the scroll-truncation path. A box whose top rows
+    /// have scrolled above the viewport is painted starting at *its* first
+    /// visible row, so placing the full raster there walks the image down
+    /// over the document text below it. Cropping the source rectangle to the
+    /// visible fraction — and shrinking `r=` to match — is what keeps the
+    /// remaining pixels on the rows they belong to. The same applies at the
+    /// bottom edge: an explicit `r=` of the visible height is honest about
+    /// the box's on-screen extent instead of relying on the terminal to clip
+    /// an over-tall placement at the screen edge.
+    pub fn place_cropped(
+        &mut self,
+        id: ImageId,
+        rect: CellRect,
+        src: Option<SourceRect>,
+        out: &mut dyn Write,
+    ) {
         let row = rect.y.saturating_add(1);
         let col = rect.x.saturating_add(1);
         let _ = write!(out, "\x1b[{row};{col}H");
         let _ = write!(
             out,
-            "\x1b_Ga=p,i={},p={},c={},r={},C=1,q=2\x1b\\",
+            "\x1b_Ga=p,i={},p={},c={},r={}",
             id.get(),
             id.get(),
             rect.width.max(1),
             rect.height.max(1)
         );
+        if let Some(src) = src {
+            let _ = write!(
+                out,
+                ",x={},y={},w={},h={}",
+                src.x,
+                src.y,
+                src.width.max(1),
+                src.height.max(1)
+            );
+        }
+        let _ = write!(out, ",C=1,q=2\x1b\\");
     }
 
     /// Deletes image `id`: its placements *and* its stored pixel data
@@ -170,7 +226,27 @@ impl Emitter {
     /// evicted node is re-transmitted under a *fresh* id when it scrolls back
     /// into view, lowercase would accumulate one orphaned copy of every image
     /// per eviction for the life of the session, until the terminal hit its
-    /// own storage quota and began silently rejecting new transmits.
+    /// own storage quota.
+    ///
+    /// What happens at that quota is worth stating correctly, because an
+    /// earlier revision of this comment guessed and guessed wrong ("began
+    /// silently rejecting new transmits"). The protocol says the opposite:
+    /// *"when the terminal is running out of quota space for new images,
+    /// existing images without placements will be preferentially deleted."*
+    /// The terminal **evicts**, it does not reject — so the damage from
+    /// orphans is not a dead viewer but a cache thrashing against its own
+    /// garbage, silently re-transmitting images it already had.
+    ///
+    /// That reasoning was re-checked against the caller and holds, but it is
+    /// conditional and the condition is worth naming: it is the *fresh id*
+    /// that orphans the raster, not the lowercase delete. A caller that keeps
+    /// a node's id stable — because it is only hiding the image, not
+    /// forgetting it — can use [`clear_placements`](Self::clear_placements)
+    /// safely, since the same id still reaches the same stored raster and a
+    /// later `d=I` frees exactly it. `MediaSink` does both: `d=i` at every
+    /// frame boundary to end *visibility* while keeping the record, and this
+    /// `d=I` when it drops the record and the raster together. The two are
+    /// not interchangeable in either direction.
     pub fn delete(&mut self, id: ImageId, out: &mut dyn Write) {
         let _ = write!(out, "\x1b_Ga=d,d=I,i={},q=2\x1b\\", id.get());
     }
@@ -179,14 +255,26 @@ impl Emitter {
     /// leaving its transmitted pixel data resident so an immediately
     /// following [`place`](Self::place) can redraw it without re-transmitting.
     ///
-    /// This is the backstop for the repaint-behind model when the terminal
-    /// does not honor same-`(i, p)` put replacement: emitting this before each
-    /// re-place guarantees the previous frame's placement is gone before the
-    /// new one is drawn, so a still-visible image cannot accumulate a stacked
-    /// trail regardless of whether the terminal treats a repeated put as a
-    /// move or as a new placement. Kept distinct from [`delete`](Self::delete)
-    /// (`d=I`, which also frees the pixel data) precisely because the per-frame
-    /// path must NOT drop the raster it is about to reuse.
+    /// This is what ends an image's **visibility** without ending its
+    /// residency, and `MediaSink` emits it for every live placement at every
+    /// frame boundary. A viewer that repaints the whole viewport each frame
+    /// has an exact answer to "is this image on screen": whatever this frame
+    /// painted. Deferring the removal — to a grace period, or to the next
+    /// frame — is only sound if another frame is coming, and in a viewer that
+    /// paints on keypress the next frame may be minutes away or never. So the
+    /// placements come off first and the frame's own paints put back what is
+    /// still visible, inside one synchronized-update block.
+    ///
+    /// It doubles as the backstop for the repaint-behind model when the
+    /// terminal does not honor same-`(i, p)` put replacement: the previous
+    /// frame's placement is provably gone before the new one is drawn, so a
+    /// still-visible image cannot accumulate a stacked trail regardless of
+    /// whether the terminal treats a repeated put as a move or as a new
+    /// placement. Kept distinct from [`delete`](Self::delete) (`d=I`, which
+    /// also frees the pixel data) precisely because the per-frame path must
+    /// NOT drop the raster it is about to reuse — and safe to use this way
+    /// only because the caller keeps the node's image id stable across it
+    /// (see [`delete`](Self::delete)'s note on orphaned rasters).
     pub fn clear_placements(&mut self, id: ImageId, out: &mut dyn Write) {
         let _ = write!(out, "\x1b_Ga=d,d=i,i={},q=2\x1b\\", id.get());
     }
@@ -353,6 +441,52 @@ mod tests {
         let put1 = &frame1[frame1.find("\x1b_G").unwrap()..];
         let put2 = &frame2[frame2.find("\x1b_G").unwrap()..];
         assert_eq!(put1, put2, "put command must be identical across frames");
+    }
+
+    /// The scroll-truncation wire format: `x`/`y`/`w`/`h` select the slice
+    /// of the source raster that the (now shorter) `r=` cell box shows.
+    #[test]
+    fn test_place_cropped_emits_the_source_rectangle_keys() {
+        let out = captured(|buf| {
+            Emitter::new().place_cropped(
+                ImageId::new(2),
+                CellRect {
+                    x: 0,
+                    y: 0,
+                    width: 4,
+                    height: 6,
+                },
+                Some(SourceRect {
+                    x: 0,
+                    y: 288,
+                    width: 96,
+                    height: 288,
+                }),
+                buf,
+            )
+        });
+        assert_eq!(
+            out,
+            "\x1b[1;1H\x1b_Ga=p,i=2,p=2,c=4,r=6,x=0,y=288,w=96,h=288,C=1,q=2\x1b\\"
+        );
+    }
+
+    /// A full-image placement must stay byte-identical to what `place` has
+    /// always emitted: kitty's own defaults for the source keys already mean
+    /// "the entire image," so spelling them out would change the wire format
+    /// of every uncropped placement for no gain.
+    #[test]
+    fn test_place_cropped_without_a_source_rect_is_byte_identical_to_place() {
+        let rect = CellRect {
+            x: 3,
+            y: 7,
+            width: 5,
+            height: 2,
+        };
+        let plain = captured(|buf| Emitter::new().place(ImageId::new(4), rect, buf));
+        let none = captured(|buf| Emitter::new().place_cropped(ImageId::new(4), rect, None, buf));
+        assert_eq!(plain, none);
+        assert!(!plain.contains(",x="), "no source keys expected: {plain:?}");
     }
 
     #[test]

@@ -6,7 +6,14 @@
 //! [`decor`] define the hook seams they implement, and the paint-facing
 //! types they need are re-exported here.
 
-#![forbid(unsafe_code)]
+// `deny`, not `forbid`: exactly one module opts out — `terminal::signals`,
+// which must install a POSIX signal handler so a `SIGTERM`/`SIGHUP` can put
+// the terminal back (DW-5.1). Every libc call is `unsafe` by definition and
+// crossterm exposes no signal seam, so the choice is a scoped, commented
+// `#[allow]` on ~30 lines of handler or a leaked raw-mode terminal on every
+// `pkill`. `deny` keeps the rest of the crate exactly as strict as `forbid`
+// did — an `unsafe` block anywhere else is still a hard error.
+#![deny(unsafe_code)]
 
 pub mod app;
 pub mod cli;

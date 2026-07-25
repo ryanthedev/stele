@@ -143,9 +143,15 @@ impl<'a> Ctx<'a> {
     }
 
     /// Emit a reserved media box scaled to fit the current content width,
-    /// one `Line::Reserved` per row. Reserved lines carry no prefix runs
-    /// (the pinned `Line` shape has no room for them); P6 paints the box
-    /// over the whole row.
+    /// one `Line::Reserved` per row.
+    ///
+    /// Every row composes the container prefix exactly as [`emit`](Self::emit)
+    /// does — same `prefix_runs()`, so a segment's `first` form (the list
+    /// marker) is consumed on the box's first row and its `rest` form (the
+    /// continuation indent) on the rest. Skipping that is not a cosmetic loss:
+    /// `prefix_runs` is the only thing that consumes a prefix segment, so a
+    /// list item whose *only* child is an image never emitted its marker at
+    /// all and an ordered list silently began at "2.".
     fn emit_box(&mut self, node_id: ast::NodeId, size: CellSize) {
         let cw = self.content_width().max(1);
         let (cols, rows) = if size.cols <= cw {
@@ -155,13 +161,15 @@ impl<'a> Ctx<'a> {
             let rows = (u32::from(size.rows.max(1)) * u32::from(cw)).div_ceil(u32::from(size.cols));
             (cw, rows.clamp(1, u32::from(u16::MAX)) as u16)
         };
-        let reserved = Reserved {
-            node_id,
-            cols,
-            rows,
-        };
-        for _ in 0..rows {
-            self.push_line(Line::Reserved(reserved));
+        for row in 0..rows {
+            let prefix = self.prefix_runs();
+            self.push_line(Line::Reserved(Reserved {
+                node_id,
+                cols,
+                rows,
+                row,
+                prefix,
+            }));
         }
     }
 
@@ -244,17 +252,23 @@ fn walk_block(ctx: &mut Ctx<'_>, block: &Block) {
         BlockKind::Paragraph { children } => ctx.flow(children, Semantic::Text),
         BlockKind::Heading { level, children } => ctx.flow(children, Semantic::Heading(*level)),
         BlockKind::ThematicBreak => {
+            // `─` is East Asian *Ambiguous*: under
+            // `WidthConfig::ambiguous_wide` it is 2 cells, and
+            // `dash.repeat(cw / dw)` then under-fills every odd content width
+            // by a cell. Fill to an exact cell count instead, exactly as the
+            // table header rule does.
             let cw = ctx.content_width();
             let dash = "\u{2500}"; // ─
             let dw = ctx.engine.cluster_width(dash).max(1);
-            let text = dash.repeat(usize::from(cw / dw));
-            let w = ctx.engine.display_width(&text) as u16;
-            ctx.emit_runs(vec![Run {
-                text,
-                style_id: StyleId::Semantic(Semantic::Rule),
-                width: w,
-                aux: None,
-            }]);
+            let mut runs: Vec<Run> = Vec::new();
+            crate::table::push_rule_cells(
+                &mut runs,
+                dash,
+                dw,
+                cw,
+                StyleId::Semantic(Semantic::Rule),
+            );
+            ctx.emit_runs(runs);
         }
         BlockKind::BlockQuote { children } => {
             ctx.push_prefix(
@@ -262,7 +276,7 @@ fn walk_block(ctx: &mut Ctx<'_>, block: &Block) {
                 QUOTE_BAR.into(),
                 Semantic::BlockquoteMarker,
             );
-            walk_blocks(ctx, children, true);
+            walk_container(ctx, children, true);
             ctx.pop_prefix();
         }
         BlockKind::Alert { kind, children } => {
@@ -318,10 +332,28 @@ fn walk_block(ctx: &mut Ctx<'_>, block: &Block) {
             let marker = format!("[^{label}] ");
             let mw = ctx.engine.display_width(&marker);
             ctx.push_prefix(marker, " ".repeat(mw), Semantic::FootnoteLabel);
-            walk_blocks(ctx, children, true);
+            walk_container(ctx, children, true);
             ctx.pop_prefix();
         }
     }
+}
+
+/// Lay out a container's children under the prefix its caller has just pushed.
+///
+/// An empty container still occupies one row. [`Ctx::prefix_runs`] is the only
+/// thing that consumes a prefix segment, so `walk_blocks` over an empty slice
+/// emits nothing at all and `pop_prefix` then drops the unused marker — the
+/// container disappears from the document, taking its gutter bar, its list
+/// number or its footnote label with it. A reader then has no way to tell an
+/// empty container from a missing one: `1.` / `2.` / `3.` with an empty second
+/// item rendered as "1." then "3.", and a bare `>` rendered as nothing at all.
+/// Mirrors [`Ctx::emit_pieces`]'s "an empty block (e.g. `# `) still occupies
+/// one line".
+fn walk_container(ctx: &mut Ctx<'_>, children: &[Block], separate: bool) {
+    if children.is_empty() {
+        ctx.blank_line();
+    }
+    walk_blocks(ctx, children, separate);
 }
 
 fn walk_list_item(ctx: &mut Ctx<'_>, kind: &ListKind, index: usize, item: &Block, tight: bool) {
@@ -345,7 +377,7 @@ fn walk_list_item(ctx: &mut Ctx<'_>, kind: &ListKind, index: usize, item: &Block
     ctx.push_prefix(marker, " ".repeat(mw), style);
     // CommonMark tightness: blocks inside a tight item (e.g. a nested list
     // right under its paragraph) sit flush; loose items keep blank rows.
-    walk_blocks(ctx, children, !tight);
+    walk_container(ctx, children, !tight);
     ctx.pop_prefix();
 }
 

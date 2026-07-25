@@ -60,11 +60,38 @@ pub fn preprocess(source: &str) -> Cow<'_, str> {
 }
 
 /// Wraps `grid` in a plain (no-language) fenced code block so it displays
-/// verbatim. Uses a `~~~` fence, which a box-drawing grid can never contain,
-/// so the fence can't be closed early by the content.
+/// verbatim.
+///
+/// The fence is `~` repeated one *more* time than the longest run of tildes
+/// that starts any line of `grid`, and at least three. That is the
+/// CommonMark rule this wrapper depends on: a tilde fence is closed by the
+/// first following line whose leading tilde run is at least as long as the
+/// opening fence. A wrapper that is not strictly longer than the content's
+/// own longest leading run lets the *grid* close the block early — and then
+/// the wrapper's real closing fence opens a NEW code block that swallows
+/// every block after the diagram, to EOF.
+///
+/// The old fixed `~~~` claimed a box-drawing grid "can never contain"
+/// `~~~`. It can: diagram labels are arbitrary author text, and
+/// `mermaid-text` renders `gantt`, `journey` and `timeline` labels flush
+/// left with no box border, so tildes in a label reach column 0 unguarded.
+/// Computing the fence from the content makes this correct for *any* grid
+/// rather than for the diagram kinds that happen to draw a border.
+///
+/// Leading whitespace is stripped before measuring rather than only the
+/// three spaces CommonMark allows a closing fence to be indented by. That
+/// over-counts a deeply indented run, which can only ever make the fence
+/// longer than strictly necessary — never shorter, which is the failure
+/// that matters.
 fn as_plain_fence(grid: &str) -> String {
     let body = grid.trim_end_matches('\n');
-    format!("~~~\n{body}\n~~~")
+    let longest_leading_run = body
+        .lines()
+        .map(|line| line.trim_start().bytes().take_while(|&b| b == b'~').count())
+        .max()
+        .unwrap_or(0);
+    let fence = "~".repeat(longest_leading_run.saturating_add(1).max(3));
+    format!("{fence}\n{body}\n{fence}")
 }
 
 #[cfg(test)]
@@ -97,5 +124,98 @@ mod tests {
             assert!(out.contains("~~~"));
         }
         assert!(out.contains("before") && out.contains("after"));
+    }
+
+    /// The wrapper fence must survive *any* grid content, not just the
+    /// diagram kinds that draw a border. Assert the round trip through the
+    /// real parser: one code block, and its literal is the whole grid.
+    #[test]
+    fn test_a_grid_whose_own_lines_start_with_tildes_stays_one_code_block() {
+        // A run longer than any fence `as_plain_fence` used to emit, a run
+        // exactly at the old fence length, and an indented run.
+        let grid = "~~~~~~~~~~~~\nordinary line\n~~~\n  ~~~~~\ntail\n";
+        let fenced = as_plain_fence(grid);
+        assert!(
+            fenced.starts_with("~~~~~~~~~~~~~\n"),
+            "fence must be strictly longer than the longest leading run: {fenced:?}"
+        );
+
+        let doc = Document::parse(&fenced);
+        let blocks = doc.blocks();
+        assert_eq!(blocks.len(), 1, "expected exactly one block: {blocks:?}");
+        let BlockKind::CodeBlock { literal, info, .. } = &blocks[0].kind else {
+            panic!("expected a code block, got {:?}", blocks[0].kind);
+        };
+        assert_eq!(info.as_deref(), None);
+        assert_eq!(literal, grid, "the grid must survive verbatim");
+    }
+
+    /// End to end: a `gantt` label of tildes reaches column 0 (mermaid-text
+    /// renders gantt/journey/timeline labels flush left, unguarded by a box
+    /// border) and used to close the wrapper, turning every block after the
+    /// diagram into code-block text.
+    #[test]
+    fn test_a_hostile_gantt_label_cannot_swallow_the_rest_of_the_document() {
+        for tildes in ["~~~~", "~~~~~~~~~~~~~~~~"] {
+            let src = format!(
+                "# Doc\n\n\
+                 ```mermaid\n\
+                 gantt\n  title T\n  section {tildes}\n  {tildes} :a1, 2024-01-01, 30d\n\
+                 ```\n\n\
+                 # After the diagram\n\n\
+                 This paragraph must survive.\n"
+            );
+            // mermaid-text is pinned (`=0.57.0`); if gantt ever stops
+            // rendering, the fence is never emitted and this test would
+            // silently assert nothing.
+            assert!(
+                mermaid::render(&format!(
+                    "gantt\n  title T\n  section {tildes}\n  {tildes} :a1, 2024-01-01, 30d\n"
+                ))
+                .is_ok(),
+                "gantt must render for this test to exercise the wrapper"
+            );
+
+            let out = preprocess(&src);
+            let doc = Document::parse(&out);
+            let kinds: Vec<&BlockKind> = doc.blocks().iter().map(|b| &b.kind).collect();
+
+            // Assert the actual block structure, not a count of headings.
+            assert_eq!(
+                kinds.len(),
+                4,
+                "expected heading/code/heading/paragraph, got {kinds:?}"
+            );
+            assert!(matches!(kinds[0], BlockKind::Heading { level: 1, .. }));
+            assert!(matches!(kinds[1], BlockKind::CodeBlock { .. }));
+            let BlockKind::Heading { level, children } = kinds[2] else {
+                panic!("block 3 must still be a heading, got {:?}", kinds[2]);
+            };
+            assert_eq!(*level, 1);
+            assert_eq!(
+                children
+                    .iter()
+                    .map(|inline| match &inline.kind {
+                        ast::InlineKind::Text(t) => t.as_str(),
+                        _ => "",
+                    })
+                    .collect::<String>(),
+                "After the diagram"
+            );
+            assert!(
+                matches!(kinds[3], BlockKind::Paragraph { .. }),
+                "the trailing paragraph must still be a paragraph, got {:?}",
+                kinds[3]
+            );
+
+            // And the diagram's own bar row must still be inside the fence.
+            let BlockKind::CodeBlock { literal, .. } = kinds[1] else {
+                unreachable!()
+            };
+            assert!(
+                literal.contains(tildes),
+                "the hostile label must survive inside the code block: {literal:?}"
+            );
+        }
     }
 }

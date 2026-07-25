@@ -3,7 +3,7 @@
 //! event loop in `main.rs` stays thin glue over real crossterm I/O.
 
 use ast::Document;
-use crossterm::event::KeyCode;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use layout::{IntrinsicSizer, LayoutConfig, LayoutTree, layout};
 use width::WidthEngine;
 
@@ -67,16 +67,70 @@ impl AppState {
         self.set_scroll((current + delta).max(0) as usize);
     }
 
+    /// One viewport's worth of lines: the step for `PgUp`/`PgDn` and for
+    /// vim's `Ctrl-f`/`Ctrl-b`.
     fn page_size(&self) -> usize {
         self.size.height.max(1) as usize
     }
 
-    /// Applies one key press. Returns `true` when the key requests quit.
+    /// Half a viewport: the step for vim's `Ctrl-d`/`Ctrl-u`. Floored at one
+    /// line so a one- or two-row viewport still moves rather than silently
+    /// swallowing the key.
+    fn half_page(&self) -> usize {
+        (self.page_size() / 2).max(1)
+    }
+
+    /// Applies one key press *with its modifiers*. Returns `true` when the
+    /// key requests quit. This is the event loop's entry point.
+    ///
+    /// Control chords are tried first and **fall through** to the unmodified
+    /// table when the chord means nothing to us, so every pre-existing
+    /// binding keeps behaving exactly as it did when the event loop passed
+    /// `key.code` and dropped the modifiers on the floor: `Ctrl-Down` still
+    /// scrolls down, `Ctrl-q` still quits, `Ctrl-G` still jumps to the end.
+    pub fn handle_key_event(&mut self, key: KeyEvent) -> bool {
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && let Some(quit) = self.handle_control_chord(key.code)
+        {
+            return quit;
+        }
+        self.handle_key(key.code)
+    }
+
+    /// The Control-chord bindings. `Some(quit)` when the chord is one of
+    /// ours, `None` when it means nothing — which is what lets
+    /// [`AppState::handle_key_event`] fall through to the unmodified binding
+    /// for the same key code.
+    fn handle_control_chord(&mut self, code: KeyCode) -> Option<bool> {
+        match code {
+            // Ctrl-C quits, exactly like `q`. Raw mode clears `ISIG`, so a
+            // Ctrl-C keystroke never becomes a `SIGINT` — if key handling
+            // ignores it, nothing else in the process can see it and the
+            // viewer looks wedged to anyone who did not read the help. The
+            // `SIGINT` handler in `terminal::signals` covers the *other*
+            // path, an externally delivered `kill -INT`; both end in the
+            // same terminal restore.
+            KeyCode::Char('c') => return Some(true),
+            KeyCode::Char('d') => self.scroll_by(self.half_page() as isize),
+            KeyCode::Char('u') => self.scroll_by(-(self.half_page() as isize)),
+            KeyCode::Char('f') => self.scroll_by(self.page_size() as isize),
+            KeyCode::Char('b') => self.scroll_by(-(self.page_size() as isize)),
+            _ => return None,
+        }
+        Some(false)
+    }
+
+    /// Applies one key press by key code alone, with no modifier context.
+    ///
+    /// Kept as the unmodified half of the key table (and as the seam tests
+    /// drive directly); the running viewer always calls
+    /// [`AppState::handle_key_event`], because a `KeyCode` on its own cannot
+    /// express a chord — `Ctrl-C` and a bare `c` are the same value here.
     pub fn handle_key(&mut self, code: KeyCode) -> bool {
         match code {
             KeyCode::Char('q') => return true,
-            KeyCode::Up => self.scroll_by(-1),
-            KeyCode::Down => self.scroll_by(1),
+            KeyCode::Up | KeyCode::Char('k') => self.scroll_by(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.scroll_by(1),
             KeyCode::PageUp => self.scroll_by(-(self.page_size() as isize)),
             KeyCode::PageDown => self.scroll_by(self.page_size() as isize),
             KeyCode::Home | KeyCode::Char('g') => self.set_scroll(0),
@@ -93,6 +147,16 @@ impl AppState {
     /// tree's `line_blocks` map holds the reader's place exactly. Falls back
     /// to a proportional estimate only when there is no block to anchor to
     /// (an empty document).
+    ///
+    /// When nothing actually reflowed, the exact scroll line is kept instead.
+    /// Block anchoring pins to the block's *first* line, which is only the
+    /// reader's line when the block is short: inside one long block (a big
+    /// code fence, a rendered mermaid grid, a long table, a wrapped
+    /// paragraph) it teleports them back to the block's start. That is a
+    /// price worth paying when wrap points genuinely moved and the old line
+    /// index no longer means anything — but not on a height-only resize,
+    /// where the layout is bit-for-bit the same and any movement at all is
+    /// wrong. See `no_reflow_occurred` for how "nothing reflowed" is decided.
     pub fn relayout(&mut self, ctx: &LayoutContext, width: u16, new_size: Size) {
         let anchor = self.tree.block_at(self.scroll);
         let old_max = self.max_scroll();
@@ -101,14 +165,34 @@ impl AppState {
         } else {
             self.scroll as f64 / old_max as f64
         };
+        let previous_scroll = self.scroll;
+        let previous_width = self.tree.width();
 
         self.tree = layout(ctx.doc, width, ctx.config, ctx.engine, ctx.sizer);
         self.size = new_size;
 
-        let target = anchor
-            .and_then(|block| self.tree.first_line_of(block))
-            .unwrap_or_else(|| (ratio * self.max_scroll() as f64).round() as usize);
+        let target = if self.no_reflow_occurred(previous_width) {
+            previous_scroll
+        } else {
+            anchor
+                .and_then(|block| self.tree.first_line_of(block))
+                .unwrap_or_else(|| (ratio * self.max_scroll() as f64).round() as usize)
+        };
         self.set_scroll(target);
+    }
+
+    /// Whether the just-installed tree is identical to the one it replaced.
+    ///
+    /// `layout` is pure and deterministic in `(doc, width, config, engine,
+    /// sizer)` and clamps `width` into the config's range *before* laying
+    /// out, storing the clamped value on the tree. The document, config,
+    /// engine and sizer are fixed for the session, so equal clamped widths
+    /// imply identical trees — which is why comparing one `u16` is a sound
+    /// stand-in for comparing the whole tree, and why a resize between two
+    /// widths that both clamp to the same value (say 10 and 15 against a
+    /// 24-cell floor) correctly counts as "no reflow" too.
+    fn no_reflow_occurred(&self, previous_width: u16) -> bool {
+        self.tree.width() == previous_width
     }
 
     /// Applies a burst of resize events as the debounced event loop does:
@@ -150,6 +234,34 @@ mod tests {
     /// scroll-anchor preservation instead of merely "didn't crash".
     fn non_reflowing_source(n: usize) -> String {
         (0..n).map(|i| format!("line {i}\n\n")).collect()
+    }
+
+    /// A Control chord, as the terminal delivers it in raw mode: raw mode
+    /// clears `ISIG`, so Ctrl-C reaches us as `Char('c')` + `CONTROL` and
+    /// never as a signal.
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    /// The same key code with no modifiers held.
+    fn plain(code: KeyCode) -> KeyEvent {
+        KeyEvent::from(code)
+    }
+
+    /// A document laid out to *exactly* the viewport height: `max_scroll` is
+    /// 0, so every downward motion must be a no-op even though there is a
+    /// full screen of content.
+    fn exactly_one_viewport(n: usize) -> AppState {
+        let source = non_reflowing_source(n);
+        let (_doc, _config, _engine, probe) = build(&source, 40, 1);
+        let lines = probe.tree().line_count();
+        let (_doc, _config, _engine, state) = build(
+            &source,
+            40,
+            u16::try_from(lines).expect("test doc fits a u16"),
+        );
+        assert_eq!(state.max_scroll(), 0, "doc height must equal the viewport");
+        state
     }
 
     #[test]
@@ -328,6 +440,301 @@ mod tests {
             state.tree().first_line_of(anchor).unwrap(),
             "scroll must land on the anchored block's first line"
         );
+    }
+
+    /// Regression: a resize that reflows nothing must not move the reader at
+    /// all. Block anchoring alone pins to the block's FIRST line, so a reader
+    /// 200 lines deep into a single 400-line code fence was thrown back to
+    /// line 0 by nothing more than dragging the window one row taller. The
+    /// existing DW-5.3 tests could not see it: they use one-line paragraphs,
+    /// where the block's first line IS the reader's line.
+    #[test]
+    fn test_height_only_resize_does_not_move_the_reader_inside_a_long_block() {
+        let mut source = String::from("```\n");
+        for i in 0..400 {
+            source.push_str(&format!("code line {i}\n"));
+        }
+        source.push_str("```\n");
+
+        let (doc, config, engine, mut state) = build(&source, 80, 20);
+        let ctx = LayoutContext {
+            doc: &doc,
+            config: &config,
+            engine: &engine,
+            sizer: &NullSizer,
+        };
+        // The whole fence is one source block, so every visible line anchors
+        // to the same block — the case block-granularity anchoring loses.
+        assert_eq!(state.tree().block_at(0), state.tree().block_at(200));
+
+        for _ in 0..200 {
+            state.handle_key(KeyCode::Down);
+        }
+        assert_eq!(state.scroll(), 200);
+
+        state.apply_resize_burst(
+            &ctx,
+            &[Size {
+                width: 80,
+                height: 21,
+            }],
+        );
+        assert_eq!(
+            state.scroll(),
+            200,
+            "a resize at the same width reflows nothing and must not scroll"
+        );
+    }
+
+    /// The same guarantee across a burst of *width* changes that all clamp to
+    /// the same laid-out width: 10 and 15 both clamp up to the 24-cell floor,
+    /// so no line ever rewraps and the reader must not move either.
+    #[test]
+    fn test_width_changes_that_clamp_to_the_same_layout_width_do_not_scroll() {
+        let mut source = String::from("```\n");
+        for i in 0..200 {
+            source.push_str(&format!("c{i}\n"));
+        }
+        source.push_str("```\n");
+
+        let (doc, config, engine, mut state) = build(&source, 10, 8);
+        let ctx = LayoutContext {
+            doc: &doc,
+            config: &config,
+            engine: &engine,
+            sizer: &NullSizer,
+        };
+        assert_eq!(
+            state.tree().width(),
+            24,
+            "clamped up to the min-width floor"
+        );
+
+        for _ in 0..60 {
+            state.handle_key(KeyCode::Down);
+        }
+        let before = state.scroll();
+        assert_eq!(before, 60);
+
+        state.apply_resize_burst(
+            &ctx,
+            &[
+                Size {
+                    width: 12,
+                    height: 8,
+                },
+                Size {
+                    width: 15,
+                    height: 8,
+                },
+            ],
+        );
+        assert_eq!(state.tree().width(), 24);
+        assert_eq!(state.scroll(), before);
+    }
+
+    // ---- Ctrl-C, and the vim motions (all strictly additive) -------------
+
+    /// Ctrl-C quits, exactly like `q`. Raw mode clears `ISIG`, so this key
+    /// never becomes a `SIGINT`: if `handle_key_event` does not see the
+    /// modifier, nothing downstream can, and the viewer cannot be quit with
+    /// the one chord every terminal user tries first.
+    #[test]
+    fn test_ctrl_c_quits_exactly_like_q() {
+        let (_doc, _config, _engine, mut state) = build(&non_reflowing_source(50), 40, 10);
+        state.handle_key_event(plain(KeyCode::Down));
+        assert_eq!(state.scroll(), 1);
+
+        assert!(
+            state.handle_key_event(ctrl('c')),
+            "Ctrl-C must request quit"
+        );
+        // Quitting is all it does — it must not move the reader on the way out.
+        assert_eq!(state.scroll(), 1);
+
+        // A bare `c` is not a quit key and never was.
+        assert!(!state.handle_key_event(plain(KeyCode::Char('c'))));
+        assert_eq!(state.scroll(), 1);
+    }
+
+    /// `j`/`k` are `Down`/`Up`: one line, clamped at 0 and at the tail.
+    #[test]
+    fn test_vim_j_and_k_move_one_line_and_clamp_at_both_ends() {
+        let (_doc, _config, _engine, mut state) = build(&non_reflowing_source(50), 40, 10);
+        let tail = state.max_scroll();
+        assert!(tail > 3, "the fixture must be taller than the viewport");
+
+        assert!(!state.handle_key_event(plain(KeyCode::Char('j'))));
+        assert_eq!(state.scroll(), 1);
+        assert!(!state.handle_key_event(plain(KeyCode::Char('j'))));
+        assert_eq!(state.scroll(), 2);
+        assert!(!state.handle_key_event(plain(KeyCode::Char('k'))));
+        assert_eq!(state.scroll(), 1);
+
+        // At scroll 0, `k` clamps instead of underflowing.
+        state.handle_key_event(plain(KeyCode::Char('k')));
+        assert_eq!(state.scroll(), 0);
+        state.handle_key_event(plain(KeyCode::Char('k')));
+        assert_eq!(state.scroll(), 0);
+
+        // At the tail, `j` clamps instead of running off the end.
+        state.handle_key_event(plain(KeyCode::Char('G')));
+        assert_eq!(state.scroll(), tail);
+        state.handle_key_event(plain(KeyCode::Char('j')));
+        assert_eq!(state.scroll(), tail);
+        state.handle_key_event(plain(KeyCode::Char('k')));
+        assert_eq!(state.scroll(), tail - 1);
+    }
+
+    /// `Ctrl-d`/`Ctrl-u` move half a viewport — five lines on a ten-row
+    /// screen — and clamp at both ends.
+    #[test]
+    fn test_vim_ctrl_d_and_ctrl_u_move_half_a_viewport_and_clamp() {
+        let (_doc, _config, _engine, mut state) = build(&non_reflowing_source(50), 40, 10);
+        let tail = state.max_scroll();
+        assert!(tail > 10, "the fixture must be several pages tall");
+
+        assert!(!state.handle_key_event(ctrl('d')));
+        assert_eq!(state.scroll(), 5);
+        assert!(!state.handle_key_event(ctrl('d')));
+        assert_eq!(state.scroll(), 10);
+        assert!(!state.handle_key_event(ctrl('u')));
+        assert_eq!(state.scroll(), 5);
+
+        // At scroll 0, Ctrl-u clamps.
+        state.handle_key_event(ctrl('u'));
+        assert_eq!(state.scroll(), 0);
+        state.handle_key_event(ctrl('u'));
+        assert_eq!(state.scroll(), 0);
+
+        // At the tail, Ctrl-d clamps; Ctrl-u still steps back exactly half.
+        state.handle_key_event(plain(KeyCode::End));
+        assert_eq!(state.scroll(), tail);
+        state.handle_key_event(ctrl('d'));
+        assert_eq!(state.scroll(), tail);
+        state.handle_key_event(ctrl('u'));
+        assert_eq!(state.scroll(), tail - 5);
+    }
+
+    /// `Ctrl-f`/`Ctrl-b` move a full viewport — the same step `PgDn`/`PgUp`
+    /// already used — and clamp at both ends.
+    #[test]
+    fn test_vim_ctrl_f_and_ctrl_b_move_a_full_viewport_and_clamp() {
+        let (_doc, _config, _engine, mut state) = build(&non_reflowing_source(50), 40, 10);
+        let tail = state.max_scroll();
+        assert!(tail > 20, "the fixture must be several pages tall");
+
+        assert!(!state.handle_key_event(ctrl('f')));
+        assert_eq!(state.scroll(), 10);
+        assert!(!state.handle_key_event(ctrl('f')));
+        assert_eq!(state.scroll(), 20);
+        assert!(!state.handle_key_event(ctrl('b')));
+        assert_eq!(state.scroll(), 10);
+
+        // Ctrl-f lands where PgDn lands, from the same start.
+        state.handle_key_event(plain(KeyCode::Char('g')));
+        state.handle_key_event(plain(KeyCode::PageDown));
+        let paged = state.scroll();
+        state.handle_key_event(plain(KeyCode::Char('g')));
+        state.handle_key_event(ctrl('f'));
+        assert_eq!(state.scroll(), paged);
+
+        // At scroll 0, Ctrl-b clamps.
+        state.handle_key_event(plain(KeyCode::Home));
+        state.handle_key_event(ctrl('b'));
+        assert_eq!(state.scroll(), 0);
+
+        // At the tail, Ctrl-f clamps; Ctrl-b steps back exactly one page.
+        state.handle_key_event(plain(KeyCode::Char('G')));
+        assert_eq!(state.scroll(), tail);
+        state.handle_key_event(ctrl('f'));
+        assert_eq!(state.scroll(), tail);
+        state.handle_key_event(ctrl('b'));
+        assert_eq!(state.scroll(), tail - 10);
+    }
+
+    /// A document shorter than the viewport has nowhere to scroll: every new
+    /// motion must leave the reader at line 0 rather than clamping to some
+    /// negative-turned-huge offset.
+    #[test]
+    fn test_new_motions_are_no_ops_on_a_document_shorter_than_the_viewport() {
+        let (_doc, _config, _engine, mut state) = build("short\n", 40, 100);
+        assert_eq!(state.max_scroll(), 0);
+        for key in [ctrl('d'), ctrl('u'), ctrl('f'), ctrl('b')] {
+            assert!(!state.handle_key_event(key));
+            assert_eq!(state.scroll(), 0, "{key:?} moved a one-screen document");
+        }
+        for key in [KeyCode::Char('j'), KeyCode::Char('k')] {
+            assert!(!state.handle_key_event(plain(key)));
+            assert_eq!(state.scroll(), 0, "{key:?} moved a one-screen document");
+        }
+    }
+
+    /// The exactly-one-viewport boundary: a full screen of content with
+    /// nothing below it. `max_scroll` is 0, so the same must hold.
+    #[test]
+    fn test_new_motions_are_no_ops_on_a_document_exactly_one_viewport_tall() {
+        let mut state = exactly_one_viewport(6);
+        for key in [ctrl('d'), ctrl('u'), ctrl('f'), ctrl('b')] {
+            assert!(!state.handle_key_event(key));
+            assert_eq!(state.scroll(), 0, "{key:?} scrolled past the document tail");
+        }
+        for key in [KeyCode::Char('j'), KeyCode::Char('k')] {
+            assert!(!state.handle_key_event(plain(key)));
+            assert_eq!(state.scroll(), 0, "{key:?} scrolled past the document tail");
+        }
+    }
+
+    /// A one-row viewport would make `height / 2` zero. Ctrl-d/Ctrl-u must
+    /// still move a line rather than silently swallowing the key.
+    #[test]
+    fn test_half_page_moves_at_least_one_line_on_a_one_row_viewport() {
+        let (_doc, _config, _engine, mut state) = build(&non_reflowing_source(20), 40, 1);
+        assert_eq!(state.page_size(), 1);
+        assert!(state.max_scroll() > 2);
+
+        state.handle_key_event(ctrl('d'));
+        assert_eq!(state.scroll(), 1);
+        state.handle_key_event(ctrl('d'));
+        assert_eq!(state.scroll(), 2);
+        state.handle_key_event(ctrl('u'));
+        assert_eq!(state.scroll(), 1);
+    }
+
+    /// Strictly additive: holding Control over a key that is *not* one of the
+    /// new chords must still do what that key did before, because the event
+    /// loop used to pass `key.code` and drop the modifier entirely.
+    #[test]
+    fn test_control_falls_through_to_the_pre_existing_binding() {
+        let (_doc, _config, _engine, mut state) = build(&non_reflowing_source(50), 40, 10);
+        let tail = state.max_scroll();
+
+        assert!(!state.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL)));
+        assert_eq!(state.scroll(), 1, "Ctrl-Down must still scroll down");
+
+        assert!(!state.handle_key_event(ctrl('G')));
+        assert_eq!(state.scroll(), tail, "Ctrl-G must still jump to the end");
+
+        assert!(!state.handle_key_event(ctrl('g')));
+        assert_eq!(state.scroll(), 0, "Ctrl-g must still jump to the top");
+
+        assert!(state.handle_key_event(ctrl('q')), "Ctrl-q must still quit");
+    }
+
+    /// The unmodified letters behind the new chords stay unbound: `d`, `u`,
+    /// `f`, `b` must not become motions of their own, and `g`/`G`/`q` must
+    /// keep the meaning they already had.
+    #[test]
+    fn test_unmodified_chord_letters_remain_unbound() {
+        let (_doc, _config, _engine, mut state) = build(&non_reflowing_source(50), 40, 10);
+        state.handle_key_event(plain(KeyCode::PageDown));
+        let start = state.scroll();
+        assert_eq!(start, 10);
+
+        for c in ['d', 'u', 'f', 'b'] {
+            assert!(!state.handle_key_event(plain(KeyCode::Char(c))));
+            assert_eq!(state.scroll(), start, "bare `{c}` must not be a motion");
+        }
     }
 
     fn topmost_line_text(state: &AppState) -> String {

@@ -126,6 +126,15 @@ impl Painter {
     /// combination — an out-of-range `scroll` (past the document tail)
     /// simply paints blank rows, matching [`LayoutTree::lines`]'s own
     /// clamping behavior.
+    ///
+    /// Once `SYNC_BEGIN` is on the wire, `SYNC_END` follows it on **every**
+    /// exit path, error included. Mode 2026 is a global terminal mode, not a
+    /// screen-buffer one: the restore sequence run on exit and on panic
+    /// (`terminal.rs`) does not reset it, so a frame that `?`s out of a
+    /// half-written block hands the user back a shell that has stopped
+    /// painting — and any I/O error on a pty (EAGAIN when full, EPIPE, a short
+    /// write over ssh) is enough to do it. The paint's own error is what gets
+    /// returned; a failure to close is only reported if nothing else failed.
     pub fn frame(
         &mut self,
         tree: &LayoutTree,
@@ -134,23 +143,50 @@ impl Painter {
         out: &mut dyn Write,
     ) -> io::Result<()> {
         out.write_all(SYNC_BEGIN)?;
+        let painted = self.frame_body(tree, scroll, size, out);
+        let closed = out.write_all(SYNC_END).and_then(|()| out.flush());
+        painted.and(closed)
+    }
+
+    /// The body of [`frame`](Self::frame), between the synchronized-update
+    /// begin and end. Split out so every `?` in here is caught by the caller
+    /// rather than escaping past the closing sequence.
+    fn frame_body(
+        &mut self,
+        tree: &LayoutTree,
+        scroll: usize,
+        size: Size,
+        out: &mut dyn Write,
+    ) -> io::Result<()> {
         // Every frame, media or not: the sink needs a reliable boundary to
         // reset per-frame state and sweep placements whose node has scrolled
         // out of view entirely (no `paint` fires for those).
         self.media.begin_frame(out);
+        // Columns the *last* viewport row consumed. The build stamp shares
+        // that row with the document, so this is what decides whether there
+        // is room for it (see `paint_build_stamp`).
+        let mut last_row_cols: u16 = 0;
         for row in 0..size.height {
             write!(out, "\x1b[{};1H", row + 1)?;
             let idx = scroll.saturating_add(row as usize);
             if idx < tree.line_count()
                 && let Some(line) = tree.lines(idx..idx + 1).next()
             {
-                self.paint_line(line, row, size.width, out)?;
+                if row + 1 == size.height {
+                    last_row_cols = match line {
+                        // A media box's cells belong to the terminal's
+                        // compositor, not to us: nothing here can say whether
+                        // the stamp would land above or below the raster. Claim
+                        // the whole row so the stamp stands down.
+                        Line::Reserved(_) => size.width,
+                        _ => line.width().min(size.width),
+                    };
+                }
+                self.paint_line(line, row, size, out)?;
             }
             out.write_all(CLEAR_TO_EOL)?;
         }
-        self.paint_build_stamp(size, out)?;
-        out.write_all(SYNC_END)?;
-        out.flush()
+        self.paint_build_stamp(size, last_row_cols, out)
     }
 
     /// Paints the build's commit sha dim in the bottom-right corner.
@@ -163,9 +199,20 @@ impl Painter {
     ///
     /// Painted after the content and inside the synchronized-update block, so
     /// it never tears and never shifts a document line. It is skipped entirely
-    /// rather than truncated when the viewport is too narrow to hold it
-    /// without colliding with text.
-    fn paint_build_stamp(&mut self, size: Size, out: &mut dyn Write) -> io::Result<()> {
+    /// rather than truncated when the last viewport row cannot hold it without
+    /// colliding with text: `last_row_cols` is how many columns that row's
+    /// document content already consumed.
+    ///
+    /// That comparison has to be against the *content*, not against the
+    /// viewport. The stamp is dim, so a collision does not read as chrome
+    /// overlapping text — it reads as the document's own last words, silently
+    /// replaced by a hex string.
+    fn paint_build_stamp(
+        &mut self,
+        size: Size,
+        last_row_cols: u16,
+        out: &mut dyn Write,
+    ) -> io::Result<()> {
         let stamp = crate::cli::BUILD_SHA;
         let width = self
             .width_engine
@@ -173,6 +220,12 @@ impl Painter {
             .min(u16::MAX as usize) as u16;
         // +1 so it never butts directly against content on the same row.
         if size.height == 0 || width == 0 || size.width <= width.saturating_add(1) {
+            return Ok(());
+        }
+        // The stamp occupies `[size.width - width, size.width)`; the content
+        // occupies `[0, last_row_cols)`. Leave at least one blank cell between
+        // them, or paint nothing at all.
+        if size.width.saturating_sub(last_row_cols) <= width {
             return Ok(());
         }
         write!(out, "\x1b[{};{}H", size.height, size.width - width + 1)?;
@@ -186,27 +239,70 @@ impl Painter {
         &mut self,
         line: &Line,
         row: u16,
-        width: u16,
+        size: Size,
         out: &mut dyn Write,
     ) -> io::Result<()> {
         match line {
-            Line::Items(items) => self.paint_items(items, row, width, out),
-            Line::Reserved(reserved) => self.paint_reserved(reserved, row, width, out),
+            Line::Items(items) => self.paint_items(items, row, size.width, out),
+            Line::Reserved(reserved) => self.paint_reserved(reserved, row, size, out),
         }
     }
 
+    /// Paint one row of a standalone reserved box: its container prefix
+    /// (blockquote gutter, list marker) as text, then the box itself handed to
+    /// the media sink at the column the prefix ends at.
+    ///
+    /// `rect` is not this single row: it is the box's **visible remainder**
+    /// from this row down — `y` here, `height` the rows of the box still to
+    /// come before either the box or the viewport ends. On the box's first
+    /// painted row (the only call at which a sink can place an image) that is
+    /// exactly the box's on-screen extent, which is the one thing a sink
+    /// cannot work out for itself: it sees neither the viewport height nor
+    /// the rows that scrolled off the top. Handing it a bare `height: 1` is
+    /// what let a top-truncated box get placed at full height from the top
+    /// visible row, painting the image down over the text below it.
     fn paint_reserved(
         &mut self,
         reserved: &Reserved,
         row: u16,
-        width: u16,
+        size: Size,
         out: &mut dyn Write,
     ) -> io::Result<()> {
+        let mut painted_any = false;
+        let mut col: u16 = 0;
+        for run in &reserved.prefix {
+            let remaining = size.width.saturating_sub(col);
+            if remaining == 0 {
+                break;
+            }
+            let painted = self.paint_run(run, remaining, out)?;
+            col = col.saturating_add(painted.width);
+            painted_any |= painted.wrote_text;
+            if painted.line_full {
+                break;
+            }
+        }
+        if painted_any {
+            out.write_all(SGR_RESET)?;
+        }
+        // The box begins where layout put it — after the prefix — not at
+        // column 0: a box inside a blockquote belongs beside the gutter bar,
+        // not painted across it. `x` comes from the laid-out prefix width
+        // rather than from what actually got painted, so the box lands in the
+        // same column whether or not a narrow viewport clipped the gutter.
+        let x = reserved.prefix_width();
+        if x >= size.width {
+            // The whole box is off the right edge of this (narrower than
+            // laid-out) viewport. Painting nothing beats placing at column 0.
+            return Ok(());
+        }
+        let rows_left = reserved.rows.saturating_sub(reserved.row);
+        let rows_to_viewport_bottom = size.height.saturating_sub(row);
         let rect = CellRect {
-            x: 0,
+            x,
             y: row,
-            width: reserved.cols.min(width),
-            height: 1,
+            width: reserved.cols.min(size.width - x),
+            height: rows_left.min(rows_to_viewport_bottom).max(1),
         };
         self.media.paint(reserved, rect, out);
         Ok(())
@@ -596,6 +692,47 @@ mod tests {
         );
     }
 
+    /// An empty container occupies its line, and the proof has to be on the
+    /// wire: layout can place a gutter run on a row and the painter still owe
+    /// the user nothing visible. Asserts the exact bytes for that row — the
+    /// CUP to row 3 column 1, the dim SGR the blockquote role resolves to, and
+    /// the bar glyph itself — so a regression that drops the row, drops the
+    /// glyph, or shifts either one fails here.
+    #[test]
+    fn test_empty_blockquote_paints_its_gutter_bar_on_its_own_row() {
+        let doc = Document::parse("before\n\n>\n\nafter\n");
+        let tree = layout(&doc, 40, &LayoutConfig::default(), &engine(), &NullSizer);
+        let mut painter = Painter::new(engine());
+        let mut buf = Vec::new();
+        painter
+            .frame(
+                &tree,
+                0,
+                Size {
+                    width: 40,
+                    height: 5,
+                },
+                &mut buf,
+            )
+            .unwrap();
+        let wire = String::from_utf8(buf).expect("utf-8");
+        // Row 3 (1-indexed), between the blank row after "before" and the
+        // blank row before "after".
+        assert!(
+            wire.contains("\x1b[3;1H\x1b[0m\x1b[2m\u{2502} \x1b[0m\x1b[K"),
+            "the empty quote's row must carry its dim gutter bar: {wire:?}"
+        );
+        // And it is its own row: the rows either side of it are blank, and
+        // "after" is pushed down to row 5 rather than sitting where the quote
+        // would have been had it vanished.
+        assert!(wire.contains("\x1b[2;1H\x1b[K"), "row 2 blank: {wire:?}");
+        assert!(wire.contains("\x1b[4;1H\x1b[K"), "row 4 blank: {wire:?}");
+        assert!(
+            wire.contains("\x1b[5;1H\x1b[0mafter"),
+            "\"after\" stays on row 5: {wire:?}"
+        );
+    }
+
     #[test]
     fn test_noop_media_sink_never_writes_and_never_panics() {
         let doc = Document::parse("hello\n");
@@ -605,6 +742,8 @@ mod tests {
             node_id,
             cols: 10,
             rows: 1,
+            row: 0,
+            prefix: Vec::new(),
         };
         let rect = CellRect {
             x: 0,
@@ -643,6 +782,66 @@ mod tests {
             assert!(text.contains(&format!("\x1b[{row};1H")));
         }
         assert_eq!(text.matches("only line").count(), 1);
+    }
+
+    /// A writer that fails once, mid-frame, and works again after — the
+    /// realistic pty failure (EAGAIN on a full buffer, a short write over
+    /// ssh), as opposed to a device that is gone for good.
+    struct FailsOnce {
+        fail_after: usize,
+        written: usize,
+        failed: bool,
+        seen: Vec<u8>,
+    }
+    impl Write for FailsOnce {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if !self.failed && self.written + buf.len() > self.fail_after {
+                self.failed = true;
+                return Err(io::Error::other("would block"));
+            }
+            self.written += buf.len();
+            self.seen.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_frame_closes_the_sync_update_block_after_a_recoverable_write_error() {
+        // Mode 2026 is a *global* terminal mode: a frame that returns early
+        // with the block still open leaves the user on a shell that has
+        // stopped painting, and the exit/panic restore is the only thing left
+        // to save them. The close has to be attempted on the error path.
+        let doc = Document::parse("hello world\n\nsecond paragraph\n");
+        let tree = layout(&doc, 40, &LayoutConfig::default(), &engine(), &NullSizer);
+        let mut painter = Painter::new(engine());
+        let mut out = FailsOnce {
+            fail_after: 20,
+            written: 0,
+            failed: false,
+            seen: Vec::new(),
+        };
+        let res = painter.frame(
+            &tree,
+            0,
+            Size {
+                width: 40,
+                height: 10,
+            },
+            &mut out,
+        );
+        assert!(res.is_err(), "the paint must still report the failure");
+        let wire = String::from_utf8_lossy(&out.seen).into_owned();
+        assert!(
+            wire.starts_with("\x1b[?2026h"),
+            "the block was opened: {wire:?}"
+        );
+        assert!(
+            wire.ends_with("\x1b[?2026l"),
+            "the block must be closed even though the paint failed: {wire:?}"
+        );
     }
 
     #[test]

@@ -273,8 +273,12 @@ fn regex_lite(text: &str) -> (Vec<String>, usize) {
         let (Ok(row), Ok(col)) = (row.parse::<u32>(), col.parse::<u32>()) else {
             continue;
         };
-        let tail = &text[idx..(idx + 60).min(text.len())];
-        let put = tail.split('\u{1b}').next().unwrap_or("");
+        // Char-boundary safe: `idx + 60` can land inside a multi-byte
+        // cluster (a blockquote's `│` gutter, any CJK cell), and slicing
+        // there panics — which killed this harness on the first document
+        // that put an image inside a container.
+        let tail: String = text[idx..].chars().take(60).collect();
+        let put = tail.split('\u{1b}').next().unwrap_or("").to_string();
         if col > 1 {
             inline += 1;
         }

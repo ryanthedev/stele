@@ -294,20 +294,55 @@ fn push_pad(runs: &mut Vec<Run>, n: u16) {
 }
 
 /// The `───┼───` rule under the header, sized to the column widths.
+///
+/// Every span here is measured through the engine and filled to an exact cell
+/// count rather than to a codepoint count. Both glyphs are East Asian
+/// *Ambiguous*: under [`width::WidthConfig::ambiguous_wide`] `─` and `┼` are 2
+/// cells each, so a hard-coded `"─┼─"` is 6 cells against a 4-cell `" │ "`
+/// separator, and `dash.repeat(w / dw)` under-fills every odd column by one.
+/// Composing to `sep_w` and to `w` keeps the rule lined up with the row above
+/// it under either policy.
 fn header_rule(widths: &[u16], ctx: &Ctx<'_>) -> Vec<Run> {
     let dash = "\u{2500}"; // ─
-    let cross = "\u{2500}\u{253C}\u{2500}"; // ─┼─
+    let cross = "\u{253C}"; // ┼
     let dw = ctx.engine.cluster_width(dash).max(1);
-    let mut runs: Vec<Run> = Vec::new();
+    let xw = ctx.engine.cluster_width(cross).max(1);
+    let sep_w = ctx.engine.display_width(SEPARATOR).min(u16::MAX as usize) as u16;
     let style = StyleId::Semantic(Semantic::TableBorder);
+    let mut runs: Vec<Run> = Vec::new();
     for (col, &w) in widths.iter().enumerate() {
         if col > 0 {
-            let cw = ctx.engine.display_width(cross) as u16;
-            inline::append_run(&mut runs, cross, style, cw);
+            // The crossing glyph must occupy exactly the separator's cells.
+            let side = sep_w.saturating_sub(xw);
+            let left = side / 2;
+            push_rule_cells(&mut runs, dash, dw, left, style);
+            inline::append_run(&mut runs, cross, style, xw);
+            push_rule_cells(&mut runs, dash, dw, side - left, style);
         }
-        let seg = dash.repeat(usize::from(w / dw));
-        let sw = ctx.engine.display_width(&seg) as u16;
-        inline::append_run(&mut runs, &seg, style, sw);
+        push_rule_cells(&mut runs, dash, dw, w, style);
     }
     runs
+}
+
+/// Exactly `target` cells of rule: whole `dash` glyphs while they fit, then
+/// spaces for a remainder a `dw`-cell glyph cannot tile. Everything carries
+/// `style`, so the whole rule stays one merged run.
+///
+/// Shared with the thematic break in `block.rs`: both draw a `─` fill to an
+/// exact cell count, and `─` is 2 cells under the ambiguous-wide policy.
+pub(crate) fn push_rule_cells(
+    runs: &mut Vec<Run>,
+    dash: &str,
+    dw: u16,
+    target: u16,
+    style: StyleId,
+) {
+    let n = target / dw;
+    if n > 0 {
+        inline::append_run(runs, &dash.repeat(usize::from(n)), style, n * dw);
+    }
+    let rest = target - n * dw;
+    if rest > 0 {
+        inline::append_run(runs, &" ".repeat(usize::from(rest)), style, rest);
+    }
 }
