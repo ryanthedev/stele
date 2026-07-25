@@ -1,8 +1,9 @@
 //! The decoration hook seam (P7 registers a real theme/highlight
 //! implementation here). P5 paints with the structural default: identity
 //! `highlight`, and a `resolve` table mapping each [`Semantic`] role to a
-//! structural [`Style`] (bold headings, dim blockquote gutters, and so on)
-//! — no color, since the full theme engine arrives in P7.
+//! structural [`Style`] (headings on a bold-to-dim ladder by level, dim
+//! blockquote gutters, and so on) — no color, since the full theme engine
+//! arrives in P7.
 
 use layout::{Run, Semantic, StyleId};
 
@@ -82,8 +83,8 @@ fn structural_style(semantic: Semantic) -> Style {
         ..Style::default()
     };
     match semantic {
-        Semantic::Heading(_)
-        | Semantic::Strong
+        Semantic::Heading(level) => heading_style(level),
+        Semantic::Strong
         | Semantic::TableHeader
         | Semantic::FootnoteLabel
         | Semantic::AlertTitle(_) => bold,
@@ -99,6 +100,50 @@ fn structural_style(semantic: Semantic) -> Style {
         | Semantic::ListMarker
         | Semantic::Strikethrough => dim,
         Semantic::Text | Semantic::TaskMarker | Semantic::CodeBlock => Style::default(),
+    }
+}
+
+/// The heading ladder, themeless half: six distinct attribute sets, loudest
+/// (H1) to quietest (H6). This path never carries color, so the ladder is
+/// the *only* thing distinguishing levels here — no two rungs may collide,
+/// and `dim` is safe to spend on the deepest two because it attenuates the
+/// terminal's own foreground rather than an already-quiet ramp color.
+///
+/// Kept identical to the monochrome branch of `highlight::theme`'s
+/// `heading_attrs`; that crate's colored branch deliberately differs (it
+/// drops `dim`, since stacking SGR faint on the quietest ramp tier falls
+/// under WCAG AA). Both sides pin their ladder with a test, and the two
+/// tables are separate for the same reason the rest of this function is: the
+/// structural defaults and the themed ones genuinely diverge elsewhere
+/// (`CodeInline`, `ListMarker`).
+fn heading_style(level: u8) -> Style {
+    let bold = Style {
+        bold: true,
+        ..Style::default()
+    };
+    match level.clamp(1, 6) {
+        1 => Style {
+            underline: true,
+            ..bold
+        },
+        2 => bold,
+        3 => Style {
+            italic: true,
+            ..bold
+        },
+        4 => Style {
+            italic: true,
+            ..Style::default()
+        },
+        5 => Style {
+            dim: true,
+            ..Style::default()
+        },
+        _ => Style {
+            dim: true,
+            italic: true,
+            ..Style::default()
+        },
     }
 }
 
@@ -139,5 +184,87 @@ mod tests {
 
         let capture = decor.resolve(StyleId::Capture(0));
         assert_eq!(capture, Style::default());
+    }
+
+    /// The themeless path has no color at all, so if two heading levels share
+    /// an attribute set they are literally indistinguishable on screen. This
+    /// is the test that would have caught the original collapse: every level
+    /// resolved to plain `bold`, which passes any "is H1 bold?" assertion.
+    #[test]
+    fn test_heading_levels_resolve_to_six_distinct_structural_styles() {
+        let decor = StructuralDecor;
+        let mut seen = Vec::new();
+        for level in 1..=6u8 {
+            let style = decor.resolve(StyleId::Semantic(Semantic::Heading(level)));
+            assert!(
+                style.fg.is_none() && style.bg.is_none(),
+                "H{level} carried color on the structural path"
+            );
+            assert_ne!(
+                style,
+                Style::default(),
+                "H{level} is indistinguishable from body text"
+            );
+            assert!(
+                !seen.contains(&style),
+                "H{level} shares an attribute set with a shallower level: {style:?}"
+            );
+            seen.push(style);
+        }
+    }
+
+    /// Distinctness alone permits any permutation of the six styles, so pin
+    /// the ladder the module doc actually promises: loud (bold) to quiet (dim).
+    #[test]
+    fn test_structural_heading_ladder_maps_each_level_to_its_specified_style() {
+        let decor = StructuralDecor;
+        let bold = Style {
+            bold: true,
+            ..Style::default()
+        };
+        let expected = [
+            Style {
+                underline: true,
+                ..bold
+            },
+            bold,
+            Style {
+                italic: true,
+                ..bold
+            },
+            Style {
+                italic: true,
+                ..Style::default()
+            },
+            Style {
+                dim: true,
+                ..Style::default()
+            },
+            Style {
+                dim: true,
+                italic: true,
+                ..Style::default()
+            },
+        ];
+        for level in 1..=6u8 {
+            assert_eq!(
+                decor.resolve(StyleId::Semantic(Semantic::Heading(level))),
+                expected[usize::from(level - 1)],
+                "H{level}"
+            );
+        }
+    }
+
+    /// Levels outside CommonMark's 1–6 cannot reach here through `crates/layout`,
+    /// but `Semantic::Heading` is constructible with any `u8` — clamping, not
+    /// panicking, is the contract.
+    #[test]
+    fn test_out_of_range_heading_level_clamps_to_the_nearest_rung() {
+        let decor = StructuralDecor;
+        let h1 = decor.resolve(StyleId::Semantic(Semantic::Heading(1)));
+        let h6 = decor.resolve(StyleId::Semantic(Semantic::Heading(6)));
+        assert_eq!(decor.resolve(StyleId::Semantic(Semantic::Heading(0))), h1);
+        assert_eq!(decor.resolve(StyleId::Semantic(Semantic::Heading(9))), h6);
+        assert_eq!(decor.resolve(StyleId::Semantic(Semantic::Heading(255))), h6);
     }
 }
