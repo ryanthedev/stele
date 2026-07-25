@@ -1323,7 +1323,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dw_6_1_cap_32_evicts_least_recently_used_within_a_single_frame() {
+    fn test_dw_6_1_cap_32_refuses_the_33rd_box_instead_of_evicting_a_live_one() {
         let dir = scratch_dir("cap");
         let mut out = Vec::new();
         for i in 0..40u32 {

@@ -9,7 +9,10 @@
 //!
 //! Run: `cargo run -p math --example raster_probe`
 
-/// Mirrors `stele::media::sizer::ASSUMED_CELL_PX` (probed 24x48 in Ghostty).
+/// Mirrors `stele::terminal::FALLBACK_CELL_PX`. stele asks the terminal with
+/// `CSI 16t` now and only falls back to this pair when nothing answers, so a
+/// live session may well be measuring something else — the numbers this probe
+/// prints are the fallback geometry's, not necessarily the reader's.
 const CELL_PX: (u32, u32) = (24, 48);
 /// Mirrors `stele::media::sizer::MATH_BASELINE_PX_HEIGHT`.
 const MATH_BASELINE_PX_HEIGHT: u32 = 40;

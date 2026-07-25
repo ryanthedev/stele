@@ -1405,7 +1405,22 @@ mod tests {
         reset_caches_for_test();
         let tex = r"\cfrac{1}{1+\cfrac{1}{1+\cfrac{1}{1+\cfrac{1}{1+x}}}}";
         // 512 px em on this layout projects past MAX_PIXMAP_PX once padding
-        // is counted, so `fit_font_size` genuinely shrinks it.
+        // is counted, so `fit_font_size` genuinely shrinks it. Asserted rather
+        // than trusted: if a RaTeX version or a nudge to this formula ever
+        // let 512 fit, the shrunk and requested cache keys would coincide and
+        // the test below would pass without exercising the bug at all — green,
+        // vacuous, and silent about it. Measured today: 383 of a requested 512.
+        let fitted = fit_font_size(
+            &cached_display_list(tex).unwrap(),
+            MAX_PX_HEIGHT,
+            f64::from(PADDING),
+        )
+        .unwrap();
+        assert!(
+            fitted < MAX_PX_HEIGHT,
+            "this test's premise is that the budget shrinks the font; it did not \
+             ({fitted} == requested {MAX_PX_HEIGHT}), so the cache keys below cannot differ"
+        );
         render(tex, MAX_PX_HEIGHT).unwrap();
         assert_eq!(cache_stats().png_misses, 1);
         render(tex, MAX_PX_HEIGHT).unwrap();
