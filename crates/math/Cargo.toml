@@ -28,3 +28,10 @@ png = "0.18"
 # crate with no dependencies of its own and none on `math`, so this adds no
 # cycle and nothing to the shipped binary.
 ast = { path = "../ast" }
+# Test-only: the shipped pipeline finishes a formula's raster in
+# `gfx::decode::letterbox_png` (see `render_fitted`), and DW-6.2's
+# "exactly the cell box" property is a property of the *composition*, not of
+# either half. Asserting it here is what keeps it next to the fixture corpus.
+# `gfx` does not depend on `math`, so this adds no cycle, and a dev-dependency
+# is never linked into the shipped binary.
+gfx = { path = "../gfx" }

@@ -1,7 +1,11 @@
 //! Probe: what does `render_fitted` actually rasterize for the hostile
 //! formulas in `testdocs/02-math.md`, and does the result stay inside the
-//! crate's own `MAX_PIXMAP_PX` budget once the solved letterbox padding is
-//! counted?
+//! crate's own `MAX_PIXMAP_PX` budget?
+//!
+//! The raster reported here is the *math* raster — ink at the em
+//! `em_capped_to_box` allows, at the ink's own aspect. It is not what goes on
+//! the wire: `stele::media::sink` runs it through `gfx::decode::letterbox_png`
+//! first, which centers it on a transparent canvas of exactly the cell box.
 //!
 //! Run: `cargo run -p math --example fitted_probe`
 

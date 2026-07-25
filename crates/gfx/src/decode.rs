@@ -1,6 +1,9 @@
 //! Bounded local image decode: a header-only dimension probe (no full pixel
-//! decode at layout time) and a full, `Limits`-bounded decode+scale for
-//! painting.
+//! decode at layout time), a full `Limits`-bounded decode+scale for painting,
+//! and an in-memory [`letterbox_png`] for a raster some other crate produced
+//! (a `crates/math` formula). All three share one decode and one letterbox, so
+//! the bounds and the "exactly the target box" guarantee are the same property
+//! stated once, not three promises that can drift apart.
 //!
 //! Every input here is hostile until proven otherwise (DW-6.3): a malformed
 //! file, a truncated file, or a valid-looking header claiming a
@@ -121,6 +124,16 @@ fn opened(
     Ok(reader)
 }
 
+/// The in-memory twin of [`opened`]. Same `limits`, applied the same way and
+/// in the same order — before any pixel is decoded.
+fn opened_bytes(bytes: &[u8], limits: Limits) -> Result<ImageReader<Cursor<&[u8]>>, DecodeError> {
+    let mut reader = ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(DecodeError::Io)?;
+    reader.limits(limits.to_image_limits());
+    Ok(reader)
+}
+
 /// Header-only dimension probe: reads just enough of `path` to learn its
 /// pixel dimensions, without decoding any pixel data. Used by `ImageSizer`
 /// at layout time, where a full decode of a potentially large/hostile image
@@ -157,8 +170,52 @@ pub fn decode_and_scale(
     target_px: (u32, u32),
     limits: Limits,
 ) -> Result<DecodedImage, DecodeError> {
-    let probe_reader = opened(path, limits)?;
-    let (width, height) = probe_reader.into_dimensions().map_err(|e| match e {
+    let img = decode_within_limits(|| opened(path, limits), limits)?;
+    let png = letterbox_onto(&img, target_px)?;
+    Ok(DecodedImage {
+        source_width: img.width(),
+        source_height: img.height(),
+        png,
+    })
+}
+
+/// Letterboxes an **already-encoded** raster held in memory onto `target_px`,
+/// returning a PNG that is exactly `target_px` with the source centered inside
+/// it at its own aspect ratio.
+///
+/// This is the entry point `crates/math`'s rasters take. A formula comes out of
+/// `math::render_fitted` at whatever size its em and its own ink demand, which
+/// is not the cell box; kitty scales a placement to fill its `c=` x `r=` box
+/// exactly, so anything that is not already the box arrives stretched. Sending
+/// it through the same [`letterbox`] the image path uses makes the transmitted
+/// raster equal to its box, which makes the stretch factor 1.0 by construction
+/// rather than by a bound.
+///
+/// `limits` is honored exactly as on the file path, and for the same reason:
+/// this seam does not get to assume its input is friendly just because the
+/// bytes came from a sibling crate. Sharing the decode with
+/// [`decode_and_scale`] is what makes that automatic rather than a promise.
+pub fn letterbox_png(
+    png: &[u8],
+    target_px: (u32, u32),
+    limits: Limits,
+) -> Result<Vec<u8>, DecodeError> {
+    let img = decode_within_limits(|| opened_bytes(png, limits), limits)?;
+    letterbox_onto(&img, target_px)
+}
+
+/// Probe-then-decode under `limits`, shared by both entry points above.
+///
+/// `open` is called twice on purpose: `into_dimensions` consumes a reader, so
+/// the header check and the pixel decode each need their own. The second one
+/// re-applies the limits and the decoder re-checks them as it reads — the real
+/// backstop against input whose body disagrees with its own header.
+fn decode_within_limits<R, F>(open: F, limits: Limits) -> Result<image::DynamicImage, DecodeError>
+where
+    R: std::io::BufRead + std::io::Seek,
+    F: Fn() -> Result<ImageReader<R>, DecodeError>,
+{
+    let (width, height) = open()?.into_dimensions().map_err(|e| match e {
         image::ImageError::Limits(_) => DecodeError::ExceedsLimits {
             width: 0,
             height: 0,
@@ -168,29 +225,26 @@ pub fn decode_and_scale(
     if !limits.accepts(width, height) {
         return Err(DecodeError::ExceedsLimits { width, height });
     }
-
-    // `into_dimensions` consumed the probe reader; re-open for the actual
-    // decode (limits are re-applied, and re-checked by the decoder as it
-    // reads — the real backstop against a file whose body disagrees with
-    // its own header).
-    let decode_reader = opened(path, limits)?;
-    let img = decode_reader.decode().map_err(|e| match e {
+    open()?.decode().map_err(|e| match e {
         image::ImageError::Limits(_) => DecodeError::ExceedsLimits { width, height },
         other => DecodeError::Malformed(other.to_string()),
-    })?;
+    })
+}
 
+/// [`letterbox`] plus the PNG re-encode — the tail both entry points share, so
+/// there is exactly one place that decides what a transmitted raster's pixel
+/// dimensions are.
+fn letterbox_onto(
+    img: &image::DynamicImage,
+    target_px: (u32, u32),
+) -> Result<Vec<u8>, DecodeError> {
     let (target_w, target_h) = (target_px.0.max(1), target_px.1.max(1));
     let letterboxed = letterbox(&img.to_rgba8(), target_w, target_h);
     let mut png = Vec::new();
     image::DynamicImage::ImageRgba8(letterboxed)
         .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
         .map_err(|e| DecodeError::Malformed(e.to_string()))?;
-
-    Ok(DecodedImage {
-        source_width: img.width(),
-        source_height: img.height(),
-        png,
-    })
+    Ok(png)
 }
 
 /// Scales `src` down/up to fit *inside* `target_w` x `target_h` preserving its
@@ -206,11 +260,21 @@ pub fn decode_and_scale(
 /// (`cargo run -p gfx --example aspect_repro`) that was a 40x24 icon rendering
 /// as a square (-40%) and a 3000x100 banner rendering 80% too tall (-44%).
 ///
-/// This is the image-side twin of [`math::render_fitted`]'s letterbox: same
-/// problem, same remedy, so a photo and a formula in the same document are
-/// both undistorted. The returned raster is still *exactly* `target_w` x
-/// `target_h`, so every caller that reasons about the raster's pixel geometry
-/// (placement sizing, and any source-rect crop over it) is unaffected.
+/// **A photo and a formula take this same code.** They used to only claim to:
+/// `math::render_fitted` letterboxed by solving `ratex_render`'s single
+/// symmetric `padding` for the box's aspect, and symmetric padding can only
+/// move a raster's aspect *toward* 1:1 — so every box aspect outside the
+/// interval between 1 and the ink's own was unreachable, and 8 of the 33
+/// shipped fixture formulas missed their box by more than 10% (`x_1` reserved
+/// 2 cols x 1 row = 48x48 px, rasterized 47x32, and landed on screen stretched
+/// 1.47x vertically). It is now literally one implementation: `math` renders
+/// ink at the right em and its own aspect, and [`letterbox_png`] puts that
+/// raster on the box here.
+///
+/// The returned raster is *exactly* `target_w` x `target_h`, so every caller
+/// that reasons about the raster's pixel geometry (placement sizing, and any
+/// source-rect crop over it) is unaffected — and the kitty scale factor is
+/// 1.0 on both axes for both kinds of content.
 fn letterbox(src: &image::RgbaImage, target_w: u32, target_h: u32) -> image::RgbaImage {
     // Fit: the smaller of the two axis ratios, in a wide-enough type that a
     // 8192-px source against a 1-px target cannot round to zero.
@@ -579,6 +643,90 @@ mod tests {
             return (0, 0);
         }
         (max_x - min_x + 1, max_y - min_y + 1)
+    }
+
+    /// [`letterbox_png`] is the entry point a `crates/math` formula takes, and
+    /// it has to give the same two guarantees the file path does: the result is
+    /// *exactly* the target, and the ink inside it keeps the source's aspect.
+    ///
+    /// The 40x24-into-48x48 case is the formula shape that motivated the whole
+    /// change — `x_1` reserves a 2 col x 1 row box and rasterizes wider than it
+    /// is tall, and kitty stretches whatever it is handed to fill the box. A
+    /// resize-onto-the-target here would report ink of 48x48.
+    #[test]
+    fn test_letterbox_png_puts_an_in_memory_raster_exactly_on_the_target() {
+        for (sw, sh, target, ink) in [
+            (40u32, 24u32, (48u32, 48u32), (48u32, 29u32)),
+            (47, 32, (48, 48), (48, 33)),
+            (5904, 12, (2400, 48), (2400, 5)),
+            (24, 48, (24, 48), (24, 48)),
+        ] {
+            let img = image::RgbaImage::from_pixel(sw, sh, image::Rgba([200, 30, 30, 255]));
+            let mut bytes = Vec::new();
+            image::DynamicImage::ImageRgba8(img)
+                .write_to(&mut Cursor::new(&mut bytes), image::ImageFormat::Png)
+                .unwrap();
+            let out = letterbox_png(&bytes, target, Limits::default())
+                .unwrap_or_else(|e| panic!("{sw}x{sh} -> {target:?}: {e}"));
+            assert_eq!(
+                probe_reencoded_dimensions(&out),
+                target,
+                "{sw}x{sh} must land exactly on {target:?}"
+            );
+            let raster = image::load_from_memory(&out).unwrap().to_rgba8();
+            assert_eq!(
+                opaque_extent(&raster),
+                ink,
+                "{sw}x{sh} into {target:?}: ink must keep the source's aspect"
+            );
+        }
+    }
+
+    /// The math raster is untrusted at this seam like anything else: the same
+    /// `limits` the file path honors are honored here, on the same two caps.
+    /// Sharing one decode with [`decode_and_scale`] is what makes that true
+    /// without a second implementation to keep in step.
+    #[test]
+    fn test_letterbox_png_enforces_the_same_limits_as_the_file_path() {
+        let img = image::RgbaImage::from_pixel(100, 100, image::Rgba([9, 9, 9, 255]));
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut Cursor::new(&mut bytes), image::ImageFormat::Png)
+            .unwrap();
+
+        let tight_dim = Limits {
+            max_dim: 50,
+            max_alloc: 256 * 1024 * 1024,
+        };
+        // Reported as `{0, 0}`, exactly as on the file path: `image`'s own
+        // `Limits` rejects inside `into_dimensions`, so this crate never learns
+        // the real numbers — which is the point of setting the limits before
+        // reading rather than after.
+        assert!(matches!(
+            letterbox_png(&bytes, (24, 48), tight_dim),
+            Err(DecodeError::ExceedsLimits { .. })
+        ));
+
+        // The allocation cap is this crate's own check, past the decoder's, so
+        // here the real dimensions do come back.
+        let tight_alloc = Limits {
+            max_dim: 8_192,
+            max_alloc: 20_000,
+        };
+        assert!(matches!(
+            letterbox_png(&bytes, (24, 48), tight_alloc),
+            Err(DecodeError::ExceedsLimits {
+                width: 100,
+                height: 100
+            })
+        ));
+
+        // And it is not simply refusing everything.
+        assert!(letterbox_png(&bytes, (24, 48), Limits::default()).is_ok());
+        // A bomb header never reaches a pixel buffer here either.
+        assert!(letterbox_png(&bomb_dimension_png(), (24, 48), Limits::default()).is_err());
+        // Nor does a raster that is not a raster.
+        assert!(letterbox_png(b"\x89PNGnotarealpngatall", (24, 48), Limits::default()).is_err());
     }
 
     /// The letterbox margin must be genuinely transparent, not an opaque black

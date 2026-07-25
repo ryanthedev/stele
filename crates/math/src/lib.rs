@@ -27,9 +27,9 @@
 //! the document: a `DisplayList` cache keyed by the exact TeX source
 //! (reused across a `px_height` change — no re-parse, no re-layout, only a
 //! re-rasterization at the new size) and a final-PNG cache keyed by
-//! `(tex, px_height, padding)` (skips rasterization entirely on a
-//! byte-identical repeat request). [`cache_stats`] exposes hit/miss counters
-//! so this is asserted deterministically rather than by timing.
+//! `(tex, px_height)` (skips rasterization entirely on a byte-identical
+//! repeat request). [`cache_stats`] exposes hit/miss counters so this is
+//! asserted deterministically rather than by timing.
 
 #![forbid(unsafe_code)]
 
@@ -53,15 +53,13 @@ const MAX_TEX_LEN: usize = 4_096;
 const MIN_PX_HEIGHT: u32 = 4;
 const MAX_PX_HEIGHT: u32 = 512;
 
-/// Default blank margin the rasterizer adds on every side, in pixels. Part
-/// of the raster's final size, so [`render_fitted`] solves for it rather
-/// than treating it as free.
+/// Blank transparent margin the rasterizer adds on every side, in pixels.
+/// Constant, and deliberately so: this crate no longer tries to reconcile a
+/// raster's aspect with a cell box by growing its margin (it cannot — see
+/// [`render_fitted`]). It renders ink at the right em, at the ink's own aspect,
+/// with this much breathing room around it; `gfx::decode::letterbox_png` is
+/// what lands the result exactly on the box.
 const PADDING: f32 = 4.0;
-
-/// Ceiling on the solved letterbox margin. A degenerate box aspect could
-/// otherwise ask for an enormous transparent border, and padding counts
-/// toward the pixmap budget like any other pixel.
-const MAX_PADDING: f32 = 512.0;
 
 const CACHE_CAP: usize = 256;
 
@@ -160,16 +158,26 @@ impl TextGrid {
 const MAX_PIXMAP_PX: u64 = 8_000_000;
 
 /// Projected pixmap area, in pixels, for a layout of em extent
-/// `(em_w, em_h)` rendered at `font` with `padding` px of margin on every
-/// side. **The padding term is not optional:** [`render_fitted`] solves for a
-/// letterbox margin up to [`MAX_PADDING`] on each side, which adds up to
-/// `2 * MAX_PADDING` to *both* axes. Counting only `em * font` let a wide
-/// formula's solved margin blow the budget by 8x — measured 63.5 megapixels
-/// against a stated 8-megapixel ceiling on `testdocs/02-math.md`'s own
-/// 3423-character formula (`cargo run -p math --example fitted_probe`).
-fn projected_px(em_w: f64, em_h: f64, font: u32, padding: f64) -> u64 {
+/// `(em_w, em_h)` rendered at `font`, counting the [`PADDING`] margin the
+/// rasterizer adds on every side.
+///
+/// **The margin term is small but not optional.** It adds `2 * PADDING` to
+/// *both* axes, so area is `(em_w*f + m)(em_h*f + m)` — strictly more than
+/// `em_w*em_h*f^2`, and not proportional to `f^2` at all. That is what stops
+/// the closed form `sqrt(MAX / (em_w * em_h))` from being the right answer —
+/// see [`fit_font_size`], which binary-searches instead. It is also worth real
+/// pixels near the ceiling: a 100 x 1 em layout at font 282 projects
+/// 28 200 x 282 = 7.95 Mpx without it and 28 208 x 290 = 8.18 Mpx with it, i.e.
+/// inside an 8 Mpx budget only if you forget to count it
+/// (`test_pixmap_budget_counts_the_rasterizer_margin`).
+///
+/// This used to take the margin as a parameter, because [`render_fitted`]
+/// solved for a per-box letterbox margin. It no longer does — the letterbox is
+/// `gfx::decode::letterbox_png`'s job now — so there is one margin and it is a
+/// constant.
+fn projected_px(em_w: f64, em_h: f64, font: u32) -> u64 {
     let f = f64::from(font);
-    let margin = 2.0 * padding.max(0.0);
+    let margin = 2.0 * f64::from(PADDING);
     let w = (em_w * f + margin).ceil().max(1.0);
     let h = (em_h * f + margin).ceil().max(1.0);
     // Saturate rather than wrap on an absurd extent.
@@ -180,21 +188,20 @@ fn projected_px(em_w: f64, em_h: f64, font: u32, padding: f64) -> u64 {
 }
 
 /// Returns the largest font size `<= requested` whose projected pixmap —
-/// **including `padding`** — stays within [`MAX_PIXMAP_PX`], or
+/// **including the [`PADDING`] margin** — stays within [`MAX_PIXMAP_PX`], or
 /// `PixmapTooLarge` if even [`MIN_PX_HEIGHT`] does not fit. Degenerate (zero /
 /// non-finite) extents pass through unchanged — there is nothing to bound, and
 /// the rasterizer handles them.
 fn fit_font_size(
     list: &ratex_types::display_item::DisplayList,
     requested: u32,
-    padding: f64,
 ) -> Result<u32, MathError> {
     let em_w = list.width;
     let em_h = list.height + list.depth;
     if !em_w.is_finite() || !em_h.is_finite() || em_w <= 0.0 || em_h <= 0.0 {
         return Ok(requested);
     }
-    let px_at = |font: u32| projected_px(em_w, em_h, font, padding);
+    let px_at = |font: u32| projected_px(em_w, em_h, font);
     if px_at(requested) <= MAX_PIXMAP_PX {
         return Ok(requested);
     }
@@ -219,27 +226,11 @@ fn fit_font_size(
 }
 
 pub fn render(tex: &str, px_height: u32) -> Result<Png, MathError> {
-    render_padded(tex, px_height, PADDING)
-}
-
-/// [`render`] with an explicit transparent margin. Used by
-/// [`render_fitted`] to letterbox a formula onto its cell box's aspect ratio
-/// without touching the em size.
-fn render_padded(tex: &str, px_height: u32, padding: f32) -> Result<Png, MathError> {
     if tex.len() > MAX_TEX_LEN {
         return Err(MathError::TooLarge { len: tex.len() });
     }
     let px_height = px_height.clamp(MIN_PX_HEIGHT, MAX_PX_HEIGHT);
-    // Padding is part of the raster's identity, so it belongs in the cache
-    // key — the same formula at the same em but a different letterbox is a
-    // different image. Quantized to whole pixels so f32 noise cannot spawn
-    // unbounded near-duplicate cache entries.
-    let padding = if padding.is_finite() {
-        padding.clamp(0.0, MAX_PADDING).round()
-    } else {
-        PADDING
-    };
-    let cache_key = (tex.to_string(), px_height, padding as u32);
+    let cache_key = (tex.to_string(), px_height);
 
     if let Some(png) = png_cache().lock().unwrap().get(&cache_key) {
         record_png_hit();
@@ -250,16 +241,16 @@ fn render_padded(tex: &str, px_height: u32, padding: f32) -> Result<Png, MathErr
     let display_list = cached_display_list(tex)?;
 
     // Bound the *pixmap*, not just the font size. Area scales with the
-    // layout's em extent and with the letterbox padding as well, so a
+    // layout's em extent and with the rasterizer's margin as well, so a
     // wide/tall construct within the MAX_TEX_LEN budget can demand an enormous
     // raster at a legal font size. Shrink the font to fit the pixel budget;
     // only if even MIN_PX_HEIGHT overflows it do we fail, and then the caller
     // falls to the txm rung.
-    let px_height = fit_font_size(&display_list, px_height, f64::from(padding))?;
+    let px_height = fit_font_size(&display_list, px_height)?;
 
     let render_options = ratex_render::RenderOptions {
         font_size: px_height as f32,
-        padding,
+        padding: PADDING,
         background_color: TRANSPARENT,
         font_dir: String::new(),
         device_pixel_ratio: 1.0,
@@ -396,11 +387,14 @@ fn display_list_cache() -> &'static Mutex<BoundedMap<String, ratex_types::displa
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// A rendered PNG's full identity: `(tex, em size, letterbox padding)`.
-/// Padding belongs here because [`render_fitted`] varies it per target box —
-/// the same formula at the same em but a different letterbox is a different
-/// raster, and keying without it would serve the wrong one.
-type PngKey = (String, u32, u32);
+/// A rendered PNG's full identity: `(tex, em size)`.
+///
+/// It used to carry a third component, the letterbox padding, because
+/// [`render_fitted`] varied the margin per target box. It no longer varies
+/// anything: the same formula at the same em is now the same raster whatever
+/// box it is destined for, and the box-shaped part of the work happens
+/// downstream in `gfx::decode::letterbox_png`.
+type PngKey = (String, u32);
 
 fn png_cache() -> &'static Mutex<BoundedMap<PngKey, Png>> {
     static CACHE: OnceLock<Mutex<BoundedMap<PngKey, Png>>> = OnceLock::new();
@@ -497,44 +491,53 @@ pub fn intrinsic_em_size(tex: &str) -> Option<(f64, f64)> {
     Some((list.width, list.height + list.depth))
 }
 
-/// Renders `tex` at a fixed `em_px`, padded so the raster's aspect ratio
-/// matches a `target_w` x `target_h` pixel box.
+/// Renders `tex` at the largest em `<= em_px` whose ink fits a
+/// `target_w` x `target_h` pixel box, at the ink's own aspect ratio.
 ///
-/// Both halves matter, and they pull against each other:
+/// **The contract is "ink at the right em, correct aspect, sized to the box" —
+/// not "exactly the box".** Landing exactly on the box is
+/// `gfx::decode::letterbox_png`'s job, and the caller
+/// (`stele::media::sink::resolve_math`) must run this raster through it before
+/// transmitting. That split is the whole design:
 ///
-/// - **Fixed em.** The em size is what makes a formula's glyphs look like the
-///   body text around them. It must not be derived from the box, or `a+b=c`
+/// - **Fixed em, here.** The em size is what makes a formula's glyphs look like
+///   the body text around them. It must not be derived from the box, or `a+b=c`
 ///   (0.78 em tall) and `e^{i\pi}+1=0` (0.96 em tall) would render at
 ///   noticeably different glyph sizes just because one has a superscript.
-/// - **Matched aspect.** The kitty graphics protocol scales a placement to
-///   fill its `c=` x `r=` cell box *exactly*, so any mismatch between the
-///   raster's proportions and the box's shows up as stretched glyphs. Cell
-///   quantization guarantees a mismatch: a box is a whole number of cells,
-///   the ink is not.
+/// - **Exact box fit, downstream.** The kitty graphics protocol scales a
+///   placement to fill its `c=` x `r=` cell box *exactly*, so any mismatch
+///   between the raster's proportions and the box's shows up as stretched
+///   glyphs. Cell quantization guarantees a mismatch: a box is a whole number
+///   of cells, the ink is not. A raster whose pixel dimensions *equal* its cell
+///   box cannot be stretched, so the fix is to transmit one that does.
 ///
-/// Padding reconciles them. Growing the transparent margin moves the raster's
-/// aspect toward 1:1 without touching glyph size, so there is a padding that
-/// lands exactly on the box's aspect — solve
-/// `(ink_w + 2p) / (ink_h + 2p) = target_w / target_h` for `p`. The result is
-/// letterboxed, not stretched: the formula keeps its shape and sits centered
-/// in its cells.
-///
-/// When the box is proportionally *wider* than the ink, the required `p` is
-/// negative — padding can only ever move aspect toward square. There `p`
-/// clamps to [`PADDING`] and the residual mismatch stands; it is bounded by
-/// one cell of rounding.
+/// **What this used to do, and why it could not work.** It solved
+/// `ratex_render`'s single symmetric `padding` for the box's aspect —
+/// `(ink_w + 2p) / (ink_h + 2p) = target_w / target_h`. Symmetric padding only
+/// ever moves a raster's aspect *toward* 1:1, so the reachable set was the
+/// interval between 1 and the ink's own aspect, and every box aspect outside it
+/// (most importantly every square box, which would need `ink_w == ink_h`) was
+/// unreachable. The residual was a visible stretch, measured across the shipped
+/// fixture corpus: 8 of 33 formulas missed their box aspect by more than 10%,
+/// worst case `x_1` — a 2 col x 1 row box (48x48 px) holding a 47x32 raster,
+/// stretched 1.47x vertically on screen. Per-axis padding is what the problem
+/// actually needs, and a per-axis transparent canvas is exactly what
+/// `gfx::decode`'s letterbox already built for the image path. So this stopped
+/// solving and started handing its raster over.
 ///
 /// **The em is a ceiling, not a promise.** When the ink at `em_px` is *larger*
 /// than the box (layout scaled a wide formula down to the content column), the
 /// terminal is going to shrink the raster to fit regardless — rasterizing at
 /// the full em only buys a bigger pixmap, a bigger PNG on the wire, and a
-/// round of terminal resampling. `testdocs/02-math.md`'s longest formula (3423
+/// round of resampling. `testdocs/02-math.md`'s longest formula (3423
 /// characters — its own prose calls it 4095, which is wrong) measured
 /// a 59984x1058 raster (63.5 megapixels, a 2 MB PNG) for a box 2400x48 px
-/// wide. [`em_capped_to_box`] shrinks the em to whatever actually fits, which
-/// lands the same glyph size on screen at 1:1 instead of via a 25x downscale.
-/// Every formula that *does* fit its box is untouched, so the fixed-em promise
-/// holds exactly where it is observable.
+/// wide. [`em_capped_to_box`] shrinks the em to whatever actually fits: today
+/// that formula rasterizes 5904x12 — 0.07 megapixels, a 56.7 KB PNG, 3 ms in
+/// release against the old path's 345 ms
+/// (`cargo run --release -p math --example fitted_probe`). Every formula that *does* fit
+/// its box is untouched, so the fixed-em promise holds exactly where it is
+/// observable.
 pub fn render_fitted(
     tex: &str,
     em_px: u32,
@@ -543,20 +546,7 @@ pub fn render_fitted(
 ) -> Result<Png, MathError> {
     let (em_w, em_h) = intrinsic_em_size(tex).ok_or(MathError::TooLarge { len: tex.len() })?;
     let (tw, th) = (f64::from(target_w.max(1)), f64::from(target_h.max(1)));
-    let em_px = em_capped_to_box(em_w, em_h, em_px, tw, th);
-    let ink_w = em_w * f64::from(em_px);
-    let ink_h = em_h * f64::from(em_px);
-
-    // p = (ink_h*tw - ink_w*th) / (2*(th - tw)); guard the degenerate square
-    // box, where the equation has no unique solution.
-    let denom = 2.0 * (th - tw);
-    let pad = if denom.abs() < f64::EPSILON {
-        f64::from(PADDING)
-    } else {
-        ((ink_h * tw - ink_w * th) / denom).max(f64::from(PADDING))
-    };
-    let pad = if pad.is_finite() { pad as f32 } else { PADDING };
-    render_padded(tex, em_px, pad)
+    render(tex, em_capped_to_box(em_w, em_h, em_px, tw, th))
 }
 
 /// The largest em `<= em_px` whose ink fits inside a `tw` x `th` pixel box,
@@ -812,17 +802,19 @@ mod tests {
     ///    "dimensions track the formula's extent"; the loose half is the 0.65
     ///    floor below, which only has to exclude a shrunken or vestigial
     ///    raster.
-    /// 3. **The raster's aspect is the one the letterbox contract predicts.**
-    ///    Symmetric padding can only move a raster's aspect *toward* 1:1, so
-    ///    the reachable set is the interval between 1 and the ink's own
-    ///    aspect at minimum padding; the contract is "land on the box's
-    ///    aspect if it is in that interval, otherwise sit at the interval's
-    ///    edge". Predicted from the em extent and the box, then checked
-    ///    against the decoded IHDR — so it fails if the solve, the
-    ///    [`MAX_PADDING`] clamp, [`em_capped_to_box`], or the rasterizer's
-    ///    own padding handling breaks. Worst observed error over the corpus:
-    ///    2.5%, asserted at 8% to leave room for ±1px rounding on the
-    ///    smallest rasters.
+    /// 3. **The raster's aspect is the ink's own**, not the box's: the em
+    ///    extent plus one [`PADDING`] margin per side, predicted from the em
+    ///    extent and checked against the decoded IHDR. It fails if
+    ///    [`em_capped_to_box`] or the rasterizer's padding handling breaks —
+    ///    and it fails if this crate ever goes back to bending a raster toward
+    ///    its box's aspect, which is what it used to do and could not do
+    ///    correctly (8 of these 33 formulas ended up more than 10% off). Worst
+    ///    observed error over the corpus: 5.4%, on the 3423-character formula,
+    ///    whose ink is 3.4 px tall at the em floor so the 8 px of margin
+    ///    dominates the ratio and whole-pixel rounding is worth percent. It is
+    ///    asserted at 8%. That the raster then lands
+    ///    *exactly* on the box is
+    ///    [`test_dw_6_2_the_composed_pipeline_puts_every_fixture_formula_exactly_on_its_box`].
     /// 4. **The letterbox is padding, not a bar.** The entire outermost ring
     ///    of pixels is alpha 0. `test_render_never_uses_default_black_ink…`
     ///    checks one corner of one formula; an opaque background that
@@ -833,22 +825,22 @@ mod tests {
     /// Nothing here would notice RaTeX rendering `b` where the source said
     /// `a`, or transposing a matrix — that needs a golden-image corpus, and a
     /// third-party rasterizer's antialiasing makes byte-exact goldens a
-    /// maintenance trap. It also cannot catch a wrong-but-plausible letterbox
-    /// *contract* (property 3 mirrors the contract rather than deriving it
-    /// from first principles); the residual-stretch bound in
-    /// [`test_dw_6_2_letterbox_stretch_on_a_square_box_is_bounded_and_unfixed`]
-    /// is where that gap is stated in terms of what the reader sees.
+    /// maintenance trap. It also says nothing about what the *reader* sees,
+    /// because this raster is not what is transmitted — the box-exactness that
+    /// decides whether kitty stretches it is asserted in
+    /// [`test_dw_6_2_the_composed_pipeline_puts_every_fixture_formula_exactly_on_its_box`].
     ///
     /// **One measured result worth knowing, which these thresholds accept.**
     /// `testdocs/02-math.md`'s 3423-character formula is ~1474 em wide against
     /// a 2400 px box, so [`em_capped_to_box`] takes its em all the way to the
     /// [`MIN_PX_HEIGHT`] floor of 4. Its strokes then go sub-pixel: the raster
-    /// is 6012x120 with ink in 1.0% of it, an ink bbox 4 px tall, and a peak
+    /// is 5904x12 with ink in 10.2% of it, an ink bbox 4 px tall, and a peak
     /// alpha of 128 — i.e. it passes "ink is there" while being, on screen,
-    /// a faint smear the terminal then downscales 2.5x further. That is the
-    /// honest outcome for a formula thirty times wider than the viewport, not
-    /// a bug this crate can fix by itself, but it is the reason the ink
-    /// threshold here is `alpha > 0` rather than "solid ink".
+    /// a faint smear that `gfx::decode::letterbox_png` then downscales another
+    /// 2.5x to reach the 2400x48 box. That is the honest outcome for a formula
+    /// thirty times wider than the viewport, not a bug this crate can fix by
+    /// itself, but it is the reason the ink threshold here is `alpha > 0`
+    /// rather than "solid ink".
     #[test]
     fn test_dw_6_2_every_fixture_formula_rasterizes_real_ink_into_its_letterbox() {
         let _g = test_guard();
@@ -964,17 +956,16 @@ mod tests {
                 short(tex)
             );
 
-            let ink_aspect_at_min_padding =
+            let expected =
                 (ink_px_w + 2.0 * f64::from(PADDING)) / (ink_px_h + 2.0 * f64::from(PADDING));
-            let box_aspect = f64::from(target_w) / f64::from(target_h);
-            let expected = expected_raster_aspect(box_aspect, ink_aspect_at_min_padding);
             let actual = f64::from(w) / f64::from(h);
             let err = (actual / expected - 1.0).abs();
             assert!(
                 err < 0.08,
                 "{file}: {} in a {target_w}x{target_h} box rasterized {w}x{h} \
-                 (aspect {actual:.3}); the letterbox contract predicts {expected:.3} \
-                 ({:.1}% off)",
+                 (aspect {actual:.3}); its ink plus one {PADDING}px margin per side \
+                 is {expected:.3} ({:.1}% off) — this crate renders the ink's own \
+                 aspect and lets `gfx::decode::letterbox_png` fit the box",
                 short(tex),
                 err * 100.0
             );
@@ -999,27 +990,6 @@ mod tests {
             "only {rendered} of {} fixture formulas reached the RaTeX rung",
             corpus.len()
         );
-    }
-
-    /// The aspect [`render_fitted`]'s contract predicts for a raster, given
-    /// the target box's aspect and the ink's own aspect at minimum padding.
-    ///
-    /// Padding is symmetric, so it can only ever move a raster's aspect
-    /// *toward* 1:1: the reachable set is the interval bounded by 1 and
-    /// `ink_aspect`. A box aspect inside that interval is hit exactly; one
-    /// outside it clamps to the interval's ink-side edge, since padding
-    /// smaller than [`PADDING`] is not on offer. A square box is the one case
-    /// with no solution at all (`w == h` forces `ink_w == ink_h`), and
-    /// [`render_fitted`] takes the default margin there.
-    fn expected_raster_aspect(box_aspect: f64, ink_aspect: f64) -> f64 {
-        if (box_aspect - 1.0).abs() < 1e-9 {
-            return ink_aspect;
-        }
-        if ink_aspect >= 1.0 {
-            box_aspect.clamp(1.0, ink_aspect)
-        } else {
-            box_aspect.clamp(ink_aspect, 1.0)
-        }
     }
 
     /// DW-6.2's rung selection, on the fixture set rather than on injected
@@ -1065,62 +1035,207 @@ mod tests {
         assert!(render_text(r"\notarealcommand{").is_none());
     }
 
-    /// **A defect this crate cannot currently fix, bounded so it cannot get
-    /// worse.**
+    /// **The stretch is gone, by construction rather than by a bound.**
     ///
-    /// [`render_fitted`] letterboxes with `ratex_render`'s single symmetric
-    /// `padding`, which moves a raster's aspect toward 1:1 and no other way.
-    /// A target box whose aspect sits *outside* the interval between 1 and the
-    /// ink's own aspect is therefore unreachable — most importantly every
-    /// square box, where matching would require `ink_w == ink_h`. The kitty
-    /// protocol scales a placement to fill its `c=` x `r=` cell box exactly,
-    /// so the residual is a visible stretch: `x_1` reserves 2 cols x 1 row
-    /// (48x48 px), rasterizes 47x32, and lands on screen stretched 1.47x
-    /// vertically.
+    /// This replaces `test_dw_6_2_letterbox_stretch_on_a_square_box_is_bounded_and_unfixed`,
+    /// whose reasoning is worth keeping because it is why the pipeline is
+    /// shaped the way it is now. [`render_fitted`] used to letterbox with
+    /// `ratex_render`'s single symmetric `padding`, which moves a raster's
+    /// aspect toward 1:1 and no other way. A target box whose aspect sits
+    /// *outside* the interval between 1 and the ink's own aspect was therefore
+    /// unreachable — most importantly every square box, where matching would
+    /// have required `ink_w == ink_h`. The kitty protocol scales a placement to
+    /// fill its `c=` x `r=` cell box exactly, so the residual was a visible
+    /// stretch: `x_1` reserves 2 cols x 1 row (48x48 px), rasterized 47x32, and
+    /// landed on screen stretched 1.47x vertically. 8 of the 33 fixture
+    /// formulas missed their box aspect by more than 10%, and the old test
+    /// could only record that worst case and forbid it from growing.
     ///
-    /// [`test_render_fitted_matches_the_target_box_aspect_without_changing_em`]
-    /// misses this entirely because all three of its boxes are wide enough for
-    /// the solve to succeed. Fixing it needs per-axis padding, which means
-    /// composing the raster onto a larger transparent canvas here (a new
-    /// runtime image dependency and a two-axis cache key) or letting the sink
-    /// place a box the raster's own aspect fits — neither is a change this
-    /// test's scope can make. So this records the measured worst case instead:
-    /// the numbers below are today's residual, not a target.
+    /// The old test's own diagnosis named the fix: *"per-axis padding, which
+    /// means composing the raster onto a larger transparent canvas"* — which
+    /// `gfx::decode`'s letterbox had already been doing for photographs the
+    /// whole time. So the two paths are one path now, and this asserts the
+    /// composed result: **every fixture formula's transmitted raster is exactly
+    /// its target box**, so the scale factor kitty applies is 1.0 on both axes
+    /// and there is no residual left to bound.
+    ///
+    /// Two further assertions, because "exactly the box" alone would also be
+    /// satisfied by resizing straight onto the box — the original image-side
+    /// bug: the ink inside is the math raster's ink scaled by a *single* factor
+    /// on both axes, and the raster's outer ring is fully transparent, so the
+    /// fit is a letterbox and not a stretch or an opaque bar.
     #[test]
-    fn test_dw_6_2_letterbox_stretch_on_a_square_box_is_bounded_and_unfixed() {
+    fn test_dw_6_2_the_composed_pipeline_puts_every_fixture_formula_exactly_on_its_box() {
         let _g = test_guard();
         reset_caches_for_test();
-        let mut worst: (f64, String) = (0.0, String::new());
-        let mut stretched = 0usize;
-        for FixtureFormula { tex, .. } in &fixture_formulas() {
+        let corpus = fixture_formulas();
+        assert!(
+            corpus.len() >= 25,
+            "DW-6.2's fixture set shrank to {} formulas; it is supposed to cover the whole \
+             ladder plus matrices, big operators, and the near-pixmap-bound case",
+            corpus.len()
+        );
+
+        let mut composed = 0usize;
+        for FixtureFormula { file, tex } in &corpus {
             let Some((em_w, em_h)) = intrinsic_em_size(tex) else {
                 continue;
             };
-            let (target_w, target_h) = pipeline_target_px(em_w, em_h, 100);
-            let png = render_fitted(tex, 40, target_w, target_h).expect("renders");
-            let (w, h) = decode_png_dims(png.as_bytes());
-            let box_aspect = f64::from(target_w) / f64::from(target_h);
-            let stretch = ((f64::from(w) / f64::from(h)) / box_aspect - 1.0).abs();
-            if stretch > 0.10 {
-                stretched += 1;
-            }
-            if stretch > worst.0 {
-                worst = (stretch, tex.clone());
-            }
+            composed += 1;
+            let target = pipeline_target_px(em_w, em_h, 100);
+            let math_png = render_fitted(tex, 40, target.0, target.1).expect("renders");
+            let (mw, mh) = decode_png_dims(math_png.as_bytes());
+
+            // Exactly what `stele::media::sink::resolve_math` does with it.
+            let wire =
+                gfx::decode::letterbox_png(math_png.as_bytes(), target, gfx::Limits::default())
+                    .unwrap_or_else(|e| panic!("{file}: {} failed to letterbox: {e}", short(tex)));
+            let (w, h) = decode_png_dims(&wire);
+            assert_eq!(
+                (w, h),
+                target,
+                "{file}: {} was transmitted {w}x{h} for a {}x{} box — kitty scales a \
+                 placement to fill its cell box exactly, so anything but equality is a \
+                 stretch of {:.2}x horizontally and {:.2}x vertically",
+                short(tex),
+                target.0,
+                target.1,
+                f64::from(target.0) / f64::from(w),
+                f64::from(target.1) / f64::from(h),
+            );
+
+            let raster = rgba_of(&wire, w, h);
+            let ink = ink_extent(w, &raster).unwrap_or_else(|| {
+                panic!(
+                    "{file}: {} letterboxed to {w}x{h} with not one pixel of ink",
+                    short(tex)
+                )
+            });
+            let (iw, ih) = ink.bbox;
+            // The ink must be the math raster's ink scaled by **one** factor,
+            // the same on both axes — that is what letterboxing means, and it
+            // is a far sharper instrument than comparing aspect ratios: a
+            // resize-onto-the-box (the image path's original bug, and what
+            // deleting the letterbox would leave) scales x and y by different
+            // factors, which shows up here as tens of pixels on a formula
+            // whose box is nowhere near its own shape.
+            let math_ink = ink_extent(mw, &rgba_of(math_png.as_bytes(), mw, mh))
+                .unwrap_or_else(|| panic!("{file}: {} rasterized blank", short(tex)));
+            let scale = (f64::from(w) / f64::from(mw)).min(f64::from(h) / f64::from(mh));
+            let want = (
+                f64::from(math_ink.bbox.0) * scale,
+                f64::from(math_ink.bbox.1) * scale,
+            );
+            // 3 px of slack, from measurement: resampling spreads an
+            // antialiased edge outward by a pixel or so, worst observed +2.4 px
+            // (the `\begin{cases}` fixture's height).
+            assert!(
+                (f64::from(iw) - want.0).abs() <= 3.0 && (f64::from(ih) - want.1).abs() <= 3.0,
+                "{file}: {} inked {iw}x{ih} inside its {w}x{h} box; its {mw}x{mh} math \
+                 raster's {}x{} of ink scaled by one factor {scale:.4} is \
+                 {:.1}x{:.1} — a mismatch means the fit stretched the axes \
+                 independently instead of letterboxing",
+                short(tex),
+                math_ink.bbox.0,
+                math_ink.bbox.1,
+                want.0,
+                want.1,
+            );
+
+            let opaque_border = (0..w)
+                .flat_map(|x| [(x, 0), (x, h - 1)])
+                .chain((0..h).flat_map(|y| [(0, y), (w - 1, y)]))
+                .filter(|&(x, y)| raster[(y * w + x) as usize].3 != 0)
+                .count();
+            assert_eq!(
+                opaque_border,
+                0,
+                "{file}: {} has {opaque_border} non-transparent pixels on the edge of its \
+                 {w}x{h} letterbox — the margin must be padding the terminal background \
+                 shows through, not a bar",
+                short(tex)
+            );
         }
         assert!(
-            worst.0 < 0.50,
-            "worst letterbox residual grew to {:.1}% on {}; the terminal stretches the \
-             raster by exactly that much",
-            worst.0 * 100.0,
-            short(&worst.1)
+            composed >= 25,
+            "only {composed} of {} fixture formulas reached the RaTeX rung",
+            corpus.len()
+        );
+    }
+
+    /// **The one thing routing math through `gfx` gave up, pinned.**
+    ///
+    /// `gfx::Limits::max_dim` is 8192 px, and this crate's own ceilings do not
+    /// imply it: [`MAX_PIXMAP_PX`] bounds *area*, and [`em_capped_to_box`]
+    /// floors the em at [`MIN_PX_HEIGHT`] rather than shrinking without limit.
+    /// A formula wide enough in em therefore rasterizes past 8192 px on one
+    /// axis while staying comfortably inside 8 megapixels — 4096 `W`s (legal
+    /// under [`MAX_TEX_LEN`]) are 4437 em wide, which is 17758 px even at the
+    /// em floor. Since the sink letterboxes through `gfx`, such a formula is
+    /// now *declined* at that seam and lands on the txm rung instead of being
+    /// transmitted as an illegible 7x-downscaled smear. That is a deliberate,
+    /// and arguably better, rung choice — but it is a behavior change, so it is
+    /// asserted rather than discovered.
+    ///
+    /// The half that matters for real documents is the second assertion: the
+    /// whole shipped fixture corpus is inside the cap with room to spare
+    /// (widest: 5904 px, 72% of it). If that ever stops being true, a fixture
+    /// silently stops rendering as graphics and this is what says so.
+    #[test]
+    fn test_a_formula_too_wide_for_gfx_limits_declines_at_the_seam_not_in_the_corpus() {
+        let _g = test_guard();
+        reset_caches_for_test();
+        let max_dim = gfx::Limits::default().max_dim;
+
+        let hostile = "W".repeat(MAX_TEX_LEN);
+        let (em_w, em_h) = intrinsic_em_size(&hostile).expect("4096 `W`s parse");
+        let target = pipeline_target_px(em_w, em_h, 100);
+        let png = render_fitted(&hostile, 40, target.0, target.1).expect("still rasterizes");
+        let (w, h) = decode_png_dims(png.as_bytes());
+        assert!(
+            w > max_dim,
+            "this test's premise is a raster past gfx's {max_dim} px cap; it rasterized \
+             {w}x{h}, so the seam below is not what is being exercised"
         );
         assert!(
-            stretched <= 8,
-            "{stretched} fixture formulas now miss their box aspect by more than 10% (was 8: \
-             the single-cell-wide and square-box cases). A new one means the letterbox got \
-             worse, not that this bound is wrong."
+            u64::from(w) * u64::from(h) <= MAX_PIXMAP_PX,
+            "…while staying inside this crate's own {MAX_PIXMAP_PX} px area budget"
         );
+        assert!(
+            gfx::decode::letterbox_png(png.as_bytes(), target, gfx::Limits::default()).is_err(),
+            "a {w}x{h} raster must be declined by gfx, cleanly, so the sink falls to txm"
+        );
+
+        // And no fixture formula is anywhere near it.
+        let widest = fixture_formulas()
+            .iter()
+            .filter_map(|f| {
+                let (em_w, em_h) = intrinsic_em_size(&f.tex)?;
+                let target = pipeline_target_px(em_w, em_h, 100);
+                let png = render_fitted(&f.tex, 40, target.0, target.1).ok()?;
+                Some(decode_png_dims(png.as_bytes()).0)
+            })
+            .max()
+            .expect("the corpus renders");
+        assert!(
+            widest <= max_dim,
+            "the widest fixture raster is {widest} px, past gfx's {max_dim} px cap — that \
+             formula now degrades to the txm rung instead of being painted"
+        );
+    }
+
+    /// RGBA pixels of a PNG `gfx` produced, in the tuple form [`ink_extent`]
+    /// reads. Uses `png` (already a dev-dependency for the rasters this crate
+    /// makes itself) rather than `image`, so there is one decoder in the tests.
+    fn rgba_of(bytes: &[u8], w: u32, h: u32) -> Vec<(u8, u8, u8, u8)> {
+        let px = png_pixels_via_manual_decode(bytes);
+        assert_eq!(
+            px.len() as u64,
+            u64::from(w) * u64::from(h),
+            "IHDR says {w}x{h} but decoded {} pixels",
+            px.len()
+        );
+        px
     }
 
     #[test]
@@ -1282,39 +1397,48 @@ mod tests {
         assert_eq!(strip_ansi_sgr(styled), "bold plain");
     }
 
-    /// The kitty protocol stretches a placement to fill its `c=` x `r=` cell
-    /// box exactly, so a raster whose proportions disagree with the box shows
-    /// up as visibly stretched glyphs. `render_fitted` letterboxes instead:
-    /// same em (so glyph size stays consistent between formulas), padding
-    /// solved so the aspect lands on the box's.
+    /// The fixed-em half of [`render_fitted`]'s contract, isolated: a formula
+    /// that fits its box rasterizes **identically whatever box it is given**.
     ///
-    /// **Scope, stated because the name overclaims:** all three boxes here are
-    /// proportionally narrower than their formula's ink, which is exactly the
-    /// case where the padding solve has a solution. Symmetric padding cannot
-    /// reach a box aspect outside the interval between 1 and the ink's own
-    /// aspect, and 8 of the 33 real fixture formulas sit outside it — see
-    /// [`test_dw_6_2_letterbox_stretch_on_a_square_box_is_bounded_and_unfixed`].
+    /// That is the property the box must not be allowed to touch. Deriving the
+    /// em from the box makes glyph size depend on whether a formula happens to
+    /// have a superscript — the two formulas here differ by 0.96 vs 0.78 em in
+    /// height — so `e^{i\pi}+1=0` and `a+b=c` would render at visibly different
+    /// sizes on the same line.
+    ///
+    /// The old version of this test asserted the raster matched each box's
+    /// *aspect*, which it no longer tries to do: matching the box exactly is
+    /// `gfx::decode::letterbox_png`'s job now, asserted over the real corpus in
+    /// [`test_dw_6_2_the_composed_pipeline_puts_every_fixture_formula_exactly_on_its_box`].
+    /// The old assertion also overclaimed — all three of these boxes are
+    /// proportionally narrower than the ink, the one case the old padding solve
+    /// could actually reach.
     #[test]
-    fn test_render_fitted_matches_the_target_box_aspect_without_changing_em() {
+    fn test_render_fitted_keeps_the_em_fixed_across_boxes_that_fit() {
         let _g = test_guard();
         reset_caches_for_test();
-        // A formula with a superscript and one without: their em heights
-        // differ a lot (0.96 vs 0.78), which is exactly what used to make a
-        // box-derived em render them at different glyph sizes.
         for tex in [r"e^{i\pi}+1=0", "a+b=c"] {
-            for (tw, th) in [(192u32, 48u32), (168, 48), (312, 96)] {
+            // Every box here is at least as big as either formula's ink at em
+            // 40 (`e^{i\pi}+1=0` is the larger: 190x39 px), so `em_capped_to_box`
+            // leaves the em alone in all of them.
+            let boxes = [(192u32, 48u32), (312, 96), (2400, 240)];
+            let mut dims = Vec::new();
+            for (tw, th) in boxes {
                 let png = render_fitted(tex, 40, tw, th).expect("renders");
-                let (rw, rh) = decode_png_dims(png.as_bytes());
-                let raster_aspect = f64::from(rw) / f64::from(rh);
-                let box_aspect = f64::from(tw) / f64::from(th);
-                let err = (raster_aspect / box_aspect - 1.0).abs();
-                assert!(
-                    err < 0.10,
-                    "{tex} into {tw}x{th}: raster {rw}x{rh} aspect {raster_aspect:.3} \
-                     vs box {box_aspect:.3} ({:.1}% off)",
-                    err * 100.0
-                );
+                dims.push(((tw, th), decode_png_dims(png.as_bytes())));
             }
+            let (_, first) = dims[0];
+            assert!(
+                dims.iter().all(|&(_, d)| d == first),
+                "{tex} rasterized differently across boxes that all fit it, so its glyph \
+                 size depends on its cell box: {dims:?}"
+            );
+            // And it is the *unfitted* raster: the box changed nothing at all.
+            assert_eq!(
+                first,
+                decode_png_dims(render(tex, 40).expect("renders").as_bytes()),
+                "{tex} at a box it fits must be exactly `render(tex, 40)`"
+            );
         }
     }
 
@@ -1327,9 +1451,9 @@ mod tests {
     ///
     /// Why the suite missed it: `MAX_PIXMAP_PX` *was* enforced, by
     /// `fit_font_size`, which computed area as `em * font` and never counted
-    /// the up-to-`2 * MAX_PADDING` the letterbox adds to each axis. The bound
-    /// was asserted at the wrong level: on the layout's em extent rather than
-    /// on the pixmap actually allocated.
+    /// the margin the rasterizer adds to each axis. The bound was asserted at
+    /// the wrong level: on the layout's em extent rather than on the pixmap
+    /// actually allocated.
     #[test]
     fn test_render_fitted_stays_inside_the_pixmap_budget_and_its_own_box() {
         let _g = test_guard();
@@ -1354,7 +1478,7 @@ mod tests {
         // the real upper bound, and it is ~9x tighter than the uncapped em's
         // 59984 px.
         let (em_w, em_h) = intrinsic_em_size(&wide).unwrap();
-        let floor_w = (em_w * f64::from(MIN_PX_HEIGHT)).ceil() as u32 + 2 * MAX_PADDING as u32;
+        let floor_w = (em_w * f64::from(MIN_PX_HEIGHT)).ceil() as u32 + 2 * PADDING as u32;
         assert!(
             w <= floor_w,
             "raster width {w} exceeds the MIN_PX_HEIGHT floor bound {floor_w} \
@@ -1373,26 +1497,43 @@ mod tests {
         );
     }
 
-    /// The pixmap ceiling must be computed on the pixmap, padding included.
+    /// The pixmap ceiling must be computed on the pixmap, [`PADDING`] margin
+    /// included — asserted at the exact font size where that is the *only*
+    /// thing that decides the answer.
+    ///
+    /// A 100 x 1 em layout at font 282 is 28200 x 282 = 7.95 Mpx of ink, inside
+    /// the 8 Mpx budget; add the 4px margin the rasterizer puts on every side
+    /// and it is 28208 x 290 = 8.18 Mpx, outside it. So `fit_font_size(list,
+    /// 282)` must come back *below* 282, and it can only do that if
+    /// [`projected_px`] counts the margin. Delete the margin term and this goes
+    /// red; no other assertion in the suite does, because at ordinary formula
+    /// sizes 8 px is lost in the noise.
     #[test]
-    fn test_pixmap_budget_counts_the_letterbox_padding() {
+    fn test_pixmap_budget_counts_the_rasterizer_margin() {
         let list = ratex_types::display_item::DisplayList {
             width: 100.0,
             height: 1.0,
             depth: 0.0,
             ..Default::default()
         };
-        // Without padding, font 40 projects 4000 x 40 = 160k px — trivially
-        // inside the budget. With a full MAX_PADDING letterbox it projects
-        // 5024 x 1064 = 5.3M, and at font 300 it projects 31024 x 1324 = 41M,
-        // which must be rejected down to something that fits.
-        let unpadded = fit_font_size(&list, 300, 0.0).unwrap();
-        let padded = fit_font_size(&list, 300, f64::from(MAX_PADDING)).unwrap();
+        const FONT: u32 = 282;
+        let ink_only = (100.0 * f64::from(FONT)) * f64::from(FONT);
         assert!(
-            padded < unpadded,
-            "padding must tighten the fitted font size: {padded} vs {unpadded}"
+            ink_only <= MAX_PIXMAP_PX as f64,
+            "this test's premise is that the ink alone fits ({ink_only} px); it does not, \
+             so the margin is not what decides the answer"
         );
-        assert!(projected_px(100.0, 1.0, padded, f64::from(MAX_PADDING)) <= MAX_PIXMAP_PX);
+        assert!(
+            projected_px(100.0, 1.0, FONT) > MAX_PIXMAP_PX,
+            "…and that the margin pushes it out"
+        );
+        let fitted = fit_font_size(&list, FONT).unwrap();
+        assert!(
+            fitted < FONT,
+            "the fitted font must shrink below {FONT}, got {fitted} — the pixmap budget \
+             is being computed on the ink instead of on the pixmap"
+        );
+        assert!(projected_px(100.0, 1.0, fitted) <= MAX_PIXMAP_PX);
     }
 
     /// A formula big enough for `fit_font_size` to shrink used to be inserted
@@ -1410,12 +1551,7 @@ mod tests {
         // let 512 fit, the shrunk and requested cache keys would coincide and
         // the test below would pass without exercising the bug at all — green,
         // vacuous, and silent about it. Measured today: 383 of a requested 512.
-        let fitted = fit_font_size(
-            &cached_display_list(tex).unwrap(),
-            MAX_PX_HEIGHT,
-            f64::from(PADDING),
-        )
-        .unwrap();
+        let fitted = fit_font_size(&cached_display_list(tex).unwrap(), MAX_PX_HEIGHT).unwrap();
         assert!(
             fitted < MAX_PX_HEIGHT,
             "this test's premise is that the budget shrinks the font; it did not \
@@ -1432,12 +1568,16 @@ mod tests {
         assert_eq!(cache_stats().png_misses, 1);
     }
 
-    /// Padding can only push a raster's aspect toward square, so a box that is
-    /// proportionally wider than the ink has no solution. That must clamp to
-    /// the default margin and still produce a usable raster, never a negative
-    /// padding or a panic.
+    /// A box far bigger than the ink must leave the ink alone: no upscaling to
+    /// fill it, no degenerate margin, just the plain fixed-em raster —
+    /// `gfx::decode::letterbox_png` centers it in the box afterwards.
+    ///
+    /// This used to be about the padding solve clamping (a box proportionally
+    /// wider than the ink demanded a *negative* margin). There is no solve
+    /// left; the assertion survives because "a huge box changes nothing" is
+    /// still the behaviour, and it is now true for a simpler reason.
     #[test]
-    fn test_render_fitted_clamps_when_the_box_is_wider_than_the_ink() {
+    fn test_render_fitted_leaves_the_ink_alone_when_the_box_is_far_wider() {
         let _g = test_guard();
         reset_caches_for_test();
         let png = render_fitted("a+b=c", 40, 4_000, 48).expect("still renders");

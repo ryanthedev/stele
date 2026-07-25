@@ -118,11 +118,17 @@ struct Placement {
     /// re-decode / re-render) — this is DW-6.5's cache.
     rendered_px: (u32, u32),
     /// The raster's *actual* `(width_px, height_px)`, read back from the
-    /// transmitted PNG rather than assumed to equal `rendered_px`. Only the
-    /// image path scales to the target exactly; `math::render_fitted`
-    /// letterboxes to the target's *aspect* at a fixed em, so its raster is
-    /// a different pixel size entirely. Source-rectangle cropping is in
-    /// raster pixels, so it has to be the measured number.
+    /// transmitted PNG rather than assumed to equal `rendered_px`.
+    ///
+    /// Both producers now go through `gfx::decode`'s letterbox, so in practice
+    /// this equals `rendered_px` — it did not used to: `math::render_fitted`
+    /// letterboxed to the target's *aspect* only, so a formula's raster was a
+    /// different pixel size entirely, and cropping against `rendered_px`
+    /// mis-cropped every one of them. Kept measured rather than collapsed into
+    /// `rendered_px` because source-rectangle cropping is denominated in raster
+    /// pixels: this field is where that unit is *observed*, and a future
+    /// producer that stops matching its target stays correct here instead of
+    /// silently mis-cropping again.
     raster_px: (u32, u32),
     /// The last frame this node was painted in. Drives the raster's
     /// residency (the grace sweep and the LRU cap) — never its visibility.
@@ -705,8 +711,18 @@ impl GfxMediaSink {
             if self.replace_if_cached(node_id, target, reserved, rect, out) {
                 return Resolved::Graphics;
             }
-            // Render at the SAME em the sizer measured this box with, and let
-            // the math crate letterbox the raster onto the box's aspect.
+            // Render at the SAME em the sizer measured this box with, then
+            // letterbox that raster onto the box through the *same*
+            // `gfx::decode` path an image takes.
+            //
+            // The letterbox is not optional and it does not belong in `math`:
+            // kitty scales a placement to fill its `c=` x `r=` box exactly, so
+            // only a raster whose pixels *are* the box escapes being stretched,
+            // and producing one means padding per axis — a transparent canvas,
+            // which is what `gfx::decode::letterbox_png` already does for
+            // photos. `math` tried to approximate it with `ratex_render`'s
+            // single symmetric padding and could not: 8 of the 33 fixture
+            // formulas missed their box aspect by more than 10%.
             //
             // This used to pass `target.1` — the box's total pixel height —
             // into an argument that means *em size*, so every formula
@@ -725,10 +741,25 @@ impl GfxMediaSink {
             // an eviction here would blank a box already on screen. Falling
             // through lands on the txm rung below, which is what the ladder
             // is for.
+            //
+            // Both steps are on the cache-*miss* path only — `replace_if_cached`
+            // returned above for a box whose raster is already resident at this
+            // target — so the letterbox costs one decode+encode per formula per
+            // (re)size, not one per frame.
+            //
+            // `letterbox_png` applies `self.limits` to the formula's raster,
+            // which `math`'s own ceilings do not imply: `math` bounds pixmap
+            // *area*, `gfx` bounds each *axis*. A formula wide enough in em
+            // (4096 `W`s, legal TeX, rasterize 17758 px wide even at `math`'s
+            // em floor) is declined here and takes the txm rung — a better rung
+            // than transmitting a 7x-downscaled smear, and pinned by `math`'s
+            // `test_a_formula_too_wide_for_gfx_limits_declines_at_the_seam_not_in_the_corpus`,
+            // which also holds the whole fixture corpus inside the cap.
             if self.has_placement_slot(node_id)
                 && let Ok(png) =
                     math::render_fitted(&tex, MATH_BASELINE_PX_HEIGHT, target.0, target.1)
-                && self.transmit_and_place(node_id, png.as_bytes(), target, reserved, rect, out)
+                && let Ok(boxed) = gfx::decode::letterbox_png(png.as_bytes(), target, self.limits)
+                && self.transmit_and_place(node_id, &boxed, target, reserved, rect, out)
             {
                 return Resolved::Graphics;
             }
@@ -866,11 +897,13 @@ fn crop_source(
 /// Reads `(width, height)` out of a PNG's IHDR chunk, which the format
 /// requires to be the first chunk immediately after the 8-byte signature.
 ///
-/// Measured rather than assumed because the two raster producers disagree:
-/// `gfx::decode::decode_and_scale` resizes to the requested target exactly,
-/// while `math::render_fitted` rasterizes at a fixed em and only matches the
-/// target's *aspect*. Cropping is in raster pixels, so guessing here would
-/// silently mis-crop every formula.
+/// Measured rather than assumed. The two raster producers used to disagree —
+/// `gfx::decode::decode_and_scale` resized to the requested target exactly,
+/// while `math::render_fitted` rasterized at a fixed em and only matched the
+/// target's *aspect* — and cropping is in raster pixels, so guessing mis-cropped
+/// every formula. Both now finish in the same `gfx::decode` letterbox and land
+/// on the target, but the measurement is what makes that a *checked* fact at
+/// the seam rather than an assumption inherited from two crates away.
 fn png_pixel_size(png: &[u8]) -> Option<(u32, u32)> {
     const SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
     if png.len() < 24 || !png.starts_with(SIGNATURE) || &png[12..16] != b"IHDR" {
@@ -1886,12 +1919,13 @@ mod tests {
     /// The guarantee is real, but it rests on call-graph discipline, so it has
     /// to be asserted from the output rather than argued from the fields.
     ///
-    /// The node is an **image**, not a formula, and that is not incidental:
-    /// `gfx::decode::decode_and_scale` rasterizes to the requested pixel target
-    /// exactly, so "the raster followed the new cell size" is a statement about
-    /// a number on the wire. A formula's raster follows the target's *aspect*
-    /// only — see
-    /// `test_a_proportional_cell_change_re_transmits_a_formula_raster_unchanged`.
+    /// The node is an **image**, and its formula twin is
+    /// `test_a_formula_raster_is_exactly_its_cell_box_at_every_cell_geometry`.
+    /// Both rasterize to the requested pixel target exactly — the image through
+    /// `gfx::decode::decode_and_scale`, the formula through
+    /// `math::render_fitted` plus `gfx::decode::letterbox_png` — so in both
+    /// cases "the raster followed the new cell size" is a statement about a
+    /// number on the wire.
     #[test]
     fn test_dw_6_5_geometry_change_regenerates_the_raster_and_keeps_the_cell_box() {
         let dir = scratch_dir("geometry");
@@ -1980,26 +2014,30 @@ mod tests {
         );
     }
 
-    /// A formula's raster is **not** a function of cell geometry the way an
-    /// image's is, and DW-6.5's wording hides that. `math::render_fitted`
-    /// rasterizes at a fixed em and solves for the *padding* that would put the
-    /// result on the target's aspect ratio — but padding can only be added, and
-    /// it is floored at `math::PADDING`, so for any target wider than the ink
-    /// plus minimum padding the solution clamps and the raster stops depending
-    /// on the target at all. A 20x2 cell box is such a target at every cell
-    /// geometry in the plausible range, so a proportional cell change
-    /// re-transmits bit-identical pixels. The sink re-transmits anyway, because
-    /// its cache key is the target it *asked* for, not the raster it got.
+    /// **A formula on the wire is exactly its cell box, at every cell
+    /// geometry** — the property that makes the kitty scale factor 1.0 and so
+    /// makes stretching a formula structurally impossible rather than merely
+    /// bounded.
     ///
-    /// Asserted rather than left implicit for two reasons: it is why the DW-6.5
-    /// test above uses an image, and it is a small real inefficiency (one
-    /// wasted transmit per formula per geometry change) that should be visible
-    /// to whoever next touches the cache key rather than rediscovered. A change
-    /// that pulls the target back inside the clamp *does* reach the raster —
-    /// the second half below, without which "identical" would also be satisfied
-    /// by a renderer that ignored its target entirely.
+    /// This test used to assert the opposite, and was right to:
+    /// `math::render_fitted` rasterized at a fixed em and solved
+    /// `ratex_render`'s single symmetric padding for the target's *aspect*.
+    /// Symmetric padding only moves a raster's aspect toward 1:1, so it clamped
+    /// at `math::PADDING` for any target wider than the ink and the raster
+    /// stopped depending on the target at all — a 20x2 cell box is such a
+    /// target at every plausible cell geometry, so a proportional cell change
+    /// re-transmitted bit-identical pixels, and every box aspect the solve
+    /// could not reach arrived on screen stretched by the residual (worst case
+    /// over the shipped corpus: 1.47x vertically, on `x_1`).
+    ///
+    /// The sink now hands the formula's raster to `gfx::decode::letterbox_png`,
+    /// the same letterbox an image takes, which centers it on a transparent
+    /// canvas of exactly the target. So the assertions below are the ones the
+    /// old version could not make: the raster *is* the target, and it tracks
+    /// each axis of the cell geometry independently — the third case changes
+    /// the cell's width alone.
     #[test]
-    fn test_a_proportional_cell_change_re_transmits_a_formula_raster_unchanged() {
+    fn test_a_formula_raster_is_exactly_its_cell_box_at_every_cell_geometry() {
         let dir = scratch_dir("formula-geometry");
         let doc = Document::parse("$x+1$\n");
         let node_id = doc
@@ -2027,33 +2065,18 @@ mod tests {
             (creates(&out), transmitted_raster_px(&out))
         };
 
-        // 24x48 -> 32x64 is 4/3 on both axes: the 20x2 cell box keeps its 5:1
-        // aspect, so the formula rasterizes to exactly the same pixels.
-        let (creates_a, raster_a) = render_at((24, 48));
-        let (creates_b, raster_b) = render_at((32, 64));
-        assert_eq!((creates_a, creates_b), (1, 1));
-        assert_eq!(
-            raster_a, raster_b,
-            "a proportional cell change leaves a formula's raster identical — \
-             the re-transmit buys nothing"
-        );
-        // Not equal to its own pixel target, either: that is what makes
-        // "identical" mean "independent of the target" rather than "both
-        // happened to land on the same target".
-        assert_ne!(
-            raster_a,
-            Some((20 * 24, 2 * 48)),
-            "a formula does not rasterize to its pixel target"
-        );
-
-        // Narrow the cell instead of scaling it, so the 20-column box stops
-        // being wider than the ink-plus-minimum-padding solution, and the
-        // padding the renderer solves for is no longer clamped.
-        let (_, raster_narrow) = render_at((12, 48));
-        assert_ne!(
-            raster_a, raster_narrow,
-            "a target inside the padding clamp must reach the formula's raster"
-        );
+        // Three cell geometries, including one that changes only the width:
+        // the raster is the 20x2 cell box times the cell, every time.
+        for cell in [(24u32, 48u32), (32, 64), (12, 48)] {
+            let (creates_n, raster) = render_at(cell);
+            assert_eq!(creates_n, 1, "cell {cell:?}: one raster on the wire");
+            assert_eq!(
+                raster,
+                Some((20 * cell.0, 2 * cell.1)),
+                "cell {cell:?}: a formula must be transmitted at exactly its cell \
+                 box, or kitty stretches it by the difference"
+            );
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2061,10 +2084,12 @@ mod tests {
     /// rather than *bytes*: the raster target is exactly the cell box times
     /// the cell geometry, on both axes independently.
     ///
-    /// Asserted for an image rather than a formula because
-    /// `gfx::decode::decode_and_scale` rasterizes to the requested target
-    /// exactly, so the number on the wire is the arithmetic under test;
-    /// `math::render_fitted` matches only the target's aspect.
+    /// Asserted for an image, whose `gfx::decode::decode_and_scale` rasterizes
+    /// to the requested target exactly, so the number on the wire is the
+    /// arithmetic under test. A formula now lands on its target exactly too
+    /// (`test_a_formula_raster_is_exactly_its_cell_box_at_every_cell_geometry`),
+    /// but by way of a second crate; the image is the shorter path from the
+    /// arithmetic to the assertion.
     #[test]
     fn test_the_raster_target_is_the_cell_box_times_the_queried_cell_geometry() {
         let dir = scratch_dir("raster-target");
@@ -2246,10 +2271,13 @@ mod tests {
     }
 
     /// The crop is proportional to the raster's own pixel height, so it is
-    /// correct for a raster that is *not* the target size — which is every
-    /// formula, since `math::render_fitted` rasterizes at a fixed em and
-    /// only matches the target's aspect. Sizing the crop off the target
-    /// instead would mis-crop each of those by the difference.
+    /// correct for a raster that is *not* the target size. Every formula used
+    /// to be one, back when `math::render_fitted` rasterized at a fixed em and
+    /// only matched the target's aspect, and sizing the crop off the target
+    /// mis-cropped each by the difference. Both producers now land on the
+    /// target exactly, so the case is no longer *reached* in the product — the
+    /// unit under test is the arithmetic, and it is asserted directly here
+    /// rather than left to depend on that continuing to be true.
     #[test]
     fn test_crop_source_is_proportional_to_the_measured_raster_height() {
         // A 10-row box whose raster is 250 px tall: 25 px per cell row,
