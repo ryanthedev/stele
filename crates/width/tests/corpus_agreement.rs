@@ -9,60 +9,11 @@
 //! being backed by a real measured run rather than hand-authored
 //! expectations.
 
-use std::path::PathBuf;
-
-use serde::Deserialize;
-
 use width::{WidthConfig, WidthEngine};
 
-#[derive(Deserialize)]
-struct MeasuredCase {
-    id: String,
-    category: String,
-    cluster: String,
-    measured_width: u16,
-}
+mod common;
 
-#[derive(Deserialize)]
-struct MeasuredCorpus {
-    ghostty_version: Option<String>,
-    cases: Vec<MeasuredCase>,
-}
-
-/// Locates the single committed `corpus/ghostty-<version>-widths.json`
-/// artifact. Failing loudly (rather than silently skipping) if it's
-/// missing or ambiguous is deliberate: DW-3.1 is a hard requirement, not a
-/// best-effort check.
-fn load_pinned_corpus() -> MeasuredCorpus {
-    let corpus_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("corpus");
-    let mut matches: Vec<PathBuf> = std::fs::read_dir(&corpus_dir)
-        .unwrap_or_else(|e| panic!("failed to read {corpus_dir:?}: {e}"))
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path())
-        .filter(|p| {
-            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            name.starts_with("ghostty-") && name.ends_with("-widths.json")
-        })
-        .collect();
-    matches.sort();
-
-    assert!(
-        !matches.is_empty(),
-        "no committed corpus artifact found in {corpus_dir:?} — run \
-         `cargo test -p width --test live_ghostty_corpus --features corpus-tool -- --ignored` \
-         against a real Ghostty session to produce one"
-    );
-    assert_eq!(
-        matches.len(),
-        1,
-        "expected exactly one pinned corpus artifact, found {matches:?} — commit only the \
-         current Ghostty version's corpus"
-    );
-
-    let bytes = std::fs::read(&matches[0])
-        .unwrap_or_else(|e| panic!("failed to read {:?}: {e}", matches[0]));
-    serde_json::from_slice(&bytes).unwrap_or_else(|e| panic!("failed to parse corpus JSON: {e}"))
-}
+use common::load_pinned_corpus;
 
 #[test]
 fn test_dw_3_1_engine_agrees_with_live_ghostty_over_the_full_corpus() {

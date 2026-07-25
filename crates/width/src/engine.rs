@@ -14,10 +14,24 @@ use crate::correction::corrected_cluster_width;
 /// than something the engine can measure once and assume forever.
 #[derive(Default)]
 pub struct WidthConfig {
-    /// `true` widens ambiguous-class characters to 2 cells; `false` (the
-    /// default measured against this project's reference Ghostty
+    /// `true` asks for the CJK-locale interpretation of the Ambiguous class;
+    /// `false` (the default measured against this project's reference Ghostty
     /// configuration — see `corpus/ghostty-1.3.1-widths.json`) keeps them
     /// at 1.
+    ///
+    /// **It does not reach the whole class**, which is worth knowing before
+    /// relying on it: the widening comes from `unicode-width`'s `width_cjk`
+    /// table, and that table returns 2 for Ambiguous *symbols* and
+    /// box-drawing (`×` U+00D7, `°` U+00B0, `←` U+2190, `─` U+2500) while
+    /// returning 1 for the Ambiguous Greek and Cyrillic **letters** (`α`
+    /// U+03B1, `Ω` U+03A9, `а` U+0430). Verified character by character
+    /// against `unicode-width` 0.2 and pinned by
+    /// `tests/property_display_width.rs`'s
+    /// `test_dw_3_2_hand_computed_string_widths_under_the_cjk_ambiguous_policy`.
+    /// Neither half is measured against a CJK-configured Ghostty — the pinned
+    /// corpus covers the reference configuration only — so this bit is a
+    /// caller-supplied policy in the honest sense: unmeasured, and only as
+    /// good as the table behind it.
     pub ambiguous_wide: bool,
 }
 

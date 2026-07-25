@@ -24,7 +24,8 @@ fn main() {
             .join("testdocs/02-math.md"),
     )
     .unwrap();
-    // The 4095-char formula from the "absurdly long formula" section.
+    // The longest formula, from the "absurdly long formula" section: 3423
+    // characters between the `$$`, not the 4095 that section's prose claims.
     let long = doc
         .lines()
         .find(|l| l.starts_with("$$x + 1 + 1"))
@@ -41,7 +42,7 @@ fn main() {
             "tall cfrac",
             r"\cfrac{1}{1+\cfrac{1}{1+\cfrac{1}{1+\cfrac{1}{1+x}}}}".to_string(),
         ),
-        ("4095-char", long),
+        ("3423-char", long),
     ];
 
     println!(

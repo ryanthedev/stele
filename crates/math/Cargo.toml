@@ -20,3 +20,11 @@ unicode-width = "0.2"
 # `ratex-render`; declared directly here since edition 2024 resolves the
 # extern prelude from direct dependencies only.
 png = "0.18"
+# Test-only: DW-6.2's fixture set is `fixtures/math.md` and
+# `testdocs/02-math.md`, real markdown documents. The real parser decides
+# what is a math span in them (`$5 and $10` in prose deliberately is not),
+# so the test extracts formulas with it rather than with a hand-rolled
+# scanner that would disagree with the shipped product. `ast` is a leaf
+# crate with no dependencies of its own and none on `math`, so this adds no
+# cycle and nothing to the shipped binary.
+ast = { path = "../ast" }

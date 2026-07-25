@@ -936,6 +936,7 @@ dependencies = [
 name = "math"
 version = "0.1.0"
 dependencies = [
+ "ast",
  "png 0.18.1",
  "ratex-layout",
  "ratex-parser",
