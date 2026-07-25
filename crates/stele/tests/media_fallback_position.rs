@@ -1,5 +1,5 @@
-//! WAVE2-SINK: end-to-end position assertions for the media sink's text
-//! fallback rungs and its live-placement cap.
+//! End-to-end **position** assertions for the media sink's text fallback
+//! rungs: alt text, the txm Unicode grid, and the literal TeX source.
 //!
 //! Everything here goes through the real `Painter::frame` -> `GfxMediaSink`
 //! path and asserts on the *bytes on the wire* plus what a terminal would
@@ -8,17 +8,21 @@
 //! right characters, and the painter's already asserted that the sink was
 //! called with the right rect — nobody composed the two and asked what the
 //! row looks like.
+//!
+//! (Was `wave2_sink.rs`: a wave label is a work assignment, not a subject. Its
+//! blockquote case lives in `reserved_column.rs`, which owns "a box inside a
+//! container is placed past the container's prefix" and asserts more of it.)
+
+mod common;
 
 use ast::Document;
 use layout::{LayoutConfig, layout};
 use stele::ImageSizer;
 use stele::media::GfxMediaSink;
 use stele::painter::{Painter, Size};
-use width::{WidthConfig, WidthEngine};
 
-fn engine() -> WidthEngine {
-    WidthEngine::new(WidthConfig::default())
-}
+use common::fixtures::engine;
+use common::render::render_row;
 
 /// Paints `src` at `width` x `height` with both math rungs above the literal
 /// one forced to fail, so the *text* ladder is what reaches the wire.
@@ -38,60 +42,36 @@ fn frame_with_failed_math(src: &str, width: u16, height: u16, txm_fails: bool) -
     String::from_utf8_lossy(&buf).into_owned()
 }
 
-/// Replays a frame's bytes onto a cell grid the way a terminal would: honour
-/// CUP, honour EL(0), otherwise write glyphs left to right. Deliberately the
-/// same model HUNTER-PAINT used to prove the fix before it was written.
-fn render_row(frame: &str, row: u16, width: usize) -> String {
-    let mut grid = vec![' '; width];
-    let mut cur_row: u16 = 1;
-    let mut col: usize = 0;
-    let chars: Vec<char> = frame.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        if chars[i] == '\u{1b}' {
-            // Skip an APC (kitty graphics) payload wholesale: it is not text.
-            if chars.get(i + 1) == Some(&'_') {
-                while i < chars.len() && chars[i] != '\u{9c}' {
-                    if chars[i] == '\u{1b}' && chars.get(i + 1) == Some(&'\\') && i > 0 {
-                        i += 2;
-                        break;
-                    }
-                    i += 1;
-                }
-                continue;
-            }
-            let mut j = i + 2; // skip ESC [
-            while j < chars.len() && !chars[j].is_ascii_alphabetic() {
-                j += 1;
-            }
-            let params: String = chars[i + 2..j].iter().collect();
-            match chars.get(j) {
-                Some('H') => {
-                    let mut it = params.split(';');
-                    cur_row = it.next().and_then(|v| v.parse().ok()).unwrap_or(1);
-                    col = it
-                        .next()
-                        .and_then(|v| v.parse::<usize>().ok())
-                        .unwrap_or(1)
-                        .saturating_sub(1);
-                }
-                Some('K') if cur_row == row => {
-                    for c in grid.iter_mut().skip(col) {
-                        *c = ' ';
-                    }
-                }
-                _ => {}
-            }
-            i = j + 1;
-            continue;
-        }
-        if cur_row == row && col < width {
-            grid[col] = chars[i];
-        }
-        col += 1;
-        i += 1;
-    }
-    grid.into_iter().collect()
+/// The terminal model every assertion below leans on, checked against hand-
+/// written bytes whose rendering is obvious by inspection.
+///
+/// It is here rather than dropped because a silently wrong model would weaken
+/// every row assertion in four test files at once, and because two of the three
+/// cases are the exact byte shapes the inline-fallback defect produced: the
+/// pre-fix frame (no CUP between the blanking run and the text — the fallback
+/// vanishes) and the post-fix frame (a CUP to the box origin — it renders).
+/// The third is the APC skip, without which a frame carrying a real kitty
+/// raster would write its base64 payload into the cell grid as text.
+#[test]
+fn test_the_terminal_model_honours_cup_el_and_skips_apc_payloads() {
+    let no_cup = "\u{1b}[?2026h\u{1b}[1;1H\u{1b}[0mab \u{1b}[0m    x+y\u{1b}[1;8H\u{1b}[0m cd\u{1b}[0m\u{1b}[K\u{1b}[?2026l";
+    assert_eq!(
+        render_row(no_cup, 1, 20),
+        "ab      cd          ",
+        "without a box-origin CUP the fallback is overpainted and invisible"
+    );
+    let with_cup = "\u{1b}[?2026h\u{1b}[1;1H\u{1b}[0mab \u{1b}[0m    \u{1b}[1;4Hx+y\u{1b}[1;8H\u{1b}[0m cd\u{1b}[0m\u{1b}[K\u{1b}[?2026l";
+    assert_eq!(
+        render_row(with_cup, 1, 20),
+        "ab x+y  cd          ",
+        "with the CUP the fallback renders in the box's own cells"
+    );
+    let raster = "\u{1b}[1;1Hab\u{1b}_Ga=T,f=100,i=1;QUJDRA==\u{1b}\\cd";
+    assert_eq!(
+        render_row(raster, 1, 8),
+        "abcd    ",
+        "a graphics payload is not text and must not land in the cell grid"
+    );
 }
 
 /// An INLINE box's text fallback. `paint_inline_box` blanks the box by
@@ -101,7 +81,7 @@ fn render_row(frame: &str, row: u16, width: usize) -> String {
 /// column 8 and painted " cd" straight over it — the fallback rendered
 /// nothing at all.
 #[test]
-fn inline_box_text_fallback_is_cup_ed_to_the_box_origin() {
+fn test_inline_box_text_fallback_is_cup_ed_to_the_box_origin() {
     let frame = frame_with_failed_math("ab $x+y$ cd\n", 40, 1, true);
 
     // The exact bytes: SGR reset, four blanking spaces for the 4-cell box,
@@ -125,7 +105,7 @@ fn inline_box_text_fallback_is_cup_ed_to_the_box_origin() {
 /// correct by accident — the frame loop happens to leave the cursor at
 /// column 1 — so it is asserted explicitly now rather than left to luck.
 #[test]
-fn own_row_box_text_fallback_is_cup_ed_to_the_box_origin() {
+fn test_own_row_box_text_fallback_is_cup_ed_to_the_box_origin() {
     let frame = frame_with_failed_math("before\n\n$$x+y$$\n\nafter\n", 40, 8, true);
 
     let box_row = (1..=8u16)
@@ -144,62 +124,12 @@ fn own_row_box_text_fallback_is_cup_ed_to_the_box_origin() {
     assert_eq!(&render_row(&frame, box_row, 10), "x+y       ");
 }
 
-/// The two halves of the rect seam, composed. WAVE2-LAYOUT made
-/// `paint_reserved` hand the sink the column the container prefix ends at;
-/// WAVE2-SINK made the sink honour whatever column it is handed.
-///
-/// Precisely what each half buys, because it is not symmetric and the
-/// difference is worth recording rather than glossing: without WAVE2-LAYOUT's
-/// half the rect says column 0 and the box paints *across* the gutter bar —
-/// observably wrong. Without this crate's half the fallback still lands in the
-/// right cells here, but only because the prefix run happens to leave the
-/// cursor exactly at the box column. That is luck, and the assertion below is
-/// on the CUP for that reason: the same luck does not hold for an inline box
-/// (the blanking run leaves the cursor a box-width right), and nothing in the
-/// type of `CellRect` says the caller must park the cursor for the sink.
-#[test]
-fn a_blockquoted_box_paints_its_fallback_beside_the_gutter_not_across_it() {
-    let frame = frame_with_failed_math("> quoted\n>\n> $$x+y$$\n", 40, 8, true);
-    let rows: Vec<String> = (1..=8u16).map(|r| render_row(&frame, r, 12)).collect();
-    let box_row = rows
-        .iter()
-        .position(|r| r.contains("x+y"))
-        .unwrap_or_else(|| panic!("the fallback is on no row at all: {rows:?}"));
-
-    // Whatever the gutter glyph is, the box's text starts after it and at the
-    // same column the quoted paragraph's own text does.
-    // Cell columns, not byte offsets: the gutter glyph is a 3-byte `│`.
-    let cell_col = |row: &str, needle: &str| {
-        row.find(needle)
-            .map(|byte_idx| row[..byte_idx].chars().count())
-    };
-    let quoted = rows
-        .iter()
-        .find(|r| r.contains("quoted"))
-        .unwrap_or_else(|| panic!("the quoted paragraph vanished: {rows:?}"));
-    let text_col = cell_col(quoted, "quoted").unwrap();
-    assert!(
-        text_col > 0,
-        "this test needs a real gutter prefix to be meaningful: {quoted:?}"
-    );
-    assert_eq!(
-        cell_col(&rows[box_row], "x+y"),
-        Some(text_col),
-        "the fallback must start at the blockquote's content column ({text_col}), \
-         not at column 0 across the gutter: {rows:?}"
-    );
-    assert!(
-        frame.contains(&format!("\u{1b}[{};{}Hx+y", box_row + 1, text_col + 1)),
-        "and it must be a CUP to that column that puts it there: {frame:?}"
-    );
-}
-
 /// The txm Unicode-grid rung, the middle of the three text rungs: it is
 /// multi-row, so every one of its rows has to re-home to the box column.
 /// Row *k* of the box must show row *k* of the grid, starting at the box's
 /// own column — not staggered after wherever the previous row ended.
 #[test]
-fn txm_grid_rung_renders_every_row_inside_the_box() {
+fn test_txm_grid_rung_renders_every_row_inside_the_box() {
     const TEX: &str = r"\sum_{i=0}^{n} x_i";
     let grid = math::render_text(TEX).expect("txm must render a sum");
     assert!(grid.rows.len() >= 3, "this test needs a tall grid");
@@ -240,7 +170,7 @@ fn txm_grid_rung_renders_every_row_inside_the_box() {
 /// does. A file that fails the *header* probe never reserves a box at all
 /// and so never reaches the sink — that path would make this test vacuous.
 #[test]
-fn inline_image_alt_text_lands_in_the_box() {
+fn test_inline_image_alt_text_lands_in_the_box() {
     let img_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdocs/img");
     let doc = Document::parse("hi ![ALT](small.png) there\n");
     let sizer = ImageSizer::new(&img_dir);

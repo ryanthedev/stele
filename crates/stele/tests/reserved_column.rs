@@ -11,59 +11,37 @@
 //! whose width is just `cols`, and true whether that box is drawn beside its
 //! gutter or straight across it. A bound cannot see a column.
 
-use std::io::Write as _;
-use std::path::{Path, PathBuf};
+mod common;
 
 use layout::{LayoutConfig, layout};
 use stele::media::GfxMediaSink;
 use stele::{ImageSizer, Painter, Size};
-use width::{WidthConfig, WidthEngine};
+
+use common::fixtures::{engine, scratch_dir, write_png};
+use common::render::render_row;
 
 const VIEWPORT: Size = Size {
     width: 60,
     height: 12,
 };
 
-fn scratch_dir(tag: &str) -> PathBuf {
-    let mut p = std::env::temp_dir();
-    p.push(format!(
-        "stele-reserved-column-{tag}-{}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&p).unwrap();
-    p
-}
-
-/// A 48x96 pixel PNG: 2 cells wide, 2 cells tall at the sink's assumed 24x48
-/// cell geometry — small enough to sit well inside every container tested
-/// here, so `cols` can never be mistaken for the container's own width.
-fn write_png(dir: &Path, name: &str) {
-    let img = image::RgbaImage::from_pixel(48, 96, image::Rgba([7, 8, 9, 255]));
-    let mut bytes = Vec::new();
-    image::DynamicImage::ImageRgba8(img)
-        .write_to(
-            &mut std::io::Cursor::new(&mut bytes),
-            image::ImageFormat::Png,
-        )
-        .unwrap();
-    std::fs::File::create(dir.join(name))
-        .unwrap()
-        .write_all(&bytes)
-        .unwrap();
-}
+/// The fixture image is 48x96 px: 2 cells wide, 2 cells tall at the sink's
+/// assumed 24x48 cell geometry — small enough to sit well inside every
+/// container tested here, so `cols` can never be mistaken for the container's
+/// own width.
+const PNG_PX: (u32, u32) = (48, 96);
 
 fn frame_of(tag: &str, src: &str) -> String {
-    let dir = scratch_dir(tag);
-    write_png(&dir, "t.png");
+    let dir = scratch_dir(&format!("reserved-column-{tag}"));
+    write_png(&dir, "t.png", PNG_PX.0, PNG_PX.1);
     let doc = ast::Document::parse(src);
-    let engine = WidthEngine::new(WidthConfig::default());
     let config = LayoutConfig {
         min_width: 24,
         max_width: VIEWPORT.width,
     };
     let sizer = ImageSizer::new(&dir);
-    let tree = layout(&doc, VIEWPORT.width, &config, &engine, &sizer);
-    let mut painter = Painter::new(WidthEngine::new(WidthConfig::default()));
+    let tree = layout(&doc, VIEWPORT.width, &config, &engine(), &sizer);
+    let mut painter = Painter::new(engine());
     painter.register_media(Box::new(GfxMediaSink::new(doc, &dir)));
     let mut buf = Vec::new();
     painter.frame(&tree, 0, VIEWPORT, &mut buf).expect("paint");
@@ -194,23 +172,33 @@ fn test_top_level_box_still_starts_at_column_one() {
 /// what a reader actually sees when both are in: a formula that degrades to its
 /// literal TeX inside a blockquote renders *beside* the gutter bar.
 ///
-/// Neither half alone gets this right — the graphics rung positions absolutely
-/// and would have hidden the sink's half, and the text rung would have been
-/// handed a correct rect it ignored.
+/// Precisely what each half buys, because it is not symmetric and the
+/// difference is worth recording rather than glossing: without the layout half
+/// the rect says column 0 and the box paints *across* the gutter bar —
+/// observably wrong. Without the sink's half the fallback still lands in the
+/// right cells here, but only because the prefix run happens to leave the
+/// cursor exactly at the box column. That is luck, and it is why the CUP is
+/// asserted rather than only the rendering: the same luck does not hold for an
+/// inline box (whose blanking run leaves the cursor a box-width right — see
+/// `media_fallback_position.rs`), and nothing in the type of `CellRect` says
+/// the caller must park the cursor for the sink.
+///
+/// Three oracles, deliberately: the CUP on the wire, the glyphs the painter put
+/// ahead of it, and the row a terminal would actually show — the last one is
+/// what catches a gutter bar that is painted and then overwritten.
 #[test]
 fn test_text_fallback_inside_a_blockquote_lands_past_the_gutter() {
     let doc = ast::Document::parse("> before\n>\n> $$x+y$$\n");
-    let engine = WidthEngine::new(WidthConfig::default());
     let config = LayoutConfig {
         min_width: 24,
         max_width: VIEWPORT.width,
     };
     let sizer = ImageSizer::new(".");
-    let tree = layout(&doc, VIEWPORT.width, &config, &engine, &sizer);
+    let tree = layout(&doc, VIEWPORT.width, &config, &engine(), &sizer);
     let mut sink = GfxMediaSink::new(doc, ".");
     sink.force_ratex_failure_for_test(true);
     sink.force_txm_failure_for_test(true);
-    let mut painter = Painter::new(WidthEngine::new(WidthConfig::default()));
+    let mut painter = Painter::new(engine());
     painter.register_media(Box::new(sink));
     let mut buf = Vec::new();
     painter.frame(&tree, 0, VIEWPORT, &mut buf).expect("paint");
@@ -224,5 +212,32 @@ fn test_text_fallback_inside_a_blockquote_lands_past_the_gutter() {
         glyphs_before_the_box(&frame, 3),
         "\u{2502} ",
         "and the gutter bar is still there: {frame:?}"
+    );
+
+    // What the reader sees, and stated relative to the quoted paragraph rather
+    // than to the literal column 3: the fallback starts at the same cell column
+    // the blockquote's own text does. Cell columns, not byte offsets — the
+    // gutter glyph is a 3-byte `│`.
+    let rows: Vec<String> = (1..=VIEWPORT.height)
+        .map(|r| render_row(&frame, r, 12))
+        .collect();
+    let cell_col = |row: &str, needle: &str| {
+        row.find(needle)
+            .map(|byte_idx| row[..byte_idx].chars().count())
+    };
+    let quoted = rows
+        .iter()
+        .find(|r| r.contains("before"))
+        .unwrap_or_else(|| panic!("the quoted paragraph vanished: {rows:?}"));
+    let text_col = cell_col(quoted, "before").unwrap();
+    assert!(
+        text_col > 0,
+        "this assertion needs a real gutter prefix to mean anything: {quoted:?}"
+    );
+    assert_eq!(
+        cell_col(&rows[2], "x+y"),
+        Some(text_col),
+        "the fallback must render at the blockquote's content column ({text_col}), \
+         not at column 0 across the gutter: {rows:?}"
     );
 }

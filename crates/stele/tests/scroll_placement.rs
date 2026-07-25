@@ -11,13 +11,13 @@
 //! height, painting the image down over the document text below it. A count
 //! and a balance cannot see that. A row number and a `r=` can.
 
-use std::io::Write as _;
-use std::path::{Path, PathBuf};
+mod common;
 
 use layout::{LayoutConfig, Line, layout};
 use stele::media::GfxMediaSink;
 use stele::{ImageSizer, Painter, Size};
-use width::{WidthConfig, WidthEngine};
+
+use common::fixtures::{engine, scratch_dir, write_png};
 
 /// The sink's assumed cell geometry (`GfxMediaSink::cell_px`), which both
 /// the raster target and — because `ImageSizer` assumes the same — the box's
@@ -30,35 +30,6 @@ const VIEWPORT: Size = Size {
     height: 10,
 };
 
-fn scratch_dir(tag: &str) -> PathBuf {
-    let mut p = std::env::temp_dir();
-    p.push(format!(
-        "stele-scroll-placement-{tag}-{}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&p).unwrap();
-    p
-}
-
-/// Writes a `w`x`h` pixel PNG so the box's cell extent is exactly
-/// `(w / 24, h / 48)`.
-fn write_png(dir: &Path, name: &str, w: u32, h: u32) {
-    let img = image::RgbaImage::from_pixel(w, h, image::Rgba([7, 8, 9, 255]));
-    let mut bytes = Vec::new();
-    image::DynamicImage::ImageRgba8(img)
-        .write_to(
-            &mut std::io::Cursor::new(&mut bytes),
-            image::ImageFormat::Png,
-        )
-        .unwrap();
-    std::fs::File::create(dir.join(name))
-        .unwrap()
-        .write_all(&bytes)
-        .unwrap();
-}
-
-/// The full `a=p` put command in `frame`, and the row the cursor was moved
-/// to immediately before it (0-indexed, as `CellRect::y`).
 /// The first image id this process's sink will allocate.
 ///
 /// Not the literal `1`: an id carries a pid-derived instance tag so a second
@@ -69,6 +40,8 @@ fn first_id() -> u32 {
     gfx::IdAllocator::for_this_process().allocate().get()
 }
 
+/// The full `a=p` put command in `frame`, and the row the cursor was moved
+/// to immediately before it (0-indexed, as `CellRect::y`).
 fn put_and_row(frame: &str) -> Option<(String, u16)> {
     assert!(
         frame.matches("\x1b_Ga=p").count() <= 1,
@@ -94,19 +67,18 @@ struct Fixture {
 }
 
 fn fixture(tag: &str, png_px: (u32, u32)) -> Fixture {
-    let dir = scratch_dir(tag);
+    let dir = scratch_dir(&format!("scroll-placement-{tag}"));
     write_png(&dir, "tall.png", png_px.0, png_px.1);
     // Text on both sides of the box: the defect this guards painted the
     // image over the trailing lines, so they have to exist.
     let src = "lead one\n\nlead two\n\n![tall](tall.png)\n\ntail one\n\ntail two\n\ntail three\n";
     let doc = ast::Document::parse(src);
-    let engine = WidthEngine::new(WidthConfig::default());
     let config = LayoutConfig {
         min_width: 24,
         max_width: VIEWPORT.width,
     };
     let sizer = ImageSizer::new(&dir);
-    let tree = layout(&doc, VIEWPORT.width, &config, &engine, &sizer);
+    let tree = layout(&doc, VIEWPORT.width, &config, &engine(), &sizer);
 
     let mut first = None;
     let mut rows = 0;
@@ -118,7 +90,7 @@ fn fixture(tag: &str, png_px: (u32, u32)) -> Fixture {
             cols = r.boxed.cols;
         }
     }
-    let mut painter = Painter::new(WidthEngine::new(WidthConfig::default()));
+    let mut painter = Painter::new(engine());
     painter.register_media(Box::new(GfxMediaSink::new(doc, &dir)));
     Fixture {
         painter,
