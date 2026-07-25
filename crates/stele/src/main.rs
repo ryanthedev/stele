@@ -21,7 +21,7 @@ use stele::decor::themed::ThemedDecor;
 use stele::loader;
 use stele::media::{GfxMediaSink, ImageSizer, NoopMediaSink};
 use stele::painter::{Painter, Size};
-use stele::terminal::{TerminalGuard, install_panic_hook};
+use stele::terminal::{CellQuery, TerminalGuard, install_panic_hook};
 
 /// How long a resize burst is drained for before committing to one
 /// relayout — long enough to coalesce a storm of SIGWINCH-driven `Resize`
@@ -67,11 +67,6 @@ fn main() -> ExitCode {
     // guarantee behind DW-6.4.
     let is_ghostty = std::env::var("TERM_PROGRAM").is_ok_and(|t| t == "ghostty");
     let graphics_disabled = cli.no_images || std::env::var_os("TMUX").is_some() || !is_ghostty;
-    let sizer: Box<dyn layout::IntrinsicSizer> = if graphics_disabled {
-        Box::new(ImageSizer::disabled(&base_dir))
-    } else {
-        Box::new(ImageSizer::new(&base_dir))
-    };
 
     let config = LayoutConfig {
         min_width: 24,
@@ -91,12 +86,35 @@ fn main() -> ExitCode {
     };
 
     install_panic_hook();
-    let guard = match TerminalGuard::enter() {
+    // The guard asks the terminal how big a cell is on its way in — after raw
+    // mode (the reply has no newline) and before the alternate-screen switch
+    // (so the wait cannot be mistaken for "the first frame is done"). Skipped
+    // when graphics are off: nothing would consume the answer.
+    let cell_query = if graphics_disabled {
+        CellQuery::Skip
+    } else {
+        CellQuery::Ask
+    };
+    let guard = match TerminalGuard::enter(cell_query) {
         Ok(guard) => guard,
         Err(err) => {
             eprintln!("stele: could not enter raw mode: {err}");
             return ExitCode::FAILURE;
         }
+    };
+
+    // The geometry the guard resolved on its way in feeds two stages that use
+    // it for different things, and both want the same number. `ImageSizer`
+    // divides a probed pixel size by it to decide how many *cells* a box
+    // occupies — the box's aspect ratio, which is what the reader sees.
+    // `GfxMediaSink` multiplies a cell count by it to decide how many *pixels*
+    // to rasterize into — resolution only.
+    let geometry = guard.cell_geometry();
+
+    let sizer: Box<dyn layout::IntrinsicSizer> = if graphics_disabled {
+        Box::new(ImageSizer::disabled(&base_dir))
+    } else {
+        Box::new(ImageSizer::new(&base_dir).with_cell_px(geometry.cell_px))
     };
 
     let ctx = LayoutContext {
@@ -114,7 +132,9 @@ fn main() -> ExitCode {
     } else {
         // The sink keeps its own copy of the document: it resolves image
         // paths and math sources by `NodeId` at paint time.
-        painter.register_media(Box::new(GfxMediaSink::new(doc.clone(), &base_dir)));
+        painter.register_media(Box::new(
+            GfxMediaSink::new(doc.clone(), &base_dir).with_cell_px(geometry.cell_px),
+        ));
     }
     // The themed decor provides real syntax highlighting and theme colors.
     // Background is not OSC 11-probed here (that needs a pre-alt-screen query

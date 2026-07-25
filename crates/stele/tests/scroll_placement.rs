@@ -19,11 +19,18 @@ use stele::{ImageSizer, Painter, Size};
 
 use common::fixtures::{engine, scratch_dir, write_png};
 
-/// The sink's assumed cell geometry (`GfxMediaSink::cell_px`), which both
-/// the raster target and — because `ImageSizer` assumes the same — the box's
-/// cell extent derive from. Fixing it here is what makes the expected source
-/// rectangle exact rather than approximate.
-const CELL_PX: (u32, u32) = (24, 48);
+/// The cell geometry both stages here run on: the raster target
+/// (`GfxMediaSink::cell_px`) and the box's cell extent (`ImageSizer`'s
+/// divisor). Fixing it is what makes the expected source rectangle exact
+/// rather than approximate.
+///
+/// In a real session both come from `terminal::query_cell_px`, which asks the
+/// terminal (`CSI 16t`), then the kernel (`TIOCGWINSZ`), then falls back to
+/// `terminal::FALLBACK_CELL_PX`. There is no terminal on the other end of a
+/// test process, so both stages sit on that fallback — which is exactly this
+/// constant, and deliberately so: it is why every byte asserted in this file
+/// is unchanged by the query being wired.
+const CELL_PX: (u32, u32) = stele::terminal::FALLBACK_CELL_PX;
 
 const VIEWPORT: Size = Size {
     width: 60,

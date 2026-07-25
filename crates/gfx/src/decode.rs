@@ -370,6 +370,102 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// DW-6.3's *"memory stays under cap"*, half one: the **allocation** cap is
+    /// enforced, and it is enforced independently of the dimension cap.
+    ///
+    /// Every other DW-6.3 fixture trips `max_dim`, so before this test
+    /// `max_alloc` had never been the thing that refused an input — the check
+    /// could have been deleted with the suite still green. Here both dimensions
+    /// pass `max_dim` comfortably (100 < 8192) and only the RGBA8 byte size
+    /// (100·100·4 = 40 000) exceeds the budget, so the only line that can
+    /// reject this file is `Limits::accepts`'s `bytes <= self.max_alloc`.
+    ///
+    /// Asserted on both entry points: the layout-time probe and the paint-time
+    /// full decode. The probe is the one that matters most — it is what runs on
+    /// a document being opened, before anything has been allocated.
+    #[test]
+    fn test_dw_6_3_allocation_cap_rejects_an_image_the_dimension_cap_admits() {
+        let img = image::RgbaImage::from_pixel(100, 100, image::Rgba([9, 9, 9, 255]));
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let path = write_file("alloc-cap", &png);
+
+        let tight_alloc = Limits {
+            max_dim: 8_192,
+            max_alloc: 20_000,
+        };
+        assert!(
+            100 <= tight_alloc.max_dim,
+            "the fixture must pass the dimension cap, or this tests max_dim again"
+        );
+        let probed = probe_dimensions(&path, tight_alloc);
+        assert!(
+            matches!(
+                probed,
+                Err(DecodeError::ExceedsLimits {
+                    width: 100,
+                    height: 100
+                })
+            ),
+            "the allocation cap must reject a 100x100 RGBA8 image against a \
+             20 000-byte budget, reporting the real dimensions; got {probed:?}"
+        );
+        let decoded = decode_and_scale(&path, (24, 48), tight_alloc);
+        assert!(
+            matches!(decoded, Err(DecodeError::ExceedsLimits { .. })),
+            "the full decode must reject it too; got {decoded:?}"
+        );
+
+        // The same file, the same dimension cap, a budget one byte over what it
+        // needs: accepted. Without this the test would also pass if `accepts`
+        // rejected everything.
+        let ample = Limits {
+            max_dim: 8_192,
+            max_alloc: 100 * 100 * 4,
+        };
+        assert_eq!(probe_dimensions(&path, ample).unwrap(), (100, 100));
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// DW-6.3's *"memory stays under cap"*, half two — and the half that is
+    /// actually about memory rather than about one fixture.
+    ///
+    /// `Limits` has two caps and only one of them bounds a decode's peak
+    /// allocation. The bound that matters is the *conjunction*: no input the
+    /// dimension cap admits may be able to exceed the allocation cap. At the
+    /// shipped defaults that holds exactly — 8192·8192·4 = 268 435 456 =
+    /// 256 MiB = `max_alloc` — which is why no default-limits fixture can ever
+    /// exercise `max_alloc`, and why the assertion above has to tighten it by
+    /// hand.
+    ///
+    /// This is the assertion that fails if `max_dim` is ever raised on its own.
+    /// Doubling it to 16 384 admits a 1 GiB decode against an unchanged 256 MiB
+    /// budget, and nothing else in the suite would notice: every existing test
+    /// would still pass, and the cap would silently stop capping.
+    #[test]
+    fn test_dw_6_3_no_input_the_dimension_cap_admits_can_exceed_the_allocation_cap() {
+        let limits = Limits::default();
+        let worst_case_bytes = u64::from(limits.max_dim) * u64::from(limits.max_dim) * 4;
+        assert!(
+            worst_case_bytes <= limits.max_alloc,
+            "the largest image `max_dim` ({}) admits decodes to {worst_case_bytes} \
+             bytes of RGBA8, which exceeds `max_alloc` ({}). Raise `max_alloc` \
+             alongside `max_dim`, or the allocation cap is no longer a cap.",
+            limits.max_dim,
+            limits.max_alloc
+        );
+        // And the pair is tight, not merely satisfied by a wildly slack
+        // `max_alloc` — the two caps are meant to describe the same ceiling
+        // from two directions.
+        assert!(
+            worst_case_bytes * 2 > limits.max_alloc,
+            "`max_alloc` is more than twice the worst case `max_dim` admits, so \
+             it is documenting a ceiling nothing can reach"
+        );
+    }
+
     #[test]
     fn test_missing_file_rejected_cleanly() {
         let result = probe_dimensions(std::path::Path::new("/no/such/file.png"), Limits::default());

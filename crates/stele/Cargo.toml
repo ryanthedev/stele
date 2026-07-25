@@ -32,6 +32,21 @@ clap = { version = "4", features = ["derive"] }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# A bounded `poll(2)` on stdin, for the startup `CSI 16t` cell-geometry query
+# (`terminal::query_cell_px`). Already compiled into the binary — crossterm
+# 0.29 depends on it for termios — and its API is *safe*, so asking the
+# terminal a question adds no `unsafe` to this crate. That matters: the crate
+# lint is `deny(unsafe_code)` with exactly one audited escape hatch
+# (`terminal::signals`), asserted by `tests/hardening.rs`, and a hand-written
+# `libc::poll` here would have had to widen it.
+rustix = { version = "1", features = ["event"] }
+
 [dev-dependencies]
 # Test-only: building synthetic PNG fixtures for media-module tests.
 image = { version = "0.25", default-features = false, features = ["png"] }
+
+# Test-only: decoding a transmitted raster back off the wire. DW-6.5's claim
+# is about the raster's *pixel* size changing while its *cell* box does not,
+# and the only honest place to read the pixel size is the `a=t` payload the
+# terminal would receive.
+base64 = "0.22"

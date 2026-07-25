@@ -3,8 +3,10 @@
 //! (installed by [`install_panic_hook`]) *and* on a fatal signal — a leaked
 //! raw-mode/alt-screen terminal is a hard failure (DW-5.1).
 
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
+use std::os::fd::AsFd as _;
 use std::panic;
+use std::time::{Duration, Instant};
 
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 
@@ -30,6 +32,302 @@ const RESTORE_SEQUENCE: &[u8] = b"\x1b[?2026l\x1b[?25h\x1b[?1049l";
 /// shows it again on the way out.
 const ENTER_SEQUENCE: &[u8] = b"\x1b[?1049h\x1b[?25l";
 
+/// Cell geometry to use when the terminal will not say: `(width_px,
+/// height_px)`.
+///
+/// It is the value `docs/spikes/ghostty-caps.md` item 7 measured on the
+/// reference install (Ghostty 1.3.1, Darwin arm64) — so it is a real
+/// measurement of *one* machine, not a universal truth. Anything that reads
+/// this instead of [`CellGeometry::cell_px`] from a live answer is running on
+/// a guess, which is why [`CellGeometry`] carries its [`CellPxSource`]:
+/// "queried" and "assumed" must not look the same to a reader.
+///
+/// **Which way the fallback errs, and why that is the safer way.** Every
+/// consumer multiplies a cell count by these numbers to get a *pixel* target
+/// ([`crate::media::GfxMediaSink`]'s raster size) or divides a pixel count by
+/// them to get a *cell* count (`ImageSizer::px_to_cells`). Claiming cells are
+/// bigger than they are therefore oversizes every raster — more bytes
+/// base64-encoded, transmitted inside a 1000 ms synchronized-update budget,
+/// and stored against the terminal's 320 MB image quota — while claiming they
+/// are smaller only costs resolution the terminal then scales up. 24×48 is at
+/// the small end of plausible for a modern hidpi terminal (a 2x-scaled 12×24
+/// logical cell), so it errs toward *under*-sizing on the machines where it is
+/// wrong. That is deliberate.
+pub const FALLBACK_CELL_PX: (u32, u32) = (24, 48);
+
+/// Where a [`CellGeometry`] came from. Ordered best-first, and that order is
+/// the ladder [`query_cell_px`] walks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CellPxSource {
+    /// `CSI 16t` — the terminal answered with its own per-cell pixel size.
+    /// The spike's primary source: exact, and cross-checked there against
+    /// `CSI 14t` ÷ (rows, cols) to the pixel.
+    Csi16t,
+    /// `TIOCGWINSZ`'s `ws_xpixel`/`ws_ypixel` divided by the grid size, via
+    /// `crossterm::terminal::window_size`. A local ioctl, no round trip, but
+    /// the spike measured its pixel fields ~0.5–1.6% *high* — it reports the
+    /// whole window including padding/chrome, not the character grid. The
+    /// division truncates, which pulls that bias back down rather than
+    /// compounding it.
+    WindowSize,
+    /// Nobody answered: [`FALLBACK_CELL_PX`].
+    Fallback,
+}
+
+/// A cell size and the provenance of the number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CellGeometry {
+    pub cell_px: (u32, u32),
+    pub source: CellPxSource,
+}
+
+impl CellGeometry {
+    /// The fallback, labelled as such.
+    pub const fn assumed() -> Self {
+        CellGeometry {
+            cell_px: FALLBACK_CELL_PX,
+            source: CellPxSource::Fallback,
+        }
+    }
+}
+
+/// XTWINOPS "report cell size in pixels". `docs/spikes/ghostty-caps.md` item
+/// 7 measured live Ghostty answering this with `CSI 6 ; 48 ; 24 t`, and
+/// measured `OSC 1337 ReportCellSize` — iTerm2's mechanism — going unanswered,
+/// which is why that one is not attempted here.
+const CELL_SIZE_QUERY: &[u8] = b"\x1b[16t";
+
+/// How long [`query_cell_px`] waits for the `CSI 16t` reply before giving up
+/// and dropping to the next rung.
+///
+/// This is a round trip on the same descriptor crossterm is about to read key
+/// events from, so the deadline is not just a liveness guard — it decides who
+/// owns the reply bytes. Everything that arrives before it is consumed here;
+/// anything that arrives after it lands in crossterm's input stream, where a
+/// `CSI 6;48;24t` is not a key sequence crossterm parses. The budget is
+/// therefore deliberately generous relative to the ~ms a local terminal needs
+/// (the spike's own probe used 500 ms per query and never timed out against a
+/// live Ghostty), and it is paid in full exactly once, at startup, only when
+/// graphics are enabled at all. A terminal that answers *later* than this is
+/// the one residual hazard and it cannot be designed away — any timeout has
+/// the same tail.
+const CELL_SIZE_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Bounds on a cell size this code will believe. A terminal answering `1;1`
+/// (or a garbled reply parsed into something enormous) is worse than no
+/// answer: the low end makes `px_to_cells` reserve a box hundreds of cells
+/// tall for an ordinary badge, and the high end oversizes every raster, which
+/// is the direction [`FALLBACK_CELL_PX`] explains we must not err in. Real
+/// cells run roughly 4×8 (tiny bitmap fonts) to 60×140 (a large font at 3x
+/// scaling); the range below is wider than that on both sides, so it rejects
+/// only nonsense.
+const MIN_PLAUSIBLE_CELL_PX: u32 = 2;
+const MAX_PLAUSIBLE_CELL_PX: u32 = 256;
+
+/// Whether [`TerminalGuard::enter`] interrogates the terminal for its cell
+/// geometry on the way in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CellQuery {
+    /// Ask. One round trip, bounded by [`CELL_SIZE_TIMEOUT`].
+    Ask,
+    /// Don't: use [`FALLBACK_CELL_PX`] and put no query bytes on the wire.
+    /// What the orchestrator passes when graphics are off — nothing would
+    /// consume the answer, and under a multiplexer the query would only add
+    /// bytes to a wire that will not answer it.
+    Skip,
+}
+
+/// Resolves the terminal's cell size once, at startup, walking
+/// [`CellPxSource`]'s ladder: ask the terminal (`CSI 16t`), else ask the
+/// kernel (`TIOCGWINSZ`), else assume [`FALLBACK_CELL_PX`].
+///
+/// Called from [`TerminalGuard::enter`] rather than by the orchestrator
+/// directly, and the position in that sequence is load-bearing in both
+/// directions. It has to be **after** `enable_raw_mode` — the reply has no
+/// newline in it, so a canonical-mode `read` would never return it — and
+/// before `crossterm::event` is first polled, or the event parser gets the
+/// reply instead of us.
+///
+/// It also has to be **before** the alternate-screen write, which is a
+/// subtler constraint discovered by breaking it. The query is a quiet
+/// interval: bytes out, then up to [`CELL_SIZE_TIMEOUT`] of nothing while a
+/// non-answering terminal is waited on. Doing it after `ENTER_SEQUENCE` puts
+/// that silence *between* the alt-screen switch and the first frame, so
+/// anything watching the wire — `tests/common/pty.rs`'s `drain_quiet`, or a
+/// human — reads the pause as "startup finished" while the first frame has
+/// not been painted yet. Querying first makes "the alt-screen sequence is on
+/// the wire" mean "the terminal interrogation is over", and costs the 250 ms
+/// while the user is still looking at their shell rather than at a cleared
+/// blank screen.
+///
+/// Never blocks longer than [`CELL_SIZE_TIMEOUT`], never panics, and writes
+/// nothing at all unless both stdin and stdout are terminals (a redirected
+/// stdout must not get an escape sequence spat into it).
+pub fn query_cell_px() -> CellGeometry {
+    if let Some(cell_px) = query_csi_16t() {
+        return CellGeometry {
+            cell_px,
+            source: CellPxSource::Csi16t,
+        };
+    }
+    if let Some(cell_px) = cell_px_from_window_size() {
+        return CellGeometry {
+            cell_px,
+            source: CellPxSource::WindowSize,
+        };
+    }
+    CellGeometry::assumed()
+}
+
+fn query_csi_16t() -> Option<(u32, u32)> {
+    let stdin = io::stdin();
+    let mut stdout = io::stdout();
+    if !stdin.is_terminal() || !stdout.is_terminal() {
+        return None;
+    }
+    csi_16t_over(stdin.as_fd(), &mut stdout, CELL_SIZE_TIMEOUT)
+}
+
+/// The `CSI 16t` round trip itself, over an explicit descriptor pair: write the
+/// query to `out`, then read `fd_in` until a cell-size report parses or
+/// `timeout` elapses.
+///
+/// Split out from [`query_csi_16t`] so it can be driven against a *fake*
+/// terminal — a pty pair with a scripted reply — rather than only against the
+/// process's own stdio, which no test process has. Without this seam the only
+/// falsifiable part of the query would be [`parse_cell_size_reply`], and
+/// "the bytes go out, the reply comes back, and the answer is believed" would
+/// be an argument rather than an assertion. See
+/// `tests/cell_geometry_query.rs`.
+#[doc(hidden)]
+pub fn csi_16t_over(
+    fd_in: std::os::fd::BorrowedFd<'_>,
+    out: &mut dyn Write,
+    timeout: Duration,
+) -> Option<(u32, u32)> {
+    out.write_all(CELL_SIZE_QUERY).ok()?;
+    out.flush().ok()?;
+
+    let deadline = Instant::now() + timeout;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 256];
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        if !readable(&fd_in, remaining) {
+            return None;
+        }
+        match rustix::io::read(fd_in, &mut chunk[..]) {
+            Ok(0) | Err(_) => return None,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
+        // Parse after every read rather than waiting for a quiet window: the
+        // reply is short and self-terminating (`t`), so there is nothing to
+        // gain by waiting once it has arrived, and every millisecond spent
+        // waiting is a millisecond of the user's startup.
+        if let Some(cell_px) = parse_cell_size_reply(&buf) {
+            return plausible(cell_px);
+        }
+        // Something arrived and it was not a cell-size report — other terminal
+        // chatter, or the user leaning on a key. Keep reading until the
+        // deadline; bailing here would strand the real reply in crossterm's
+        // input stream.
+        if buf.len() > 4096 {
+            return None;
+        }
+    }
+}
+
+/// `poll(2)` for readability on `fd`, bounded by `timeout`.
+///
+/// `rustix`'s wrapper rather than a hand-written `libc::poll`: the crate is
+/// already linked in (crossterm 0.29 uses it for termios) and its API is
+/// safe, so asking the terminal a question costs this crate no new `unsafe`
+/// surface — `terminal::signals` stays the only one, which is what
+/// `tests/hardening.rs` asserts.
+fn readable(fd: &impl std::os::fd::AsFd, timeout: Duration) -> bool {
+    use rustix::event::{PollFd, PollFlags, Timespec};
+    let Ok(spec) = Timespec::try_from(timeout) else {
+        return false;
+    };
+    let mut fds = [PollFd::new(fd, PollFlags::IN)];
+    match rustix::event::poll(&mut fds, Some(&spec)) {
+        Ok(0) | Err(_) => false,
+        Ok(_) => fds[0].revents().contains(PollFlags::IN),
+    }
+}
+
+/// Parses an XTWINOPS cell-size report, `CSI 6 ; height ; width t`, into
+/// `(width_px, height_px)`.
+///
+/// Note the argument order: the wire form is **height first**, and swapping
+/// them yields a plausible-looking pair that mis-sizes every raster by the
+/// cell's aspect ratio. Scans for the report rather than assuming it is the
+/// only thing in `bytes` — an unrelated reply, or a keystroke the user typed
+/// during startup, can share the buffer.
+fn parse_cell_size_reply(bytes: &[u8]) -> Option<(u32, u32)> {
+    let text = String::from_utf8_lossy(bytes);
+    for start in text.match_indices("\x1b[").map(|(i, _)| i) {
+        let rest = &text[start + 2..];
+        let Some(end) = rest.find('t') else {
+            continue;
+        };
+        let mut parts = rest[..end].split(';');
+        // `6` is XTWINOPS's "this is a cell-size report" discriminator. `4`
+        // (window size) and `6`'s sibling `8` (text area in cells) use the
+        // same `t` terminator, so the discriminator is what makes this parse
+        // a cell size rather than whatever else answered.
+        if parts.next() != Some("6") {
+            continue;
+        }
+        let (Some(height), Some(width)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        if parts.next().is_some() {
+            continue;
+        }
+        if let (Ok(height), Ok(width)) = (height.parse::<u32>(), width.parse::<u32>()) {
+            return Some((width, height));
+        }
+    }
+    None
+}
+
+/// `TIOCGWINSZ`'s pixel fields divided by the grid size, or `None` when the
+/// terminal (or multiplexer) reports zeros — which is the common case, and the
+/// one that would divide by zero if taken at face value.
+fn cell_px_from_window_size() -> Option<(u32, u32)> {
+    let size = crossterm::terminal::window_size().ok()?;
+    cell_px_from_window_size_parts(size.columns, size.rows, size.width, size.height)
+}
+
+fn cell_px_from_window_size_parts(
+    columns: u16,
+    rows: u16,
+    width_px: u16,
+    height_px: u16,
+) -> Option<(u32, u32)> {
+    if columns == 0 || rows == 0 || width_px == 0 || height_px == 0 {
+        return None;
+    }
+    plausible((
+        u32::from(width_px) / u32::from(columns),
+        u32::from(height_px) / u32::from(rows),
+    ))
+}
+
+/// `Some` only for a cell size inside [`MIN_PLAUSIBLE_CELL_PX`] ..=
+/// [`MAX_PLAUSIBLE_CELL_PX`] on both axes. Rejecting outright, rather than
+/// clamping, is deliberate: a clamped answer would be recorded as
+/// [`CellPxSource::Csi16t`] — "the terminal told us" — when it is really
+/// half the terminal's answer and half a constant.
+fn plausible(cell_px: (u32, u32)) -> Option<(u32, u32)> {
+    let sane = |v: u32| (MIN_PLAUSIBLE_CELL_PX..=MAX_PLAUSIBLE_CELL_PX).contains(&v);
+    (sane(cell_px.0) && sane(cell_px.1)).then_some(cell_px)
+}
+
 /// RAII guard: raw mode + the alternate screen are active for as long as
 /// one of these is alive. Restores on drop, including during panic
 /// unwinding.
@@ -37,11 +335,15 @@ pub struct TerminalGuard {
     writer: Box<dyn Write + Send>,
     manage_os_state: bool,
     restored: bool,
+    cell_geometry: CellGeometry,
 }
 
 impl TerminalGuard {
-    /// Enters raw mode and the alternate screen against the real terminal.
-    pub fn enter() -> io::Result<Self> {
+    /// Enters raw mode and the alternate screen against the real terminal,
+    /// resolving the terminal's cell geometry on the way in when `query` asks
+    /// for it (see [`query_cell_px`] for why that happens here and not in the
+    /// caller). Read the answer back with [`TerminalGuard::cell_geometry`].
+    pub fn enter(query: CellQuery) -> io::Result<Self> {
         // Snapshot the tty's canonical-mode settings BEFORE crossterm
         // replaces them, so the signal handler has something to put back,
         // then arm BEFORE anything is dirtied. Arming afterwards leaves a
@@ -64,10 +366,24 @@ impl TerminalGuard {
             writer: Box::new(io::stdout()),
             manage_os_state: true,
             restored: false,
+            cell_geometry: CellGeometry::assumed(),
         };
+        // Between raw mode and the alternate screen, on purpose — see
+        // `query_cell_px`. Infallible by design, so it cannot strand a
+        // half-entered terminal here.
+        if query == CellQuery::Ask {
+            guard.cell_geometry = query_cell_px();
+        }
         guard.writer.write_all(ENTER_SEQUENCE)?;
         guard.writer.flush()?;
         Ok(guard)
+    }
+
+    /// The cell geometry resolved by [`TerminalGuard::enter`]: the terminal's
+    /// own answer when it gave one, [`CellGeometry::assumed`] otherwise. The
+    /// [`CellPxSource`] is carried so a caller can tell those apart.
+    pub fn cell_geometry(&self) -> CellGeometry {
+        self.cell_geometry
     }
 
     /// Test seam: a guard that writes its restore sequence to `writer`
@@ -79,6 +395,7 @@ impl TerminalGuard {
             writer: Box::new(writer),
             manage_os_state: false,
             restored: false,
+            cell_geometry: CellGeometry::assumed(),
         }
     }
 
@@ -437,6 +754,100 @@ mod tests {
         // wire — this matters because both a panic-hook restore and the
         // subsequent Drop-during-unwind restore can fire for one event.
         assert_eq!(buf.lock().unwrap().as_slice(), RESTORE_SEQUENCE);
+    }
+
+    /// The exact bytes the spike recorded live Ghostty answering with
+    /// (`docs/spikes/ghostty-caps.md` item 7: `\x1b[6;48;24t` → height 48,
+    /// width 24), parsed back into the `(width, height)` order every consumer
+    /// uses. If this ever returns `(48, 24)` the wire order has been read
+    /// backwards and every raster is off by the cell's aspect ratio.
+    #[test]
+    fn test_parses_the_cell_size_report_ghostty_actually_sent() {
+        assert_eq!(parse_cell_size_reply(b"\x1b[6;48;24t"), Some((24, 48)));
+    }
+
+    #[test]
+    fn test_cell_size_report_is_found_alongside_other_terminal_chatter() {
+        // A DA1 reply, then a keystroke the user got in during startup, then
+        // the report. All three can share one read buffer.
+        assert_eq!(
+            parse_cell_size_reply(b"\x1b[?62;c\x1b[A\x1b[6;40;20t"),
+            Some((20, 40))
+        );
+        // Split arrival: the first half alone must not parse into anything.
+        assert_eq!(parse_cell_size_reply(b"\x1b[6;40;"), None);
+    }
+
+    /// The other XTWINOPS reports share the `t` terminator. Accepting them
+    /// would read a *window* size (thousands of pixels) or a *text area* size
+    /// (in cells) as a cell size — the first is rejected by `plausible`, but
+    /// the second (`CSI 8 ; 42 ; 155 t`) is a perfectly plausible-looking
+    /// 155×42 "cell" and would silently mis-size everything.
+    #[test]
+    fn test_other_xtwinops_reports_are_not_mistaken_for_a_cell_size() {
+        assert_eq!(parse_cell_size_reply(b"\x1b[8;42;155t"), None);
+        assert_eq!(parse_cell_size_reply(b"\x1b[4;2016;3720t"), None);
+        assert_eq!(parse_cell_size_reply(b"\x1b[6;48t"), None);
+        assert_eq!(parse_cell_size_reply(b"\x1b[6;48;24;9t"), None);
+        assert_eq!(parse_cell_size_reply(b"\x1b[6;x;yt"), None);
+        assert_eq!(parse_cell_size_reply(b"no escapes here"), None);
+    }
+
+    /// A terminal that answers with nonsense must fall through the ladder
+    /// rather than be believed. The high end is the one that matters: it
+    /// oversizes every raster, which is the direction `FALLBACK_CELL_PX`'s
+    /// comment commits to never erring in.
+    #[test]
+    fn test_an_implausible_answer_is_rejected_not_clamped() {
+        assert_eq!(plausible((24, 48)), Some((24, 48)));
+        assert_eq!(plausible((0, 48)), None);
+        assert_eq!(plausible((1, 48)), None);
+        assert_eq!(plausible((24, 0)), None);
+        assert_eq!(plausible((10_000, 10_000)), None);
+        assert_eq!(plausible((24, 4096)), None);
+        assert_eq!(
+            plausible((MAX_PLAUSIBLE_CELL_PX, MAX_PLAUSIBLE_CELL_PX)),
+            Some((MAX_PLAUSIBLE_CELL_PX, MAX_PLAUSIBLE_CELL_PX))
+        );
+    }
+
+    /// The `TIOCGWINSZ` rung, on the numbers the spike actually measured:
+    /// rows=42 cols=155 xpixel=3740 ypixel=2048. Those pixel fields are
+    /// ~0.5–1.6% high (they include window chrome), and the truncating
+    /// division is what absorbs the bias — 3740/155 = 24.13 → 24 and
+    /// 2048/42 = 48.76 → 48, both landing exactly on `CSI 16t`'s answer.
+    #[test]
+    fn test_window_size_rung_reproduces_the_measured_cell_size() {
+        assert_eq!(
+            cell_px_from_window_size_parts(155, 42, 3740, 2048),
+            Some((24, 48))
+        );
+    }
+
+    /// The failure mode §5.6 of the wave-4 research asked to confirm: a
+    /// multiplexer (or a pty with no pixel size set, which is every pty in
+    /// this test suite) reports zeros. Taking those at face value divides by
+    /// zero; reporting them as a cell size hands `px_to_cells` a divisor of 0.
+    #[test]
+    fn test_window_size_rung_declines_rather_than_dividing_by_zero() {
+        assert_eq!(cell_px_from_window_size_parts(80, 24, 0, 0), None);
+        assert_eq!(cell_px_from_window_size_parts(0, 0, 3740, 2048), None);
+        assert_eq!(cell_px_from_window_size_parts(80, 0, 3740, 2048), None);
+        assert_eq!(cell_px_from_window_size_parts(155, 42, 3740, 0), None);
+        // Plausibility still applies on this rung: a window reporting one
+        // pixel per cell is not a cell size.
+        assert_eq!(cell_px_from_window_size_parts(155, 42, 155, 42), None);
+    }
+
+    #[test]
+    fn test_the_assumed_geometry_labels_itself_as_a_fallback() {
+        // Provenance is the point of the type: a consumer must be able to
+        // tell "the terminal said 24x48" from "nobody answered, so we
+        // guessed 24x48" — the two are byte-identical in `cell_px`.
+        let assumed = CellGeometry::assumed();
+        assert_eq!(assumed.cell_px, FALLBACK_CELL_PX);
+        assert_eq!(assumed.source, CellPxSource::Fallback);
+        assert_ne!(CellPxSource::Fallback, CellPxSource::Csi16t);
     }
 
     #[test]

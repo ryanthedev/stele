@@ -23,15 +23,25 @@ use std::path::{Path, PathBuf};
 use ast::{Document, InlineKind, NodeId, NodeRef};
 use layout::{CellSize, IntrinsicSizer};
 
-/// Assumed terminal cell-pixel geometry used only to convert a probed pixel
-/// size into a cell count *at layout time* — before any live `CSI 16t`
-/// query is possible (layout is pure, no I/O). Pinned to the exact values
-/// `docs/spikes/ghostty-caps.md` item 7 measured against a live Ghostty
-/// session (`CSI 16t` and `CSI 14t`÷(rows,cols) agreed exactly: 24×48px).
-/// A real per-session query, once available, feeds the *raster* stage
-/// (`GfxMediaSink`) instead — this constant only ever affects how many
-/// cells get reserved, not what gets painted into them.
-const ASSUMED_CELL_PX: (u32, u32) = (24, 48);
+/// Guard rails on the cell geometry this sizer will divide by, applied to
+/// whatever [`ImageSizer::with_cell_px`] is handed. `crate::terminal` already
+/// rejects an implausible answer before it gets here, but `ImageSizer` is
+/// `pub` and a zero on either axis is an immediate divide-by-zero in
+/// [`px_to_cells`] — a barricade, not a duplicate check.
+fn usable_cell_px(cell_px: (u32, u32)) -> (u32, u32) {
+    (
+        if cell_px.0 == 0 {
+            crate::terminal::FALLBACK_CELL_PX.0
+        } else {
+            cell_px.0
+        },
+        if cell_px.1 == 0 {
+            crate::terminal::FALLBACK_CELL_PX.1
+        } else {
+            cell_px.1
+        },
+    )
+}
 
 /// RaTeX `RenderOptions::default().font_size` — the em-pixel baseline this
 /// sizer converts em units against. Matches `crates/math`'s own baseline so
@@ -58,6 +68,21 @@ pub struct ImageSizer {
     base_dir: PathBuf,
     limits: gfx::Limits,
     disabled: bool,
+    /// The terminal cell geometry a probed pixel size is divided by to reach
+    /// a cell count. Resolved once per session by
+    /// [`crate::terminal::query_cell_px`] and handed in via
+    /// [`ImageSizer::with_cell_px`]; defaults to
+    /// [`crate::terminal::FALLBACK_CELL_PX`] so a caller that cannot query
+    /// (every unit test — there is no terminal in a test process) behaves
+    /// exactly as this code did when the value was a hardcoded constant.
+    ///
+    /// This is the one place cell geometry affects what the *reader* sees
+    /// rather than only how sharp it is. `cols`/`rows` here become the box's
+    /// aspect ratio, `layout::block::emit_box` fits that aspect to the content
+    /// column, and `gfx::decode::letterbox` then letterboxes the picture into
+    /// whatever shape it was given — so a wrong cell size shows up as bands of
+    /// dead space around the image, not as a blurry image.
+    cell_px: (u32, u32),
 }
 
 impl ImageSizer {
@@ -68,6 +93,7 @@ impl ImageSizer {
             base_dir: base_dir.into(),
             limits: gfx::Limits::default(),
             disabled: false,
+            cell_px: crate::terminal::FALLBACK_CELL_PX,
         }
     }
 
@@ -78,11 +104,19 @@ impl ImageSizer {
             base_dir: base_dir.into(),
             limits: gfx::Limits::default(),
             disabled: true,
+            cell_px: crate::terminal::FALLBACK_CELL_PX,
         }
     }
 
     pub fn with_limits(mut self, limits: gfx::Limits) -> Self {
         self.limits = limits;
+        self
+    }
+
+    /// Uses `cell_px` — normally [`crate::terminal::query_cell_px`]'s
+    /// answer — instead of the fallback constant.
+    pub fn with_cell_px(mut self, cell_px: (u32, u32)) -> Self {
+        self.cell_px = usable_cell_px(cell_px);
         self
     }
 
@@ -92,14 +126,14 @@ impl ImageSizer {
         }
         let path = resolve_path(&self.base_dir, dest);
         let (px_w, px_h) = gfx::decode::probe_dimensions(&path, self.limits).ok()?;
-        Some(px_to_cells(px_w, px_h))
+        Some(px_to_cells(px_w, px_h, self.cell_px))
     }
 
     fn size_math(&self, tex: &str) -> Option<CellSize> {
         if let Some((em_w, em_h)) = math::intrinsic_em_size(tex) {
             let px_w = (em_w * MATH_BASELINE_PX_HEIGHT as f64).max(0.0) as u32;
             let px_h = (em_h * MATH_BASELINE_PX_HEIGHT as f64).max(0.0) as u32;
-            return Some(px_to_cells(px_w.max(1), px_h.max(1)));
+            return Some(px_to_cells(px_w.max(1), px_h.max(1), self.cell_px));
         }
         // RaTeX rung failed to parse: try the txm rung before giving up —
         // this is what makes a txm-rendered formula also get a real
@@ -142,8 +176,8 @@ fn resolve_path(base_dir: &Path, dest: &str) -> PathBuf {
     base_dir.join(dest)
 }
 
-/// Converts a probed/estimated pixel size into a cell count via
-/// [`ASSUMED_CELL_PX`], doing the division in `u32` (a wide-enough type for
+/// Converts a probed/estimated pixel size into a cell count against
+/// `cell_px`, doing the division in `u32` (a wide-enough type for
 /// any dimension `gfx::Limits` would ever accept) and saturating only at
 /// the final cast to `u16` — never casting an unbounded pixel value to
 /// `u16` bare, per the width/cell-rect gotcha carried from earlier phases.
@@ -158,14 +192,15 @@ fn resolve_path(base_dir: &Path, dest: &str) -> PathBuf {
 /// into whatever box it is given (`gfx::decode::decode_and_scale`), so the
 /// visible result is a band of dead transparent rows under the picture; a
 /// vertical stretch, before letterboxing existed.
-fn px_to_cells(px_w: u32, px_h: u32) -> CellSize {
+fn px_to_cells(px_w: u32, px_h: u32, cell_px: (u32, u32)) -> CellSize {
     // u64 throughout: the proportional rescale multiplies a cell count by a
     // cap before dividing, and a cell count derived from an unbounded u32
     // pixel dimension would overflow that product in u32.
     let max_cols = u64::from(MAX_RESERVED_COLS);
     let max_rows = u64::from(MAX_RESERVED_ROWS);
-    let mut cols = u64::from(px_w.div_ceil(ASSUMED_CELL_PX.0.max(1))).max(1);
-    let mut rows = u64::from(px_h.div_ceil(ASSUMED_CELL_PX.1.max(1))).max(1);
+    let cell_px = usable_cell_px(cell_px);
+    let mut cols = u64::from(px_w.div_ceil(cell_px.0)).max(1);
+    let mut rows = u64::from(px_h.div_ceil(cell_px.1)).max(1);
     if cols > max_cols {
         rows = (rows * max_cols).div_ceil(cols).max(1);
         cols = max_cols;
@@ -249,9 +284,10 @@ mod tests {
     /// stretched to fill it.
     #[test]
     fn test_over_cap_box_is_clamped_proportionally_not_per_axis() {
+        let cell = crate::terminal::FALLBACK_CELL_PX;
         // Square, over the column cap: 6000/24 = 250 cols, 6000/48 = 125 rows.
         assert_eq!(
-            px_to_cells(6000, 6000),
+            px_to_cells(6000, 6000, cell),
             CellSize {
                 cols: 200,
                 rows: 100
@@ -259,23 +295,93 @@ mod tests {
             "a square source must stay square when the column cap bites"
         );
         // Very wide, far over the column cap.
-        assert_eq!(px_to_cells(30_000, 480), CellSize { cols: 200, rows: 2 });
+        assert_eq!(
+            px_to_cells(30_000, 480, cell),
+            CellSize { cols: 200, rows: 2 }
+        );
         // Very tall: the row cap bites instead, and pulls cols with it.
-        assert_eq!(px_to_cells(480, 30_000), CellSize { cols: 7, rows: 200 });
+        assert_eq!(
+            px_to_cells(480, 30_000, cell),
+            CellSize { cols: 7, rows: 200 }
+        );
         // Over both caps at once.
         assert_eq!(
-            px_to_cells(24_000, 48_000),
+            px_to_cells(24_000, 48_000, cell),
             CellSize {
                 cols: 200,
                 rows: 200
             }
         );
         // Under both caps: untouched, exactly as before.
-        assert_eq!(px_to_cells(240, 480), CellSize { cols: 10, rows: 10 });
+        assert_eq!(px_to_cells(240, 480, cell), CellSize { cols: 10, rows: 10 });
         // A degenerate axis still floors to one cell rather than zero.
-        assert_eq!(px_to_cells(1, 1), CellSize { cols: 1, rows: 1 });
-        assert_eq!(px_to_cells(u32::MAX, 1).cols, 200);
-        assert_eq!(px_to_cells(1, u32::MAX).rows, 200);
+        assert_eq!(px_to_cells(1, 1, cell), CellSize { cols: 1, rows: 1 });
+        assert_eq!(px_to_cells(u32::MAX, 1, cell).cols, 200);
+        assert_eq!(px_to_cells(1, u32::MAX, cell).rows, 200);
+    }
+
+    /// The queried geometry has to reach the division, and it has to reach it
+    /// on both axes and in the right order.
+    ///
+    /// A 480x480 source is deliberately square: at the fallback 24x48 it
+    /// measures 20x10 cells, and any of the three ways this wiring can be
+    /// wrong gives a different answer. Ignoring `cell_px` gives 20x10 at every
+    /// geometry; transposing the pair gives 10x20 at the fallback; using one
+    /// axis for both gives a square box. The four geometries below pin all
+    /// four apart.
+    #[test]
+    fn test_a_queried_cell_geometry_changes_the_reserved_cell_count() {
+        assert_eq!(
+            px_to_cells(480, 480, (24, 48)),
+            CellSize { cols: 20, rows: 10 }
+        );
+        // A 2x-larger cell halves both counts.
+        assert_eq!(
+            px_to_cells(480, 480, (48, 96)),
+            CellSize { cols: 10, rows: 5 }
+        );
+        // A square cell measures a square source as a square box.
+        assert_eq!(
+            px_to_cells(480, 480, (48, 48)),
+            CellSize { cols: 10, rows: 10 }
+        );
+        // Width and height are not interchangeable.
+        assert_ne!(
+            px_to_cells(480, 480, (24, 48)),
+            px_to_cells(480, 480, (48, 24))
+        );
+    }
+
+    /// A zero divisor is a panic, not a bad picture. `ImageSizer` is `pub`, so
+    /// "the terminal module already rejected zero" is a fact about one caller.
+    #[test]
+    fn test_a_zero_cell_axis_falls_back_instead_of_dividing_by_zero() {
+        let fallback = px_to_cells(480, 480, crate::terminal::FALLBACK_CELL_PX);
+        assert_eq!(px_to_cells(480, 480, (0, 0)), fallback);
+        assert_eq!(px_to_cells(480, 480, (0, 48)), fallback);
+        assert_eq!(px_to_cells(480, 480, (24, 0)), fallback);
+    }
+
+    /// The builder is the only path a queried geometry takes into a sizer, so
+    /// it has to be the value `size()` divides by — not merely stored.
+    #[test]
+    fn test_with_cell_px_is_what_size_divides_by() {
+        let dir = scratch_dir("with-cell-px");
+        write_png(&dir, "pic.png", 240, 480);
+        let doc = Document::parse("![alt](pic.png)\n");
+        let image_node = doc
+            .nodes()
+            .find(|n| matches!(n, NodeRef::Inline(i) if matches!(i.kind, InlineKind::Image { .. })))
+            .unwrap()
+            .id();
+        let at_fallback = ImageSizer::new(&dir).size(image_node, &doc).unwrap();
+        let at_double = ImageSizer::new(&dir)
+            .with_cell_px((48, 96))
+            .size(image_node, &doc)
+            .unwrap();
+        assert_eq!(at_fallback, CellSize { cols: 10, rows: 10 });
+        assert_eq!(at_double, CellSize { cols: 5, rows: 5 });
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// End to end on the real oversized fixture, through `layout` — the box

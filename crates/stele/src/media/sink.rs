@@ -151,14 +151,20 @@ pub struct GfxMediaSink {
     base_dir: PathBuf,
     emitter: gfx::Emitter,
     limits: gfx::Limits,
-    /// Assumed/queried terminal cell-pixel geometry, used to size the
-    /// raster target. Settable via [`GfxMediaSink::set_cell_px`] — the
-    /// orchestrator's hook for a live `CSI 16t` re-query on geometry
-    /// change; DW-6.5 is exactly "changing this regenerates the raster
-    /// without touching the document's layout tree," which holds here by
-    /// construction (this type has no way to call `layout::layout` at
-    /// all — no `&Document`-plus-`&WidthEngine` layout call is reachable
-    /// from any method on it).
+    /// Queried (or, failing that, assumed) terminal cell-pixel geometry, used
+    /// to size the raster target. Set at construction from
+    /// [`crate::terminal::query_cell_px`] via [`GfxMediaSink::with_cell_px`],
+    /// and settable afterwards by [`GfxMediaSink::set_cell_px`].
+    ///
+    /// DW-6.5 is exactly "changing this regenerates the raster without
+    /// touching the document's layout tree." That holds, but *not* by
+    /// construction — the type does hold a [`Document`] and a [`WidthEngine`],
+    /// so nothing in the type system stops a future edit from calling
+    /// `layout::layout`. What holds it is observable on the wire, and asserted
+    /// there: after a cell-size change the placement still claims the same
+    /// `c=`/`r=` cell box (no re-layout) while the transmitted raster's pixel
+    /// dimensions change (a re-rasterize). See
+    /// `test_dw_6_5_geometry_change_regenerates_the_raster_and_keeps_the_cell_box`.
     cell_px: (u32, u32),
     /// This process's slice of the terminal's global image-id namespace — see
     /// [`gfx::IdAllocator`] for why that is not just `1..`.
@@ -187,7 +193,7 @@ impl GfxMediaSink {
             base_dir: base_dir.into(),
             emitter: gfx::Emitter::new(),
             limits: gfx::Limits::default(),
-            cell_px: (24, 48),
+            cell_px: crate::terminal::FALLBACK_CELL_PX,
             ids: gfx::IdAllocator::for_this_process(),
             placements: HashMap::new(),
             lru: Vec::new(),
@@ -205,18 +211,35 @@ impl GfxMediaSink {
         self
     }
 
-    /// Updates the assumed cell-pixel geometry a subsequent `paint` scales
-    /// rasters to — the orchestrator's hook for a live `CSI 16t` re-query
-    /// on `SIGWINCH`/geometry change (DW-6.5).
+    /// Builder form of [`GfxMediaSink::set_cell_px`], for wiring
+    /// [`crate::terminal::query_cell_px`]'s startup answer in at construction.
+    pub fn with_cell_px(mut self, cell_px: (u32, u32)) -> Self {
+        self.set_cell_px(cell_px);
+        self
+    }
+
+    /// Updates the cell-pixel geometry a subsequent `paint` scales rasters to.
     ///
-    /// Nothing in the viewer calls it yet — the only `CSI 16t` anywhere in the
-    /// workspace is the spike probe's (`probe/src/bin/spike_a.rs`) — so
-    /// `cell_px` holds `sizer`'s measured 24×48 for the life of a session.
-    /// What a live query would change is raster *resolution*, and the cache key
-    /// that goes with it; never geometry. The reserved box's cell extent is
-    /// fixed at layout time, and `crop_source` measures against the raster's
-    /// own pixels.
+    /// `main.rs` calls this once, at startup, with
+    /// [`crate::terminal::query_cell_px`]'s answer. It is *not* called again
+    /// on resize, and that is a known gap rather than a design: a font-size
+    /// change arrives as an ordinary `Event::Resize`, and re-querying at that
+    /// point would need a way to reach the sink after
+    /// `Painter::register_media` has taken ownership of it, which no accessor
+    /// currently provides. Until then a mid-session font-size change leaves
+    /// every raster rendered for the old cell size — visible as softness (the
+    /// terminal rescales the raster onto the same cell box), not as
+    /// misplacement.
+    ///
+    /// What this changes is raster *resolution* and the cache key that goes
+    /// with it; never geometry. The reserved box's cell extent is fixed at
+    /// layout time, and `crop_source` measures against the raster's own
+    /// pixels. A zero on either axis is refused rather than stored — it would
+    /// make every `target_px` zero and every raster a 1×1 pixel.
     pub fn set_cell_px(&mut self, cell_px: (u32, u32)) {
+        if cell_px.0 == 0 || cell_px.1 == 0 {
+            return;
+        }
         self.cell_px = cell_px;
     }
 
@@ -806,13 +829,13 @@ fn text_rung_line<'a>(
 /// terminal's cell size turns out to be.
 ///
 /// That is a stronger claim than "no cell-pixel query is available", which is
-/// what an earlier revision of this comment argued from (and argued from an
-/// environment this code never runs in: `main.rs` disables graphics outright
-/// under a multiplexer, so `GfxMediaSink` never reaches a session where
-/// `CSI 16t` goes unanswered). Cell geometry does feed the *raster* stage —
-/// [`GfxMediaSink::set_cell_px`] and `sizer`'s `ASSUMED_CELL_PX`, whose 24×48
-/// is a live-Ghostty measurement, not a guess — but the crop is correct for
-/// any cell size, so wiring a live query would not change a byte of it.
+/// what an earlier revision of this comment argued from. It is now also the
+/// only surviving claim: the live query *is* wired
+/// ([`crate::terminal::query_cell_px`], through
+/// [`GfxMediaSink::set_cell_px`]), and it did not change a byte of this
+/// function — which is the point. Cell geometry feeds the *raster* stage, where
+/// it decides resolution; the crop is measured against the raster's own pixels
+/// and is correct for any cell size, queried or assumed.
 fn crop_source(
     raster_px: (u32, u32),
     rows: u16,
@@ -1713,13 +1736,170 @@ mod tests {
         assert!(String::from_utf8_lossy(&out).contains("fallback text"));
     }
 
+    /// DW-6.3's memory clause at the sink: an image refused by the
+    /// **allocation** cap degrades exactly like one refused by the dimension
+    /// cap — alt text, no graphics, no crash.
+    ///
+    /// The fixture is a perfectly valid, fully-decodable PNG whose dimensions
+    /// are far inside `max_dim`; only its RGBA8 byte size exceeds the budget.
+    /// Every other hostile fixture in this file is malformed or over-dimension,
+    /// so this is the only one that reaches the sink through
+    /// `Limits::accepts`'s allocation branch — the branch
+    /// `crates/gfx/src/decode.rs` shows is unreachable at the default limits.
     #[test]
-    fn test_dw_6_5_geometry_change_regenerates_raster_without_touching_layout_tree() {
-        let dir = scratch_dir("geometry");
-        let doc = Document::parse("$x+1$\n");
+    fn test_dw_6_3_an_image_over_the_allocation_cap_degrades_to_alt_text() {
+        let dir = scratch_dir("alloc-cap-degrade");
+        write_png(&dir, "big.png");
+        let doc = Document::parse("![too big to decode](./big.png)\n");
         let node_id = doc
             .nodes()
-            .find(|n| matches!(n, NodeRef::Inline(i) if matches!(i.kind, InlineKind::Math { .. })))
+            .find(|n| matches!(n, NodeRef::Inline(i) if matches!(i.kind, InlineKind::Image { .. })))
+            .unwrap()
+            .id();
+        let reserved = Reserved {
+            node_id,
+            cols: 20,
+            rows: 1,
+            row: 0,
+        };
+        let rect = CellRect {
+            x: 0,
+            y: 0,
+            width: 20,
+            height: 1,
+        };
+
+        // The same fixture, same code path, one number apart. Ample budget
+        // first, so the assertion below is about the cap and not about the
+        // fixture being unpaintable for some other reason.
+        let mut ample = GfxMediaSink::new(doc.clone(), &dir).with_limits(gfx::Limits {
+            max_dim: 8_192,
+            max_alloc: 256 * 1024 * 1024,
+        });
+        let mut out_ample = Vec::new();
+        ample.begin_frame(&mut out_ample);
+        ample.paint(&reserved, rect, &mut out_ample);
+        assert_eq!(
+            creates(&out_ample),
+            1,
+            "with an ample allocation budget this fixture must paint as graphics"
+        );
+
+        let mut capped = GfxMediaSink::new(doc, &dir).with_limits(gfx::Limits {
+            max_dim: 8_192,
+            max_alloc: 8,
+        });
+        let mut out = Vec::new();
+        capped.begin_frame(&mut out);
+        capped.paint(&reserved, rect, &mut out);
+        let text = String::from_utf8_lossy(&out);
+        assert_eq!(
+            creates(&out),
+            0,
+            "the allocation cap must refuse the decode"
+        );
+        assert!(
+            !text.contains("\x1b_G"),
+            "no graphics escape may reach the wire for a refused image: {text:?}"
+        );
+        assert!(
+            text.contains("too big to decode"),
+            "the reader must get the alt text instead of a blank box: {text:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Reassembles the PNG a `transmit` put on the wire and reports its pixel
+    /// size, by concatenating every `a=t`/`m=` chunk's base64 payload and
+    /// reading the IHDR back out.
+    ///
+    /// The wire is the only honest place to read this. `Placement.rendered_px`
+    /// is the size the sink *asked* for, and a sink that stopped scaling would
+    /// still record it.
+    fn transmitted_raster_px(buf: &[u8]) -> Option<(u32, u32)> {
+        use base64::Engine as _;
+        let text = String::from_utf8_lossy(buf);
+        let mut payload = String::new();
+        for command in text.split("\x1b_G").skip(1) {
+            // Not `?` on any of these: a `\x1b_G` command that is not a
+            // transmit chunk (a put, a delete) simply has no payload — an
+            // early return here would make the whole function answer `None`
+            // for a wire that does carry a raster, just later in the buffer.
+            let Some(body) = command.split("\x1b\\").next() else {
+                continue;
+            };
+            let Some((keys, chunk)) = body.split_once(';') else {
+                continue;
+            };
+            if !(keys.contains("a=t") || keys.starts_with("m=")) {
+                continue;
+            }
+            payload.push_str(chunk);
+        }
+        if payload.is_empty() {
+            return None;
+        }
+        let png = base64::engine::general_purpose::STANDARD
+            .decode(payload.as_bytes())
+            .ok()?;
+        png_pixel_size(&png)
+    }
+
+    /// The `c=`/`r=` (cell box) of every `a=p` put in `buf`.
+    fn placed_cell_boxes(buf: &[u8]) -> Vec<(u16, u16)> {
+        let text = String::from_utf8_lossy(buf);
+        let mut out = Vec::new();
+        for command in text.split("\x1b_G").skip(1) {
+            let Some(body) = command.split("\x1b\\").next() else {
+                continue;
+            };
+            let keys = body.split(';').next().unwrap_or("");
+            if !keys.starts_with("a=p") {
+                continue;
+            }
+            let get = |name: &str| {
+                keys.split(',')
+                    .find_map(|kv| kv.strip_prefix(name)?.parse::<u16>().ok())
+            };
+            if let (Some(c), Some(r)) = (get("c="), get("r=")) {
+                out.push((c, r));
+            }
+        }
+        out
+    }
+
+    /// DW-6.5: *"cell-size change re-rasterizes without re-layout."*
+    ///
+    /// Both halves are asserted on the bytes the terminal would receive, which
+    /// is the only place they are distinguishable:
+    ///
+    /// - **re-rasterizes** — the transmitted PNG's own pixel dimensions change.
+    /// - **without re-layout** — the placement still claims the *same* `c=`/`r=`
+    ///   cell box, so the reader's text does not move.
+    ///
+    /// This replaces an `assert_eq!(reserved.rows, 2)` on a local the test
+    /// built itself and never passed by `&mut`. That assertion could not fail:
+    /// it re-read a value nothing in the call had access to. It was standing in
+    /// for a structural argument — *"`GfxMediaSink` has no `Document`/
+    /// `WidthEngine` handle, so it is incapable of re-laying-out"* — which is
+    /// false on its own terms; the type holds both (`doc`, `width_engine`).
+    /// The guarantee is real, but it rests on call-graph discipline, so it has
+    /// to be asserted from the output rather than argued from the fields.
+    ///
+    /// The node is an **image**, not a formula, and that is not incidental:
+    /// `gfx::decode::decode_and_scale` rasterizes to the requested pixel target
+    /// exactly, so "the raster followed the new cell size" is a statement about
+    /// a number on the wire. A formula's raster follows the target's *aspect*
+    /// only — see
+    /// `test_a_proportional_cell_change_re_transmits_a_formula_raster_unchanged`.
+    #[test]
+    fn test_dw_6_5_geometry_change_regenerates_the_raster_and_keeps_the_cell_box() {
+        let dir = scratch_dir("geometry");
+        write_png(&dir, "a.png");
+        let doc = Document::parse("![alt](./a.png)\n");
+        let node_id = doc
+            .nodes()
+            .find(|n| matches!(n, NodeRef::Inline(i) if matches!(i.kind, InlineKind::Image { .. })))
             .unwrap()
             .id();
         let mut sink = GfxMediaSink::new(doc, &dir);
@@ -1733,7 +1913,7 @@ mod tests {
             x: 0,
             y: 0,
             width: 20,
-            height: 1,
+            height: 2,
         };
 
         let mut out1 = Vec::new();
@@ -1744,6 +1924,10 @@ mod tests {
             1,
             "first paint must transmit a fresh raster"
         );
+        let raster_before =
+            transmitted_raster_px(&out1).expect("the first paint must put a PNG on the wire");
+        let box_before = placed_cell_boxes(&out1);
+        assert_eq!(box_before, vec![(20, 2)], "cell box on the first paint");
 
         // Repainting at the SAME geometry must reuse the raster: no new
         // transmit, only a re-place.
@@ -1755,12 +1939,15 @@ mod tests {
             0,
             "unchanged geometry must not re-transmit"
         );
-        assert!(String::from_utf8_lossy(&out_same).contains("a=p,i="));
+        assert_eq!(
+            transmitted_raster_px(&out_same),
+            None,
+            "an unchanged geometry must put no raster on the wire at all"
+        );
+        assert_eq!(placed_cell_boxes(&out_same), box_before);
 
-        // Cell-geometry change (e.g. a live CSI 16t re-query after
-        // SIGWINCH): must produce a NEW raster (the reserved box's own
-        // cols/rows are untouched — this type has no document/WidthEngine
-        // handle to re-layout with in the first place).
+        // Cell-geometry change — what `terminal::query_cell_px` would report
+        // after a font-size change.
         sink.set_cell_px((32, 64));
         let mut out2 = Vec::new();
         sink.begin_frame(&mut out2);
@@ -1770,11 +1957,166 @@ mod tests {
             1,
             "a geometry change must regenerate the raster"
         );
-        // The Reserved box itself (cols/rows) is a plain value untouched
-        // by any of this — proving "no re-layout" doesn't need an assertion
-        // here at all: `GfxMediaSink` never holds a `&Document` layout
-        // handle it could use to call `layout::layout`.
-        assert_eq!(reserved.rows, 2);
+        let raster_after =
+            transmitted_raster_px(&out2).expect("the regenerated raster must be transmitted");
+
+        assert_eq!(
+            raster_before,
+            (20 * 24, 2 * 48),
+            "the first raster must be the cell box at the fallback geometry"
+        );
+        assert_eq!(
+            raster_after,
+            (20 * 32, 2 * 64),
+            "re-rasterize: the transmitted raster's pixel size must follow the \
+             new cell geometry, not stay at {raster_before:?}"
+        );
+        assert_eq!(
+            placed_cell_boxes(&out2),
+            box_before,
+            "no re-layout: the box must still claim exactly the cells layout \
+             gave it. A different c=/r= here means the geometry change moved \
+             the reader's text."
+        );
+    }
+
+    /// A formula's raster is **not** a function of cell geometry the way an
+    /// image's is, and DW-6.5's wording hides that. `math::render_fitted`
+    /// rasterizes at a fixed em and solves for the *padding* that would put the
+    /// result on the target's aspect ratio — but padding can only be added, and
+    /// it is floored at `math::PADDING`, so for any target wider than the ink
+    /// plus minimum padding the solution clamps and the raster stops depending
+    /// on the target at all. A 20x2 cell box is such a target at every cell
+    /// geometry in the plausible range, so a proportional cell change
+    /// re-transmits bit-identical pixels. The sink re-transmits anyway, because
+    /// its cache key is the target it *asked* for, not the raster it got.
+    ///
+    /// Asserted rather than left implicit for two reasons: it is why the DW-6.5
+    /// test above uses an image, and it is a small real inefficiency (one
+    /// wasted transmit per formula per geometry change) that should be visible
+    /// to whoever next touches the cache key rather than rediscovered. A change
+    /// that pulls the target back inside the clamp *does* reach the raster —
+    /// the second half below, without which "identical" would also be satisfied
+    /// by a renderer that ignored its target entirely.
+    #[test]
+    fn test_a_proportional_cell_change_re_transmits_a_formula_raster_unchanged() {
+        let dir = scratch_dir("formula-geometry");
+        let doc = Document::parse("$x+1$\n");
+        let node_id = doc
+            .nodes()
+            .find(|n| matches!(n, NodeRef::Inline(i) if matches!(i.kind, InlineKind::Math { .. })))
+            .unwrap()
+            .id();
+        let reserved = Reserved {
+            node_id,
+            cols: 20,
+            rows: 2,
+            row: 0,
+        };
+        let rect = CellRect {
+            x: 0,
+            y: 0,
+            width: 20,
+            height: 2,
+        };
+        let render_at = |cell_px: (u32, u32)| {
+            let mut sink = GfxMediaSink::new(doc.clone(), &dir).with_cell_px(cell_px);
+            let mut out = Vec::new();
+            sink.begin_frame(&mut out);
+            sink.paint(&reserved, rect, &mut out);
+            (creates(&out), transmitted_raster_px(&out))
+        };
+
+        // 24x48 -> 32x64 is 4/3 on both axes: the 20x2 cell box keeps its 5:1
+        // aspect, so the formula rasterizes to exactly the same pixels.
+        let (creates_a, raster_a) = render_at((24, 48));
+        let (creates_b, raster_b) = render_at((32, 64));
+        assert_eq!((creates_a, creates_b), (1, 1));
+        assert_eq!(
+            raster_a, raster_b,
+            "a proportional cell change leaves a formula's raster identical — \
+             the re-transmit buys nothing"
+        );
+        // Not equal to its own pixel target, either: that is what makes
+        // "identical" mean "independent of the target" rather than "both
+        // happened to land on the same target".
+        assert_ne!(
+            raster_a,
+            Some((20 * 24, 2 * 48)),
+            "a formula does not rasterize to its pixel target"
+        );
+
+        // Narrow the cell instead of scaling it, so the 20-column box stops
+        // being wider than the ink-plus-minimum-padding solution, and the
+        // padding the renderer solves for is no longer clamped.
+        let (_, raster_narrow) = render_at((12, 48));
+        assert_ne!(
+            raster_a, raster_narrow,
+            "a target inside the padding clamp must reach the formula's raster"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The complement, and the reason the assertion above is about *pixels*
+    /// rather than *bytes*: the raster target is exactly the cell box times
+    /// the cell geometry, on both axes independently.
+    ///
+    /// Asserted for an image rather than a formula because
+    /// `gfx::decode::decode_and_scale` rasterizes to the requested target
+    /// exactly, so the number on the wire is the arithmetic under test;
+    /// `math::render_fitted` matches only the target's aspect.
+    #[test]
+    fn test_the_raster_target_is_the_cell_box_times_the_queried_cell_geometry() {
+        let dir = scratch_dir("raster-target");
+        write_png(&dir, "a.png");
+        let doc = Document::parse("![alt](./a.png)\n");
+        let node_id = doc
+            .nodes()
+            .find(|n| matches!(n, NodeRef::Inline(i) if matches!(i.kind, InlineKind::Image { .. })))
+            .unwrap()
+            .id();
+        let reserved = Reserved {
+            node_id,
+            cols: 10,
+            rows: 3,
+            row: 0,
+        };
+        let rect = CellRect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 3,
+        };
+        // Deliberately non-square and non-proportional to the fallback, so a
+        // transposed or single-axis cell geometry cannot produce this answer.
+        for cell_px in [(24u32, 48u32), (10, 30), (48, 24)] {
+            let mut sink = GfxMediaSink::new(doc.clone(), &dir).with_cell_px(cell_px);
+            let mut out = Vec::new();
+            sink.begin_frame(&mut out);
+            sink.paint(&reserved, rect, &mut out);
+            assert_eq!(
+                transmitted_raster_px(&out),
+                Some((10 * cell_px.0, 3 * cell_px.1)),
+                "at {cell_px:?} the raster must be the 10x3 cell box in pixels"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A zero from a garbled reply must not reach `target_px`, where it makes
+    /// every raster one pixel wide.
+    #[test]
+    fn test_set_cell_px_refuses_a_zero_axis() {
+        let dir = scratch_dir("zero-cell-px");
+        let doc = Document::parse("$x+1$\n");
+        let mut sink = GfxMediaSink::new(doc, &dir);
+        let before = sink.cell_px;
+        sink.set_cell_px((0, 64));
+        sink.set_cell_px((32, 0));
+        sink.set_cell_px((0, 0));
+        assert_eq!(sink.cell_px, before);
+        sink.set_cell_px((32, 64));
+        assert_eq!(sink.cell_px, (32, 64));
     }
 
     #[test]
