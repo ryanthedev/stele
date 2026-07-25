@@ -1,10 +1,13 @@
 //! `stele` — a terminal markdown viewer for Ghostty, behaving like a PDF
 //! viewer: open a complete document, lay it out, scroll it, resize it.
 //!
-//! This crate is both the shipped binary (`src/main.rs`, thin glue over
-//! real terminal I/O) and a library P6/P7 build against: [`media`] and
-//! [`decor`] define the hook seams they implement, and the paint-facing
-//! types they need are re-exported here.
+//! This crate is both the shipped binary (`src/main.rs`, thin glue over real
+//! terminal I/O) and the library around it. [`media`] and [`decor`] define the
+//! paint-time hook seams and ship the implementations `main.rs` registers —
+//! [`media::GfxMediaSink`] for images and math, `decor::themed::ThemedDecor`
+//! for highlighting and theme colors. The paint-facing types a seam
+//! implementation needs are re-exported below so an implementor does not have
+//! to reach into `layout` or `ast` directly.
 
 // `deny`, not `forbid`: exactly one module opts out — `terminal::signals`,
 // which must install a POSIX signal handler so a `SIGTERM`/`SIGHUP` can put

@@ -189,10 +189,22 @@ mod signals {
     // SAFETY: written exactly once, by `save_terminal_settings`, before
     // `TTY_FD` is ever set to a real descriptor and before `arm` publishes
     // the handler; read only behind a `TTY_FD >= 0` acquire load thereafter.
-    // There is no path that writes it while a reader can observe it.
+    // There is no path that writes it while a reader can observe it — enforced
+    // by `save_terminal_settings`'s own `TTY_FD >= 0` early return, not by the
+    // call graph happening to call it once.
     unsafe impl Sync for TermiosSlot {}
 
     static SAVED: TermiosSlot = TermiosSlot(UnsafeCell::new(unsafe { std::mem::zeroed() }));
+
+    /// How many times [`save_terminal_settings`] has run its body past the
+    /// idempotence guard. Test-only instrumentation, and the only way to assert
+    /// that guard: a successful resolution's sole external trace is a
+    /// descriptor this module never closes — invisible from inside the process —
+    /// and the resolution only happens at all when the host has a tty, which a
+    /// `cargo test` process may not (it has none in a sandbox). Counting the
+    /// body's executions makes the guard assertable with neither.
+    #[cfg(test)]
+    static RESOLUTIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
     /// Snapshot the controlling terminal's settings. Must be called *before*
     /// raw mode is enabled; if no tty can be found (stdin redirected and no
@@ -204,11 +216,24 @@ mod signals {
     /// `enable_raw_mode` took away. The `/dev/tty` descriptor is deliberately
     /// never closed: it must stay valid for the whole session, including
     /// inside a signal handler.
+    ///
+    /// **Does nothing once a descriptor has been resolved.** That is not an
+    /// optimization: [`TerminalGuard::enter`] is `pub`, so nothing stops a
+    /// second call, and a second call would open a second never-closed
+    /// `/dev/tty` *and* write `SAVED` while the armed handler can already read
+    /// it through a live `TTY_FD` — the exact data race `TermiosSlot`'s
+    /// `unsafe impl Sync` claims cannot happen. The early return is what makes
+    /// that claim true.
     pub(super) fn save_terminal_settings() {
+        if TTY_FD.load(Ordering::Acquire) >= 0 {
+            return;
+        }
+        #[cfg(test)]
+        RESOLUTIONS.fetch_add(1, Ordering::AcqRel);
         // SAFETY: `isatty`/`open` on a constant fd and a constant path;
         // `tcgetattr` writes one `termios` through a pointer to a static of
-        // exactly that type, which nothing can be reading yet — `TTY_FD` is
-        // still -1.
+        // exactly that type, which nothing can be reading yet — the early
+        // return above guarantees `TTY_FD` is still -1.
         unsafe {
             let fd = if libc::isatty(libc::STDIN_FILENO) == 1 {
                 libc::STDIN_FILENO
@@ -291,6 +316,46 @@ mod signals {
                 return;
             }
             written += n as usize;
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// With a descriptor already resolved, `save_terminal_settings` must not
+        /// run its body at all.
+        ///
+        /// Both halves of a second run are defects. It `open`s a second
+        /// `/dev/tty` that is never closed; and it writes `SAVED` while the
+        /// armed handler can already read it through a live `TTY_FD`, which is
+        /// exactly the data race `TermiosSlot`'s `unsafe impl Sync` asserts
+        /// cannot happen. `enter()` is `pub`, so "only ever called once" is a
+        /// property of today's call graph, not of the code.
+        ///
+        /// The pre-set descriptor is `i32::MAX` — no `open`/`STDIN_FILENO`
+        /// result can be that — so this test needs no tty of its own and gives
+        /// the same verdict on a developer's terminal, in CI, and in a sandbox.
+        /// It fails without the guard: the body's first statement is the counter
+        /// bump.
+        #[test]
+        fn test_save_terminal_settings_does_not_re_resolve_once_set() {
+            const SENTINEL: libc::c_int = libc::c_int::MAX;
+            let previous = TTY_FD.swap(SENTINEL, Ordering::AcqRel);
+            let before = RESOLUTIONS.load(Ordering::Acquire);
+
+            save_terminal_settings();
+
+            let runs = RESOLUTIONS.load(Ordering::Acquire) - before;
+            let observed = TTY_FD.load(Ordering::Acquire);
+            TTY_FD.store(previous, Ordering::Release);
+
+            assert_eq!(
+                runs, 0,
+                "save_terminal_settings re-resolved the tty: it leaks a second \
+                 /dev/tty fd and rewrites SAVED under the armed handler"
+            );
+            assert_eq!(observed, SENTINEL, "TTY_FD was clobbered");
         }
     }
 }

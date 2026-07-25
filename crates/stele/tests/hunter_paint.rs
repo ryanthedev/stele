@@ -8,7 +8,7 @@
 //! that currently pass and exist to keep passing.
 
 use ast::Document;
-use crossterm::event::KeyCode;
+use crossterm::event::{KeyCode, KeyEvent};
 use layout::{LayoutConfig, NullSizer, layout};
 use std::io::{self, Write};
 use stele::app::{AppState, LayoutContext};
@@ -50,7 +50,7 @@ fn repro_height_only_resize_jumps_scroll_to_block_start() {
     };
 
     for _ in 0..200 {
-        state.handle_key(KeyCode::Down);
+        state.handle_key_event(KeyEvent::from(KeyCode::Down));
     }
     let before = state.scroll();
     assert_eq!(before, 200);
@@ -586,24 +586,24 @@ fn probe_scroll_boundaries() {
         let expected_max = n.saturating_sub(10);
         assert_eq!(state.max_scroll(), expected_max, "{lines} lines");
 
-        state.handle_key(KeyCode::Char('G'));
+        state.handle_key_event(KeyEvent::from(KeyCode::Char('G')));
         assert_eq!(state.scroll(), expected_max);
         // One more Down at the tail must not move (and must not underflow).
-        state.handle_key(KeyCode::Down);
+        state.handle_key_event(KeyEvent::from(KeyCode::Down));
         assert_eq!(state.scroll(), expected_max);
-        state.handle_key(KeyCode::PageDown);
+        state.handle_key_event(KeyEvent::from(KeyCode::PageDown));
         assert_eq!(state.scroll(), expected_max);
 
-        state.handle_key(KeyCode::Char('g'));
+        state.handle_key_event(KeyEvent::from(KeyCode::Char('g')));
         assert_eq!(state.scroll(), 0);
-        state.handle_key(KeyCode::Up);
+        state.handle_key_event(KeyEvent::from(KeyCode::Up));
         assert_eq!(state.scroll(), 0);
-        state.handle_key(KeyCode::PageUp);
+        state.handle_key_event(KeyEvent::from(KeyCode::PageUp));
         assert_eq!(state.scroll(), 0);
 
         // The last scrollable position must show the final document line as
         // the LAST viewport row — never past it, never one short of it.
-        state.handle_key(KeyCode::End);
+        state.handle_key_event(KeyEvent::from(KeyCode::End));
         let last_visible = state.scroll() + 10;
         assert!(
             last_visible >= n,

@@ -1,5 +1,5 @@
-//! CLI surface: `stele <file.md>`, plus flag plumbing consumed here (parsed
-//! and stored) or by later phases (parsed and stored, not yet acted on).
+//! CLI surface: `stele <file.md>` and its flags. Parsing only — every flag is
+//! acted on by `main.rs`, which is where the flag doc comments below point.
 
 use std::path::PathBuf;
 
@@ -31,13 +31,15 @@ pub struct Cli {
     #[arg(long)]
     pub max_width: Option<u16>,
 
-    /// Reserved for P6: disables image rendering. Parsed and stored here;
-    /// not yet acted on.
+    /// Disables image and math rendering: alt text / TeX source is shown
+    /// instead. `main.rs` folds this into `graphics_disabled`, which selects
+    /// `ImageSizer::disabled` and `NoopMediaSink`, so no box is ever reserved
+    /// and the media sink is never invoked.
     #[arg(long)]
     pub no_images: bool,
 
-    /// Reserved for P7: shows YAML frontmatter instead of hiding it.
-    /// Parsed and stored here; not yet acted on.
+    /// Shows YAML frontmatter as ordinary content instead of hiding it.
+    /// `main.rs` passes this to `decor::frontmatter::apply` before the parse.
     #[arg(long)]
     pub frontmatter: bool,
 }

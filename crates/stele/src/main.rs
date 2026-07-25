@@ -1,7 +1,9 @@
-//! The `stele` binary: parse the CLI, load the document, enter the
-//! terminal, and run the scroll/resize/paint event loop. All decision logic
-//! lives in the library (`app`, `painter`, `loader`, `terminal`); this file
-//! is thin glue over real crossterm I/O and is not itself unit-tested.
+//! The `stele` binary: parse the CLI, load the document, enter the terminal,
+//! and run the scroll/resize/paint event loop. All decision logic lives in the
+//! library (`app`, `painter`, `loader`, `terminal`, `media`, `decor`); this
+//! file is thin glue over real crossterm I/O and is not itself unit-tested —
+//! it is covered black-box, through the real binary, by
+//! `tests/cli_errors.rs`, `tests/quit_restore.rs` and `tests/signal_restore.rs`.
 
 use std::io;
 use std::process::ExitCode;

@@ -2,7 +2,7 @@
 //! debounced resize/relayout — all pure and independently testable, so the
 //! event loop in `main.rs` stays thin glue over real crossterm I/O.
 
-use ast::Document;
+use ast::{Document, NodeId};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use layout::{IntrinsicSizer, LayoutConfig, LayoutTree, layout};
 use width::WidthEngine;
@@ -17,6 +17,25 @@ pub struct LayoutContext<'a> {
     pub config: &'a LayoutConfig,
     pub engine: &'a WidthEngine,
     pub sizer: &'a dyn IntrinsicSizer,
+}
+
+/// Where the reader is, expressed so it survives a relayout: the top-level
+/// source block at the top of the viewport, plus *how far into that block*
+/// the viewport top sits.
+///
+/// The offset is the part block identity alone cannot carry. A reader on line
+/// 200 of a 400-line code fence and a reader on its first line have the same
+/// block; re-anchoring on the block alone puts both on the fence's line 0.
+#[derive(Debug, Clone, Copy)]
+struct Anchor {
+    block: NodeId,
+    /// Lines of `block` scrolled off above the viewport top.
+    offset: usize,
+    /// Lines `block` occupied in the tree `offset` was measured in. Only
+    /// meaningful paired with `offset`: together they are a *fraction* of the
+    /// block, and a fraction is what stays comparable when reflow changes how
+    /// many lines the same source text takes.
+    span: usize,
 }
 
 /// The viewer's mutable state: the current layout tree, scroll offset, and
@@ -120,13 +139,15 @@ impl AppState {
         Some(false)
     }
 
-    /// Applies one key press by key code alone, with no modifier context.
+    /// The unmodified half of the key table.
     ///
-    /// Kept as the unmodified half of the key table (and as the seam tests
-    /// drive directly); the running viewer always calls
-    /// [`AppState::handle_key_event`], because a `KeyCode` on its own cannot
-    /// express a chord — `Ctrl-C` and a bare `c` are the same value here.
-    pub fn handle_key(&mut self, code: KeyCode) -> bool {
+    /// Deliberately **private**: a `KeyCode` on its own cannot express a
+    /// chord — `Ctrl-C` and a bare `c` are the same value here — so any caller
+    /// reaching for this name by reflex would silently drop Ctrl-C and the
+    /// vim `Ctrl-d`/`u`/`f`/`b` motions. [`AppState::handle_key_event`] is the
+    /// only way in, for the event loop and for tests alike, so there is
+    /// exactly one path a key can take through this type.
+    fn handle_key(&mut self, code: KeyCode) -> bool {
         match code {
             KeyCode::Char('q') => return true,
             KeyCode::Up | KeyCode::Char('k') => self.scroll_by(-1),
@@ -141,24 +162,28 @@ impl AppState {
     }
 
     /// Re-lays out the retained document at `width`/`new_size`, keeping the
-    /// block that was at the top of the viewport at the top afterward
-    /// (DW-5.3). Reflow changes line counts and wrap points, so a proportional
-    /// scroll ratio drifts; anchoring to the source block via the layout
-    /// tree's `line_blocks` map holds the reader's place exactly. Falls back
-    /// to a proportional estimate only when there is no block to anchor to
-    /// (an empty document).
+    /// reader where they were (DW-5.3). Reflow changes line counts and wrap
+    /// points, so a whole-document proportional scroll ratio drifts; anchoring
+    /// to the source block via the layout tree's `line_blocks` map, *and* to
+    /// the reader's offset inside that block, holds their place. Falls back to
+    /// a proportional estimate only when there is no block to anchor to (an
+    /// empty document, or a block that emitted no lines at the new width).
     ///
-    /// When nothing actually reflowed, the exact scroll line is kept instead.
-    /// Block anchoring pins to the block's *first* line, which is only the
-    /// reader's line when the block is short: inside one long block (a big
-    /// code fence, a rendered mermaid grid, a long table, a wrapped
-    /// paragraph) it teleports them back to the block's start. That is a
-    /// price worth paying when wrap points genuinely moved and the old line
-    /// index no longer means anything — but not on a height-only resize,
-    /// where the layout is bit-for-bit the same and any movement at all is
-    /// wrong. See `no_reflow_occurred` for how "nothing reflowed" is decided.
+    /// Three cases, in the order they are decided:
+    ///
+    /// 1. Nothing reflowed — the exact scroll line is kept, untouched. See
+    ///    `no_reflow_occurred` for how that is decided.
+    /// 2. Something reflowed but not this block: a code fence is clipped, not
+    ///    wrapped, so its line count is width-independent, and the same holds
+    ///    for any block whose wrap points did not move. `span` is unchanged,
+    ///    so the reader's offset into the block is carried across *exactly* —
+    ///    a reader 200 lines into a 400-line fence stays on line 200 of it.
+    /// 3. This block itself rewrapped — a long paragraph, a table, a mermaid
+    ///    grid. The offset is rescaled by the block's new line count, because
+    ///    the old line index no longer names the same text but the *fraction*
+    ///    of the way through the block still does.
     pub fn relayout(&mut self, ctx: &LayoutContext, width: u16, new_size: Size) {
-        let anchor = self.tree.block_at(self.scroll);
+        let anchor = self.anchor();
         let old_max = self.max_scroll();
         let ratio = if old_max == 0 {
             0.0
@@ -175,10 +200,57 @@ impl AppState {
             previous_scroll
         } else {
             anchor
-                .and_then(|block| self.tree.first_line_of(block))
+                .and_then(|anchor| self.line_of(anchor))
                 .unwrap_or_else(|| (ratio * self.max_scroll() as f64).round() as usize)
         };
         self.set_scroll(target);
+    }
+
+    /// The reader's current position as an [`Anchor`], or `None` when the top
+    /// line belongs to no block (an empty document).
+    fn anchor(&self) -> Option<Anchor> {
+        let block = self.tree.block_at(self.scroll)?;
+        let first = self.tree.first_line_of(block)?;
+        Some(Anchor {
+            block,
+            offset: self.scroll.saturating_sub(first),
+            span: self.block_span(block, first),
+        })
+    }
+
+    /// How many consecutive lines from `first` onward belong to `block`.
+    ///
+    /// A top-level block's lines are contiguous in `line_blocks`: `walk_blocks`
+    /// sets `current_block` once per block and every line emitted until the
+    /// next block is tagged with it, so counting forward from the block's first
+    /// line measures the whole block. Never zero — `first` is one of the
+    /// block's lines by construction, which is what makes `span - 1` below a
+    /// safe clamp.
+    fn block_span(&self, block: NodeId, first: usize) -> usize {
+        let mut span = 0;
+        while self.tree.block_at(first + span) == Some(block) {
+            span += 1;
+        }
+        span.max(1)
+    }
+
+    /// Where `anchor` lands in the tree that is installed *now*: the block's
+    /// new first line, plus the same distance into it.
+    ///
+    /// The distance is carried verbatim when the block still occupies the same
+    /// number of lines, and rescaled by the new line count when it does not.
+    /// Rescaling is not a heuristic for a uniformly-wrapped block: text that
+    /// sat 2/3 of the way through 300 wrapped lines sits 2/3 of the way through
+    /// the 400 the same words take at a narrower width.
+    fn line_of(&self, anchor: Anchor) -> Option<usize> {
+        let first = self.tree.first_line_of(anchor.block)?;
+        let span = self.block_span(anchor.block, first);
+        let offset = if span == anchor.span {
+            anchor.offset
+        } else {
+            (anchor.offset as f64 * span as f64 / anchor.span as f64).round() as usize
+        };
+        Some(first + offset.min(span - 1))
     }
 
     /// Whether the just-installed tree is identical to the one it replaced.
@@ -269,28 +341,28 @@ mod tests {
         let (_doc, _config, _engine, mut state) = build(&non_reflowing_source(50), 40, 10);
         assert_eq!(state.scroll(), 0);
 
-        assert!(!state.handle_key(KeyCode::Down));
+        assert!(!state.handle_key_event(plain(KeyCode::Down)));
         assert_eq!(state.scroll(), 1);
-        assert!(!state.handle_key(KeyCode::Up));
+        assert!(!state.handle_key_event(plain(KeyCode::Up)));
         assert_eq!(state.scroll(), 0);
         // Up at scroll 0 must clamp, not underflow.
-        assert!(!state.handle_key(KeyCode::Up));
+        assert!(!state.handle_key_event(plain(KeyCode::Up)));
         assert_eq!(state.scroll(), 0);
 
-        assert!(!state.handle_key(KeyCode::PageDown));
+        assert!(!state.handle_key_event(plain(KeyCode::PageDown)));
         assert_eq!(state.scroll(), state.page_size());
 
-        assert!(!state.handle_key(KeyCode::Char('G')));
+        assert!(!state.handle_key_event(plain(KeyCode::Char('G'))));
         assert_eq!(state.scroll(), state.max_scroll());
-        assert!(!state.handle_key(KeyCode::End));
+        assert!(!state.handle_key_event(plain(KeyCode::End)));
         assert_eq!(state.scroll(), state.max_scroll());
 
-        assert!(!state.handle_key(KeyCode::Char('g')));
+        assert!(!state.handle_key_event(plain(KeyCode::Char('g'))));
         assert_eq!(state.scroll(), 0);
-        assert!(!state.handle_key(KeyCode::Home));
+        assert!(!state.handle_key_event(plain(KeyCode::Home)));
         assert_eq!(state.scroll(), 0);
 
-        assert!(state.handle_key(KeyCode::Char('q')));
+        assert!(state.handle_key_event(plain(KeyCode::Char('q'))));
     }
 
     #[test]
@@ -350,7 +422,7 @@ mod tests {
 
         // Scroll partway into the document first.
         for _ in 0..100 {
-            state.handle_key(KeyCode::Down);
+            state.handle_key_event(plain(KeyCode::Down));
         }
         let topmost_before = topmost_line_text(&state);
 
@@ -409,12 +481,13 @@ mod tests {
         // at the top of the viewport (by node identity, not by text — the top
         // line may be a wrapped continuation line, not a paragraph start).
         for _ in 0..40 {
-            state.handle_key(KeyCode::Down);
+            state.handle_key_event(plain(KeyCode::Down));
         }
         let anchor = state
             .tree()
             .block_at(state.scroll())
             .expect("a scrolled-to line belongs to a block");
+        let words_before = words_scrolled_past(&state);
 
         // Resize narrow (heavy reflow) then back wide — the burst ends at 40,
         // a width at which every paragraph wraps to a different line count.
@@ -427,18 +500,143 @@ mod tests {
             .collect();
         state.apply_resize_burst(&ctx, &sizes);
 
-        // The same block is now at the top, pinned to its first line — the
-        // reader's place is held exactly, which a proportional ratio cannot do
-        // once wrap points change.
+        // The same block is now at the top, which a proportional whole-document
+        // ratio cannot do once wrap points change.
         assert_eq!(
             state.tree().block_at(state.scroll()),
             Some(anchor),
             "the topmost block must be preserved across a reflowing resize"
         );
+        // ...and the reader is still at the same place *within* it. This
+        // assertion used to read `scroll() == first_line_of(anchor)`, i.e. it
+        // required the reader be thrown to the block's first line — the exact
+        // behaviour wave-4 §2.3 flagged, asserted as if it were the goal.
+        let slack = topmost_line_text(&state).split_whitespace().count().max(1);
+        let words_after = words_scrolled_past(&state);
+        assert!(
+            words_after.abs_diff(words_before) <= slack,
+            "the reader had {words_before} words of this block above them and now has \
+             {words_after}, more than one wrapped line ({slack} words) away"
+        );
+    }
+
+    /// DW-5.3's real target, and the case block-granular anchoring loses: a
+    /// *reflowing* resize while the reader is deep inside one long block.
+    ///
+    /// A fenced code block is clipped, never wrapped (`Ctx::literal_block`), so
+    /// its 400 lines are 400 lines at every width — the reader's line inside it
+    /// means the same thing before and after, and the only correct answer is
+    /// the line they were on. Anchoring on the block alone answers "the fence's
+    /// first line" and moves them 200 lines.
+    ///
+    /// Asserted from the *text at the top of the viewport*, not from an index:
+    /// a line number that happens to match proves nothing when the whole tree
+    /// moved.
+    #[test]
+    fn test_dw_5_3_reflowing_resize_keeps_the_readers_line_inside_a_clipped_block() {
+        // The intro paragraph rewraps between 80 and 30 cells, so the fence's
+        // own first line MOVES across the resize. Without it, block-granular
+        // anchoring and offset anchoring could return the same number by
+        // accident and this test could not tell them apart.
+        let mut source = String::from(
+            "Intro paragraph carrying enough words to occupy a different number of \
+             wrapped lines at eighty cells than it does at thirty.\n\n```\n",
+        );
+        for i in 0..400 {
+            source.push_str(&format!("code line {i:03}\n"));
+        }
+        source.push_str("```\n");
+
+        let (doc, config, engine, mut state) = build(&source, 80, 20);
+        let ctx = LayoutContext {
+            doc: &doc,
+            config: &config,
+            engine: &engine,
+            sizer: &NullSizer,
+        };
+
+        // Park the reader on a line that names itself.
+        let target = (0..state.tree().line_count())
+            .find(|&i| line_text(&state, i).contains("code line 200"))
+            .expect("the fence line is in the tree");
+        while state.scroll() < target {
+            state.handle_key_event(plain(KeyCode::Down));
+        }
+        assert_eq!(state.scroll(), target, "the target line must be reachable");
+        let fence = state.tree().block_at(target).expect("the fence is a block");
+        let fence_first_before = state.tree().first_line_of(fence).unwrap();
+
+        state.apply_resize_burst(
+            &ctx,
+            &[Size {
+                width: 30,
+                height: 20,
+            }],
+        );
+
+        assert_ne!(
+            state.tree().first_line_of(fence).unwrap(),
+            fence_first_before,
+            "the fixture is broken: the fence must start at a different line \
+             after the resize, or this test cannot distinguish block anchoring \
+             from offset anchoring"
+        );
         assert_eq!(
-            state.scroll(),
-            state.tree().first_line_of(anchor).unwrap(),
-            "scroll must land on the anchored block's first line"
+            line_text(&state, state.scroll()).trim(),
+            "code line 200",
+            "the reader must still be looking at the line they were on"
+        );
+    }
+
+    /// The same guarantee for a block that genuinely REWRAPS: one enormous
+    /// paragraph. Its line count changes with width, so the reader's old line
+    /// index no longer names the same text — but the words above them do not
+    /// change, and that is what has to be preserved.
+    #[test]
+    fn test_dw_5_3_reflowing_resize_keeps_the_readers_place_inside_a_rewrapping_block() {
+        // One paragraph, 3000 distinctly-numbered words: a single source block
+        // that wraps to ~170 lines at 90 cells and ~500 at 30.
+        let source: String = (0..3000).map(|i| format!("w{i:04} ")).collect();
+        let (doc, config, engine, mut state) = build(&source, 90, 20);
+        let ctx = LayoutContext {
+            doc: &doc,
+            config: &config,
+            engine: &engine,
+            sizer: &NullSizer,
+        };
+        assert_eq!(
+            state.tree().block_at(0),
+            state.tree().block_at(100),
+            "the fixture must be one block"
+        );
+
+        for _ in 0..100 {
+            state.handle_key_event(plain(KeyCode::Down));
+        }
+        let words_before = words_scrolled_past(&state);
+        assert!(
+            words_before > 1000,
+            "the reader must be deep inside the block, not near its start"
+        );
+
+        state.apply_resize_burst(
+            &ctx,
+            &[Size {
+                width: 30,
+                height: 20,
+            }],
+        );
+
+        // One wrapped line's worth of words at the NEW width is the whole
+        // budget: rescaling by the block's new line count is exact for
+        // uniformly-wrapped text up to the rounding of one line. Block-granular
+        // anchoring scores 0 words here against ~1800.
+        let slack = topmost_line_text(&state).split_whitespace().count().max(1);
+        let words_after = words_scrolled_past(&state);
+        assert!(
+            words_after.abs_diff(words_before) <= slack,
+            "the reader had {words_before} words above them and now has {words_after}, \
+             more than one wrapped line ({slack} words) away"
         );
     }
 
@@ -468,7 +666,7 @@ mod tests {
         assert_eq!(state.tree().block_at(0), state.tree().block_at(200));
 
         for _ in 0..200 {
-            state.handle_key(KeyCode::Down);
+            state.handle_key_event(plain(KeyCode::Down));
         }
         assert_eq!(state.scroll(), 200);
 
@@ -511,7 +709,7 @@ mod tests {
         );
 
         for _ in 0..60 {
-            state.handle_key(KeyCode::Down);
+            state.handle_key_event(plain(KeyCode::Down));
         }
         let before = state.scroll();
         assert_eq!(before, 60);
@@ -738,12 +936,14 @@ mod tests {
     }
 
     fn topmost_line_text(state: &AppState) -> String {
+        line_text(state, state.scroll())
+    }
+
+    /// The painted text of one tree line: its runs concatenated. A reserved
+    /// media box contributes nothing — it carries no text.
+    fn line_text(state: &AppState, index: usize) -> String {
         use layout::{Line, LineItem};
-        match state
-            .tree()
-            .lines(state.scroll()..state.scroll() + 1)
-            .next()
-        {
+        match state.tree().lines(index..index + 1).next() {
             Some(Line::Items(items)) => items
                 .iter()
                 .filter_map(|item| match item {
@@ -753,5 +953,26 @@ mod tests {
                 .collect(),
             _ => String::new(),
         }
+    }
+
+    /// How many words of the topmost visible block have scrolled off above the
+    /// viewport top.
+    ///
+    /// This is the reader's position in the document's *content*, and it is
+    /// what a reflowing resize has to preserve. A line index cannot express it:
+    /// rewrapping changes how many lines the same words occupy, so line 100
+    /// before a resize and line 100 after it are different text. A word count
+    /// is invariant under rewrapping, so before and after are comparable.
+    fn words_scrolled_past(state: &AppState) -> usize {
+        let Some(block) = state.tree().block_at(state.scroll()) else {
+            return 0;
+        };
+        let first = state
+            .tree()
+            .first_line_of(block)
+            .expect("a block found by block_at has a first line");
+        (first..state.scroll())
+            .map(|i| line_text(state, i).split_whitespace().count())
+            .sum()
     }
 }
