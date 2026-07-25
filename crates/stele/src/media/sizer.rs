@@ -293,7 +293,7 @@ mod tests {
         let tree = layout(&doc, 100, &LayoutConfig::default(), &engine, &sizer);
         let reserved: Vec<(u16, u16)> = (0..tree.line_count())
             .filter_map(|i| match tree.lines(i..i + 1).next() {
-                Some(layout::Line::Reserved(r)) => Some((r.cols, r.rows)),
+                Some(layout::Line::Reserved(r)) => Some((r.boxed.cols, r.boxed.rows)),
                 _ => None,
             })
             .collect();

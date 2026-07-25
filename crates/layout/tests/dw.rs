@@ -57,9 +57,9 @@ fn render(tree: &LayoutTree) -> String {
             }
             Line::Reserved(r) => out.push_str(&format!(
                 "[reserved node={} {}x{}]",
-                r.node_id.index(),
-                r.cols,
-                r.rows
+                r.boxed.node_id.index(),
+                r.boxed.cols,
+                r.boxed.rows
             )),
         }
         out.push('\n');

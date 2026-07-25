@@ -67,7 +67,7 @@ fn main() {
             // reporting `cols` alone under-states a quoted or listed box by
             // the whole gutter and hides the column the box is drawn at.
             Line::Reserved(r) => {
-                let cached: u16 = r.prefix_width().saturating_add(r.cols);
+                let cached: u16 = r.prefix_width().saturating_add(r.boxed.cols);
                 let measured: u16 = r
                     .prefix
                     .iter()
@@ -76,17 +76,17 @@ fn main() {
                             engine.display_width(&run.text).min(u16::MAX as usize) as u16
                         )
                     })
-                    .saturating_add(r.cols);
+                    .saturating_add(r.boxed.cols);
                 let prefix_text: String = r.prefix.iter().map(|run| run.text.as_str()).collect();
                 (
                     cached,
                     measured,
                     format!(
                         "{prefix_text}«RESERVED {}x{} node={} col={}»",
-                        r.cols,
-                        r.rows,
-                        r.node_id.index(),
-                        cached - r.cols,
+                        r.boxed.cols,
+                        r.boxed.rows,
+                        r.boxed.node_id.index(),
+                        cached - r.boxed.cols,
                     ),
                 )
             }

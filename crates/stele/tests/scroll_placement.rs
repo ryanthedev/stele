@@ -59,6 +59,16 @@ fn write_png(dir: &Path, name: &str, w: u32, h: u32) {
 
 /// The full `a=p` put command in `frame`, and the row the cursor was moved
 /// to immediately before it (0-indexed, as `CellRect::y`).
+/// The first image id this process's sink will allocate.
+///
+/// Not the literal `1`: an id carries a pid-derived instance tag so a second
+/// stele on the same screen cannot transmit over this one's images (see
+/// `gfx::IdAllocator`). Taken from the same allocator the sink uses, so the
+/// byte-exact assertions below stay byte-exact.
+fn first_id() -> u32 {
+    gfx::IdAllocator::for_this_process().allocate().get()
+}
+
 fn put_and_row(frame: &str) -> Option<(String, u16)> {
     assert!(
         frame.matches("\x1b_Ga=p").count() <= 1,
@@ -104,8 +114,8 @@ fn fixture(tag: &str, png_px: (u32, u32)) -> Fixture {
     for (i, line) in tree.lines(0..tree.line_count()).enumerate() {
         if let Line::Reserved(r) = line {
             first.get_or_insert(i);
-            rows = r.rows;
-            cols = r.cols;
+            rows = r.boxed.rows;
+            cols = r.boxed.cols;
         }
     }
     let mut painter = Painter::new(WidthEngine::new(WidthConfig::default()));
@@ -170,8 +180,9 @@ fn test_scroll_truncated_box_is_placed_and_cropped_to_its_visible_rows() {
         assert_eq!(
             put,
             format!(
-                "\x1b_Ga=p,i=1,p=1,c={},r={visible},x=0,y={y},w={raster_w},h={h},C=1,q=2\x1b\\",
-                fx.cols
+                "\x1b_Ga=p,i={id},p={id},c={},r={visible},x=0,y={y},w={raster_w},h={h},C=1,q=2\x1b\\",
+                fx.cols,
+                id = first_id()
             ),
             "scroll {scroll}: wrong placement bytes"
         );
@@ -200,7 +211,13 @@ fn test_fully_visible_box_places_the_whole_raster_uncropped() {
     let frame = fx.frame(0);
     let (put, row) = put_and_row(&frame).expect("placement emitted");
     assert_eq!(row, fx.first as u16);
-    assert_eq!(put, "\x1b_Ga=p,i=1,p=1,c=2,r=2,C=1,q=2\x1b\\");
+    assert_eq!(
+        put,
+        format!(
+            "\x1b_Ga=p,i={id},p={id},c=2,r=2,C=1,q=2\x1b\\",
+            id = first_id()
+        )
+    );
 }
 
 /// Scrolling a fully-visible box off the top edge one row at a time must
@@ -217,14 +234,23 @@ fn test_crop_advances_one_raster_row_band_per_scrolled_off_row() {
     let at_top = fx.frame(fx.first);
     let (put_at_top, row_at_top) = put_and_row(&at_top).expect("placement emitted");
     assert_eq!(row_at_top, 0);
-    assert_eq!(put_at_top, "\x1b_Ga=p,i=1,p=1,c=2,r=2,C=1,q=2\x1b\\");
+    assert_eq!(
+        put_at_top,
+        format!(
+            "\x1b_Ga=p,i={id},p={id},c=2,r=2,C=1,q=2\x1b\\",
+            id = first_id()
+        )
+    );
 
     let one_off = fx.frame(fx.first + 1);
     let (put_one_off, row_one_off) = put_and_row(&one_off).expect("placement emitted");
     assert_eq!(row_one_off, 0, "the surviving row is still at the top");
     assert_eq!(
         put_one_off,
-        format!("\x1b_Ga=p,i=1,p=1,c=2,r=1,x=0,y={raster_band},w=48,h={raster_band},C=1,q=2\x1b\\"),
+        format!(
+            "\x1b_Ga=p,i={id},p={id},c=2,r=1,x=0,y={raster_band},w=48,h={raster_band},C=1,q=2\x1b\\",
+            id = first_id()
+        ),
         "one scrolled-off row must skip exactly one raster band and claim one cell row"
     );
 }

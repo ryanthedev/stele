@@ -165,12 +165,18 @@ pub struct Run {
 /// `node_id`/`cols`/`rows` and an ascending [`row`](Self::row).
 /// `cols`/`rows` are already scaled to fit the layout width.
 ///
-/// The box's *column* is deliberately not a field of its own: for a standalone
-/// box it is the total width of [`prefix`](Self::prefix), and for an inline
+/// Every field is a fact about the *box*, and that is what lets one type serve
+/// both a standalone [`Line::Reserved`] row and an inline [`LineItem::Box`]
+/// (where `rows == 1` and `row == 0` are true statements about the box, not a
+/// filled-in convention). The row's container prefix is deliberately not here:
+/// it is a property of the *line*, and it lives on [`ReservedLine`].
+///
+/// The box's *column* is not a field either: for a standalone box it is the
+/// total width of [`ReservedLine::prefix`], and for an inline
 /// [`LineItem::Box`] it depends on the items to its left — the painter knows
 /// both and passes the answer as `CellRect::x`, so a `col` here could only
 /// restate it (and would have to lie in the inline case).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Reserved {
     pub node_id: NodeId,
     pub cols: u16,
@@ -186,25 +192,38 @@ pub struct Reserved {
     /// over equal `node_id` is not an option either: the lines above the
     /// viewport are simply not painted.
     pub row: u16,
+}
+
+/// One row of a standalone reserved box: the box, plus the container prefix
+/// that row is painted behind.
+///
+/// The split is what keeps the media seam honest. `MediaSink::paint` is handed
+/// the [`Reserved`] alone, so the prefix runs — which are the painter's to
+/// draw, and which mean nothing to a sink that positions by `CellRect` — are
+/// not in its reach at all. While they were one struct the rule was enforced
+/// only by prose, and every sink test had to fabricate a `prefix` field that
+/// none of them read. It also keeps an always-empty `Vec` off an inline
+/// [`LineItem::Box`], whose line carries its container prefix as its own
+/// leading runs.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ReservedLine {
     /// The container prefix painted to the left of this box row: the
     /// blockquote gutter bar, the list marker on row 0 and the continuation
     /// indent on the rows below it, a footnote label — already composed and
     /// clipped by the same `prefix_runs()` a text line goes through. Empty at
-    /// the top level, and empty for an inline [`LineItem::Box`], whose line
-    /// carries the prefix as its own leading runs.
+    /// the top level.
     ///
-    /// It lives here for the same reason [`row`](Self::row) does: it is a
-    /// property of *this row of this box* that nothing downstream can
+    /// It is a property of *this row of this box* that nothing downstream can
     /// reconstruct. The painter needs the runs to paint the gutter, and their
     /// total width **is** the column the box starts at — one source of truth
     /// for both, rather than a `col` that could drift from the runs beside it.
     pub prefix: Vec<Run>,
+    pub boxed: Reserved,
 }
 
-impl Reserved {
+impl ReservedLine {
     /// Total cell width of [`prefix`](Self::prefix) — the column this box row
-    /// starts at, for a standalone box. Saturating, matching the rest of the
-    /// width arithmetic here.
+    /// starts at. Saturating, matching the rest of the width arithmetic here.
     pub fn prefix_width(&self) -> u16 {
         self.prefix
             .iter()
@@ -226,10 +245,10 @@ impl Reserved {
 pub enum LineItem {
     Run(Run),
     /// An inline media box occupying `cols` columns of this row. `rows` is
-    /// always 1 and [`Reserved::prefix`] is empty (this line's own leading
-    /// runs carry the container prefix); both fields are kept so P6's
-    /// `paint(reserved, rect)` seam takes the same [`Reserved`] value for
-    /// inline and block media alike.
+    /// always 1 and `row` always 0, so P6's `paint(reserved, rect)` seam takes
+    /// the same [`Reserved`] value for inline and block media alike. The
+    /// container prefix is not on the box (see [`ReservedLine`]) — this line's
+    /// own leading runs carry it.
     Box(Reserved),
 }
 
@@ -251,11 +270,11 @@ impl LineItem {
 /// [`LineItem::Box`] on an `Items` line because the two are painted by
 /// different machinery, and because the inline path is one row tall by
 /// construction and cannot describe a multi-row box. The row's container
-/// prefix rides along inside [`Reserved::prefix`].
+/// prefix rides along inside [`ReservedLine::prefix`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Line {
     Items(Vec<LineItem>),
-    Reserved(Reserved),
+    Reserved(ReservedLine),
 }
 
 impl Line {
@@ -268,7 +287,7 @@ impl Line {
             Line::Items(items) => items
                 .iter()
                 .fold(0u16, |acc, item| acc.saturating_add(item.width())),
-            Line::Reserved(r) => r.prefix_width().saturating_add(r.cols),
+            Line::Reserved(r) => r.prefix_width().saturating_add(r.boxed.cols),
         }
     }
 }

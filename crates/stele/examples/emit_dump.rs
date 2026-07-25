@@ -52,7 +52,7 @@ fn main() {
                 };
                 acc.saturating_add(w)
             }),
-            Line::Reserved(r) => r.cols,
+            Line::Reserved(r) => r.boxed.cols,
         };
         if measured > width {
             overflow.push((i, measured));
@@ -98,9 +98,9 @@ fn main() {
                 reserved_rows += 1;
                 println!(
                     "  line {i:>3}: <reserved {}x{} node={}>",
-                    r.cols,
-                    r.rows,
-                    r.node_id.index()
+                    r.boxed.cols,
+                    r.boxed.rows,
+                    r.boxed.node_id.index()
                 );
             }
         }

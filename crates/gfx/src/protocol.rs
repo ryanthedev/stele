@@ -24,9 +24,16 @@ use base64::Engine as _;
 const CHUNK_SIZE: usize = 4096;
 
 /// Identity of one kitty-protocol image. Kitty's own id space is a plain
-/// `u32`; `0` is reserved by the protocol to mean "no id," so callers should
-/// allocate from `1..`, but this type does not itself enforce that (the
-/// caller — [`crate`]'s `MediaSink` — owns id allocation).
+/// `u32`; `0` is reserved by the protocol to mean "no id."
+///
+/// **The id space is global to the terminal, not private to this process.**
+/// The spec is explicit that ids "are in a global namespace" and "there can
+/// easily be collisions," and it defines the collision's outcome: re-
+/// transmitting an existing id *replaces* that image and deletes all its
+/// placements. So an id chosen naively from `1..` — which is what this doc
+/// used to recommend — lets any other kitty-graphics program sharing the
+/// screen destroy this one's images, and vice versa. [`IdAllocator`] is the
+/// answer; see its doc for the policy and why not `I=` image numbers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ImageId(u32);
 
@@ -37,6 +44,77 @@ impl ImageId {
 
     pub fn get(self) -> u32 {
         self.0
+    }
+}
+
+/// Bits of an image id that belong to the allocating process's own counter.
+/// The rest are its instance tag.
+const ID_COUNTER_BITS: u32 = 20;
+const ID_COUNTER_MASK: u32 = (1 << ID_COUNTER_BITS) - 1;
+/// How many distinct instance tags the id's high bits can hold.
+const ID_TAG_BUCKETS: u32 = 1 << (32 - ID_COUNTER_BITS);
+
+/// Hands out image ids inside one process's slice of the terminal's **global**
+/// id namespace: a pid-derived tag in the high bits, a monotonic counter in
+/// the low `ID_COUNTER_BITS`.
+///
+/// Two viewers in one Ghostty window (two panes, two tabs on one surface, a
+/// multiplexer passing graphics through) each allocate from their own tag, so
+/// neither can transmit over an id the other is using — which per the spec
+/// would delete the other's image *and every placement of it*, silently, from
+/// the victim's point of view. `yazi` shipped exactly that bug with a
+/// hardcoded `i=1` and fixed it the same way.
+///
+/// **Why not `I=` image numbers,** which the spec offers for precisely this
+/// problem: acting on a number is defined as acting on "the newest image with
+/// that number," so two processes both using number 1 do not collide on
+/// transmit but *do* collide on every later `a=p` — the loser places the
+/// winner's raster. The spec's escape from that is to read back the assigned
+/// id from the terminal's reply, and this crate suppresses every reply
+/// (`q=2`) by design, on a fd that a keyboard reader owns. A pid-derived tag
+/// needs no reply and no round trip.
+///
+/// **Collision odds, stated rather than implied:** the tag is 12 bits with
+/// bucket 0 excluded, so two concurrently-running instances share a tag with
+/// probability 1/4095. That is a real number, not zero, and it is the price of
+/// not reading replies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IdAllocator {
+    tag: u32,
+    next: u32,
+}
+
+impl IdAllocator {
+    /// An allocator tagged for the current process.
+    ///
+    /// The pid's own high bits are folded down rather than truncated away:
+    /// Linux allows pids past 4 million, and truncating to 12 bits would map
+    /// every pid congruent mod 4096 onto one tag — including the neighbouring
+    /// pids that two panes of the same terminal are most likely to get.
+    ///
+    /// Tag 0 is excluded, so every id this yields is above the whole counter
+    /// range. That is not cosmetic: bucket 0 *is* the naive `1..` range, the
+    /// one every program that has not thought about the namespace allocates
+    /// from, so it is the single most contended tag on any shared screen.
+    pub fn for_this_process() -> Self {
+        let pid = std::process::id();
+        let tag = (pid ^ (pid >> 12) ^ (pid >> 24)) % (ID_TAG_BUCKETS - 1) + 1;
+        IdAllocator {
+            tag: tag << ID_COUNTER_BITS,
+            next: 1,
+        }
+    }
+
+    /// The next id in this process's slice.
+    ///
+    /// The counter runs `1..=ID_COUNTER_MASK` and then wraps back to 1,
+    /// rather than climbing into the tag bits — which would walk this process
+    /// into another instance's slice, the exact collision the tag exists to
+    /// prevent. It never yields 0, which the protocol reserves for "no id."
+    pub fn allocate(&mut self) -> ImageId {
+        let id = ImageId(self.tag | self.next);
+        self.next = ((self.next + 1) & ID_COUNTER_MASK).max(1);
+        id
     }
 }
 
@@ -499,6 +577,51 @@ mod tests {
         };
         let out = captured(|buf| Emitter::new().place(ImageId::new(1), rect, buf));
         assert!(out.contains("c=1,r=1"));
+    }
+
+    /// The id namespace is global to the terminal: a second stele — or any
+    /// other kitty-graphics client — transmitting the same id *replaces* this
+    /// one's image and deletes every placement of it. The guarantee that
+    /// prevents it is positional, so assert it positionally: every id this
+    /// process hands out lies above the entire naive counter range, and the
+    /// counter never leaks into the tag that keeps it there.
+    #[test]
+    fn test_allocated_ids_sit_above_the_naive_counter_range_under_a_pid_tag() {
+        let mut alloc = IdAllocator::for_this_process();
+        let first = alloc.allocate();
+        let second = alloc.allocate();
+        assert!(
+            first.get() > ID_COUNTER_MASK,
+            "id {} is inside the 1.. range every untagged client uses",
+            first.get()
+        );
+        assert_eq!(first.get() & ID_COUNTER_MASK, 1, "counter starts at 1");
+        assert_eq!(second.get() & ID_COUNTER_MASK, 2, "counter increments");
+        assert_eq!(
+            first.get() & !ID_COUNTER_MASK,
+            second.get() & !ID_COUNTER_MASK,
+            "the tag is per-process, so it must not move between allocations"
+        );
+    }
+
+    /// Wrapping is the one moment the counter could climb out of its own slice
+    /// and land on another instance's ids, so walk the whole period and check
+    /// the tag on every single id rather than sampling the ends.
+    #[test]
+    fn test_counter_wraps_inside_its_slice_and_never_yields_the_reserved_zero() {
+        let mut alloc = IdAllocator::for_this_process();
+        let first = alloc.allocate();
+        let tag = first.get() & !ID_COUNTER_MASK;
+        let mut last = first;
+        for _ in 0..ID_COUNTER_MASK {
+            last = alloc.allocate();
+            assert_eq!(last.get() & !ID_COUNTER_MASK, tag, "tag moved: {last:?}");
+            assert_ne!(last.get() & ID_COUNTER_MASK, 0, "0 means \"no id\"");
+        }
+        assert_eq!(
+            last, first,
+            "after a full period the counter must be back at its first value"
+        );
     }
 
     #[test]

@@ -37,10 +37,35 @@ pub trait MediaSink {
 
     /// Paints one row of a reserved media box into `rect`.
     ///
-    /// `reserved.row` says which row *of the box* this is, so a box whose top
-    /// has scrolled above the viewport is paintable; `rect` is where it goes
-    /// and is the only position the sink may use — the caller's cursor is not
-    /// on the box.
+    /// Called once per row of the box that is on screen, in top-to-bottom
+    /// order. Every subtle obligation of this seam is on this method, so they
+    /// are written here rather than left to be reassembled from
+    /// [`crate::painter`]'s call sites:
+    ///
+    /// - **`rect` is the position, and the only one.** The caller's cursor is
+    ///   not on the box — an inline box's blanking spaces leave it a whole box
+    ///   width to the right — so a sink that writes at the cursor writes
+    ///   outside the box. Everything it emits must be positioned absolutely
+    ///   from `rect`.
+    /// - **`rect.height` is the box's visible remainder from this row down**,
+    ///   not 1. On the box's first painted row that is its whole on-screen
+    ///   extent, which is the one thing a sink cannot work out for itself: it
+    ///   sees neither the viewport height nor how many rows scrolled off the
+    ///   top. (For an inline box `rows == 1`, so the remainder *is* 1 — the
+    ///   contract is uniform, not a special case.)
+    /// - **`rect.x` is the box's real column**, after any container prefix; the
+    ///   caller has already painted the prefix runs and does not expect them
+    ///   back. [`Reserved`] deliberately carries no prefix data (it lives on
+    ///   [`layout::ReservedLine`]), so there is nothing here to misread.
+    /// - **`reserved.row` says which row *of the box* this is**, which differs
+    ///   from the call's ordinal within the frame whenever the box's top has
+    ///   scrolled above the viewport. It is what makes a top-truncated box
+    ///   paintable instead of re-anchored to the first visible row.
+    /// - **An inline box's cells are already blanked** by the caller, so a sink
+    ///   that draws a transparent raster does not show the previous frame's
+    ///   glyphs through it.
+    /// - **The cursor may be left anywhere.** The caller re-homes it after an
+    ///   inline box and does not depend on where a block box leaves it.
     fn paint(&mut self, reserved: &Reserved, rect: CellRect, out: &mut dyn Write);
 
     /// Drops `node_id`'s media entirely, on demand.
@@ -53,7 +78,10 @@ pub trait MediaSink {
     /// tests only. The trait doc used to describe it as the scroll-out
     /// mechanism, which stopped being true when the sweep moved into
     /// `begin_frame`.
-    fn evict(&mut self, node_id: NodeId, out: &mut dyn Write);
+    ///
+    /// Defaulted to a no-op for that reason: with no caller, requiring every
+    /// implementor to write an empty body only spreads the dead weight.
+    fn evict(&mut self, _node_id: NodeId, _out: &mut dyn Write) {}
 }
 
 /// The no-media default: a true no-op on every call.
@@ -62,5 +90,4 @@ pub struct NoopMediaSink;
 
 impl MediaSink for NoopMediaSink {
     fn paint(&mut self, _reserved: &Reserved, _rect: CellRect, _out: &mut dyn Write) {}
-    fn evict(&mut self, _node_id: NodeId, _out: &mut dyn Write) {}
 }

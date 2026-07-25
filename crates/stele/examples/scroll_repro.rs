@@ -46,7 +46,7 @@ AFTER-E
     let mut reserved_rows = Vec::new();
     for (i, line) in tree.lines(0..tree.line_count()).enumerate() {
         if let Line::Reserved(r) = line {
-            reserved_rows.push((i, r.rows, r.cols));
+            reserved_rows.push((i, r.boxed.rows, r.boxed.cols));
         }
     }
     let first = reserved_rows.first().map(|r| r.0).unwrap_or(0);

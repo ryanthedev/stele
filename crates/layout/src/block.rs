@@ -11,7 +11,8 @@ use width::WidthEngine;
 
 use crate::inline::{self, Piece};
 use crate::{
-    AlertTone, CellSize, IntrinsicSizer, Line, LineItem, Reserved, Run, Semantic, StyleId,
+    AlertTone, CellSize, IntrinsicSizer, Line, LineItem, Reserved, ReservedLine, Run, Semantic,
+    StyleId,
 };
 
 /// Minimum content columns the prefix may never consume (clamped to the
@@ -163,12 +164,14 @@ impl<'a> Ctx<'a> {
         };
         for row in 0..rows {
             let prefix = self.prefix_runs();
-            self.push_line(Line::Reserved(Reserved {
-                node_id,
-                cols,
-                rows,
-                row,
+            self.push_line(Line::Reserved(ReservedLine {
                 prefix,
+                boxed: Reserved {
+                    node_id,
+                    cols,
+                    rows,
+                    row,
+                },
             }));
         }
     }

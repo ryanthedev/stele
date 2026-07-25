@@ -27,4 +27,4 @@ pub mod decode;
 pub mod protocol;
 
 pub use decode::{DecodeError, DecodedImage, Limits};
-pub use protocol::{CellRect, Emitter, ImageId, SourceRect};
+pub use protocol::{CellRect, Emitter, IdAllocator, ImageId, SourceRect};

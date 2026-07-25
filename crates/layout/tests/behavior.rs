@@ -52,8 +52,8 @@ fn text_of(tree: &LayoutTree) -> Vec<String> {
                     .iter()
                     .map(|run| run.text.as_str())
                     .collect::<String>(),
-                r.cols,
-                r.rows
+                r.boxed.cols,
+                r.boxed.rows
             ),
         })
         .collect()
@@ -164,7 +164,7 @@ fn test_image_scaled_to_fit_preserving_aspect() {
     let reserved: Vec<_> = tree
         .lines(0..tree.line_count())
         .filter_map(|l| match l {
-            Line::Reserved(r) => Some(r.clone()),
+            Line::Reserved(r) => Some(r.boxed),
             _ => None,
         })
         .collect();
@@ -309,7 +309,7 @@ fn test_sizer_receives_resolvable_node_id() {
     let reserved: Vec<_> = tree
         .lines(0..tree.line_count())
         .filter_map(|l| match l {
-            Line::Reserved(r) => Some(r.clone()),
+            Line::Reserved(r) => Some(r.boxed),
             _ => None,
         })
         .collect();
@@ -536,7 +536,7 @@ fn inline_boxes(tree: &LayoutTree) -> Vec<(usize, layout::Reserved)> {
             Line::Items(items) => items
                 .iter()
                 .filter_map(|item| match item {
-                    LineItem::Box(b) => Some((i, b.clone())),
+                    LineItem::Box(b) => Some((i, *b)),
                     LineItem::Run(_) => None,
                 })
                 .collect::<Vec<_>>(),
@@ -594,7 +594,7 @@ fn test_inline_box_taller_than_one_row_still_claims_its_own_rows() {
     let reserved: Vec<_> = tree
         .lines(0..tree.line_count())
         .filter_map(|l| match l {
-            Line::Reserved(r) => Some(r.clone()),
+            Line::Reserved(r) => Some(r.boxed),
             _ => None,
         })
         .collect();
@@ -751,7 +751,7 @@ fn test_reserved_box_in_a_blockquote_starts_after_the_gutter_on_every_row() {
                 r.prefix
                     .iter()
                     .fold(0u16, |acc, run| acc.saturating_add(run.width)),
-                r.row,
+                r.boxed.row,
             )),
             _ => None,
         })

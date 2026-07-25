@@ -201,7 +201,7 @@ impl Harness {
             let idx = scroll + r as usize;
             let mut block = None;
             match self.tree.lines(idx..idx + 1).next() {
-                Some(Line::Reserved(reserved)) => block = Some(reserved.node_id),
+                Some(Line::Reserved(line)) => block = Some(line.boxed.node_id),
                 Some(Line::Items(items)) if items.iter().any(|i| matches!(i, LineItem::Box(_))) => {
                     rows.insert(r + 1);
                 }

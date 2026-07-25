@@ -250,9 +250,6 @@ pub(crate) fn wrap(atoms: Vec<Atom>, content_width: u16, engine: &WidthEngine) -
                     cols: box_w,
                     rows: 1,
                     row: 0,
-                    // The prefix for this row is already on the line, as the
-                    // runs to the left of this box.
-                    prefix: Vec::new(),
                 }));
                 cur_w = cur_w.saturating_add(box_w);
                 pending_space = false;

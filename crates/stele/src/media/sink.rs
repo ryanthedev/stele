@@ -93,7 +93,7 @@ use width::WidthEngine;
 
 use crate::media::MediaSink;
 use crate::media::sizer::MATH_BASELINE_PX_HEIGHT;
-use crate::painter::CellRect;
+use crate::painter::{CellRect, sanitize};
 
 /// Kitty protocol / DW-6.1 cap: at most this many placements stay live at
 /// once; the (32+1)-th distinct node evicts the least-recently-painted one
@@ -160,13 +160,14 @@ pub struct GfxMediaSink {
     /// all — no `&Document`-plus-`&WidthEngine` layout call is reachable
     /// from any method on it).
     cell_px: (u32, u32),
-    next_id: u32,
+    /// This process's slice of the terminal's global image-id namespace — see
+    /// [`gfx::IdAllocator`] for why that is not just `1..`.
+    ids: gfx::IdAllocator,
     placements: HashMap<NodeId, Placement>,
     /// Least-recently-used order: front = evict first, back = most recent.
     lru: Vec<NodeId>,
     frame_counter: u64,
     width_engine: WidthEngine,
-    last_row: Option<u16>,
     row_in_frame: HashMap<NodeId, u16>,
     resolved_this_frame: HashMap<NodeId, Resolved>,
     /// Test-only failure injection for DW-6.2's ladder (each rung must be
@@ -187,12 +188,11 @@ impl GfxMediaSink {
             emitter: gfx::Emitter::new(),
             limits: gfx::Limits::default(),
             cell_px: (24, 48),
-            next_id: 1,
+            ids: gfx::IdAllocator::for_this_process(),
             placements: HashMap::new(),
             lru: Vec::new(),
             frame_counter: 0,
             width_engine: WidthEngine::new(width::WidthConfig::default()),
-            last_row: None,
             row_in_frame: HashMap::new(),
             resolved_this_frame: HashMap::new(),
             force_ratex_fail: false,
@@ -208,6 +208,14 @@ impl GfxMediaSink {
     /// Updates the assumed cell-pixel geometry a subsequent `paint` scales
     /// rasters to — the orchestrator's hook for a live `CSI 16t` re-query
     /// on `SIGWINCH`/geometry change (DW-6.5).
+    ///
+    /// Nothing in the viewer calls it yet — the only `CSI 16t` anywhere in the
+    /// workspace is the spike probe's (`probe/src/bin/spike_a.rs`) — so
+    /// `cell_px` holds `sizer`'s measured 24×48 for the life of a session.
+    /// What a live query would change is raster *resolution*, and the cache key
+    /// that goes with it; never geometry. The reserved box's cell extent is
+    /// fixed at layout time, and `crop_source` measures against the raster's
+    /// own pixels.
     pub fn set_cell_px(&mut self, cell_px: (u32, u32)) {
         self.cell_px = cell_px;
     }
@@ -222,10 +230,24 @@ impl GfxMediaSink {
         self.force_txm_fail = fail;
     }
 
+    /// The next image id for a node that has none: the allocator's next id in
+    /// this process's slice of the namespace, skipping any that a live
+    /// placement still holds.
+    ///
+    /// The skip is what makes the allocator's wrap harmless. Ids are handed out
+    /// fresh on every re-transmit (a node evicted by the grace sweep or the cap
+    /// loses its record and comes back with a new id), so a long session does
+    /// walk the counter round; without this check the id that came round could
+    /// land on a node whose raster is still resident, and transmitting it would
+    /// destroy that node's image and every placement of it. At most [`CAP`]
+    /// records exist, so the loop can iterate at most `CAP` times.
     fn alloc_id(&mut self) -> gfx::ImageId {
-        let id = gfx::ImageId::new(self.next_id);
-        self.next_id += 1;
-        id
+        loop {
+            let id = self.ids.allocate();
+            if !self.placements.values().any(|p| p.id == id) {
+                return id;
+            }
+        }
     }
 
     /// Starts a frame: resets per-frame bookkeeping, frees rasters past their
@@ -244,13 +266,8 @@ impl GfxMediaSink {
         self.frame_counter += 1;
         self.row_in_frame.clear();
         self.resolved_this_frame.clear();
-        self.last_row = None;
         self.evict_stale(out);
         self.unplace_all(out);
-    }
-
-    fn begin_row(&mut self, row: u16) {
-        self.last_row = Some(row);
     }
 
     /// Frees the **raster** of every node that has now gone unpainted for a
@@ -465,25 +482,19 @@ impl GfxMediaSink {
     /// own double-width glyphs occupy up to two cells per character, so a
     /// char-count budget lets the row overflow its reserved box. On the
     /// bottom viewport row that overflow wraps, which scrolls the alternate
-    /// screen and corrupts the frame. This mirrors `painter::clip_to_width`.
+    /// screen and corrupts the frame. It is [`crate::painter::clip_to_width`]'s
+    /// budget loop, called rather than re-implemented: a second copy of the
+    /// cell-budget arithmetic is the drift risk this guard exists to prevent,
+    /// and the copy that used to live here had already lost the saturating
+    /// width the original returns.
     fn write_text_row(
         engine: &WidthEngine,
         line: Option<&String>,
         rect: CellRect,
         out: &mut dyn Write,
     ) {
-        let budget = rect.width.max(1) as usize;
         let text = line.map(String::as_str).unwrap_or("");
-        let mut used = 0usize;
-        let mut clipped = String::with_capacity(text.len());
-        for cluster in width::graphemes(text) {
-            let w = engine.cluster_width(cluster) as usize;
-            if used + w > budget {
-                break;
-            }
-            used += w;
-            clipped.push_str(cluster);
-        }
+        let (clipped, _) = crate::painter::clip_to_width(text, engine, rect.width.max(1));
         // Emitted unconditionally, even for an empty row: the frame's
         // per-line `CLEAR_TO_EOL` fires from wherever this leaves the
         // cursor, so a row that writes no glyphs still has to leave it at
@@ -528,6 +539,85 @@ impl GfxMediaSink {
         )
     }
 
+    /// Re-places an already-resident raster and reports whether it did.
+    ///
+    /// `false` means there is no record for this node, or the record's raster
+    /// was rendered for a different target size (a resize) and has to be
+    /// remade. `true` means this frame cost a re-place and nothing else —
+    /// which is what the unplace-at-frame-boundary rule is paid for: a box
+    /// scrolls off, comes back, and the PNG never goes on the wire again.
+    ///
+    /// Shared by both resolvers on purpose. The two arms of the ladder carried
+    /// byte-equivalent copies of this and of [`Self::transmit_and_place`], so
+    /// the LRU/placement invariants had two homes and a fix to one arm left
+    /// the other quietly wrong.
+    fn replace_if_cached(
+        &mut self,
+        node_id: NodeId,
+        target: (u32, u32),
+        reserved: &Reserved,
+        rect: CellRect,
+        out: &mut dyn Write,
+    ) -> bool {
+        let cached = self
+            .placements
+            .get(&node_id)
+            .is_some_and(|existing| existing.rendered_px == target);
+        if !cached {
+            return false;
+        }
+        self.touch_lru(node_id);
+        self.place_box(node_id, reserved, rect, out);
+        true
+    }
+
+    /// Transmits `png` as this node's raster, records it, and places it.
+    ///
+    /// `false` — nothing written — when the cap has no honest slot to hand
+    /// out, i.e. every live placement was already painted in this frame. The
+    /// caller degrades to its text rung; taking a slot from a box already on
+    /// screen would blank it.
+    ///
+    /// `target` is the size the raster was *requested* at and is what the
+    /// cache key compares; the raster's real pixel size is measured from the
+    /// PNG, because only the image path scales to the target exactly (see
+    /// [`Placement::raster_px`]).
+    fn transmit_and_place(
+        &mut self,
+        node_id: NodeId,
+        png: &[u8],
+        target: (u32, u32),
+        reserved: &Reserved,
+        rect: CellRect,
+        out: &mut dyn Write,
+    ) -> bool {
+        if !self.evict_lru_if_needed(node_id, out) {
+            return false;
+        }
+        let id = self
+            .placements
+            .get(&node_id)
+            .map(|p| p.id)
+            .unwrap_or_else(|| self.alloc_id());
+        let raster_px = png_pixel_size(png).unwrap_or(target);
+        self.emitter.transmit(id, png, out);
+        self.touch_lru(node_id);
+        // Recorded before it is placed, not after: `place_box` is what marks
+        // a node visible, and it can only do that for a node it can find.
+        self.placements.insert(
+            node_id,
+            Placement {
+                id,
+                rendered_px: target,
+                raster_px,
+                last_seen_frame: self.frame_counter,
+                placed: false,
+            },
+        );
+        self.place_box(node_id, reserved, rect, out);
+        true
+    }
+
     fn resolve_image(
         &mut self,
         node_id: NodeId,
@@ -538,18 +628,7 @@ impl GfxMediaSink {
         out: &mut dyn Write,
     ) -> Resolved {
         let target = self.target_px(rect, reserved);
-        if self
-            .placements
-            .get(&node_id)
-            .is_some_and(|existing| existing.rendered_px == target)
-        {
-            // The raster is already resident at the right size, so this
-            // frame costs a re-place and nothing else — which is exactly
-            // what the unplace-at-frame-boundary rule is paid for: the box
-            // scrolls, disappears and comes back without the PNG ever going
-            // back on the wire.
-            self.touch_lru(node_id);
-            self.place_box(node_id, reserved, rect, out);
+        if self.replace_if_cached(node_id, target, reserved, rect, out) {
             return Resolved::Graphics;
         }
 
@@ -558,7 +637,7 @@ impl GfxMediaSink {
         // alt-text rung now, before paying for a decode whose raster could
         // never reach the screen — and before an eviction that would blank a
         // box already painted this frame. Purely an optimization: the
-        // authoritative gate is `evict_lru_if_needed` below, which runs once
+        // authoritative gate is `transmit_and_place` below, which runs once
         // the raster is in hand so a *failed* decode never costs another
         // node its live placement.
         if !self.has_placement_slot(node_id) {
@@ -576,30 +655,9 @@ impl GfxMediaSink {
                 return self.degrade_to_text(sanitize(&alt), rect, out);
             }
         };
-        if !self.evict_lru_if_needed(node_id, out) {
+        if !self.transmit_and_place(node_id, &decoded.png, target, reserved, rect, out) {
             return self.degrade_to_text(sanitize(&alt), rect, out);
         }
-        let id = self
-            .placements
-            .get(&node_id)
-            .map(|p| p.id)
-            .unwrap_or_else(|| self.alloc_id());
-        let raster_px = png_pixel_size(&decoded.png).unwrap_or(target);
-        self.emitter.transmit(id, &decoded.png, out);
-        self.touch_lru(node_id);
-        // Recorded before it is placed, not after: `place_box` is what marks
-        // a node visible, and it can only do that for a node it can find.
-        self.placements.insert(
-            node_id,
-            Placement {
-                id,
-                rendered_px: target,
-                raster_px,
-                last_seen_frame: self.frame_counter,
-                placed: false,
-            },
-        );
-        self.place_box(node_id, reserved, rect, out);
         Resolved::Graphics
     }
 
@@ -621,13 +679,7 @@ impl GfxMediaSink {
         let target = self.target_px(rect, reserved);
 
         if !self.force_ratex_fail {
-            if self
-                .placements
-                .get(&node_id)
-                .is_some_and(|existing| existing.rendered_px == target)
-            {
-                self.touch_lru(node_id);
-                self.place_box(node_id, reserved, rect, out);
+            if self.replace_if_cached(node_id, target, reserved, rect, out) {
                 return Resolved::Graphics;
             }
             // Render at the SAME em the sizer measured this box with, and let
@@ -653,27 +705,8 @@ impl GfxMediaSink {
             if self.has_placement_slot(node_id)
                 && let Ok(png) =
                     math::render_fitted(&tex, MATH_BASELINE_PX_HEIGHT, target.0, target.1)
-                && self.evict_lru_if_needed(node_id, out)
+                && self.transmit_and_place(node_id, png.as_bytes(), target, reserved, rect, out)
             {
-                let id = self
-                    .placements
-                    .get(&node_id)
-                    .map(|p| p.id)
-                    .unwrap_or_else(|| self.alloc_id());
-                let raster_px = png_pixel_size(png.as_bytes()).unwrap_or(target);
-                self.emitter.transmit(id, png.as_bytes(), out);
-                self.touch_lru(node_id);
-                self.placements.insert(
-                    node_id,
-                    Placement {
-                        id,
-                        rendered_px: target,
-                        raster_px,
-                        last_seen_frame: self.frame_counter,
-                        placed: false,
-                    },
-                );
-                self.place_box(node_id, reserved, rect, out);
                 return Resolved::Graphics;
             }
         }
@@ -703,7 +736,6 @@ impl MediaSink for GfxMediaSink {
     }
 
     fn paint(&mut self, reserved: &Reserved, rect: CellRect, out: &mut dyn Write) {
-        self.begin_row(rect.y);
         let row_index = *self.row_in_frame.get(&reserved.node_id).unwrap_or(&0);
         self.row_in_frame.insert(reserved.node_id, row_index + 1);
 
@@ -767,12 +799,20 @@ fn text_rung_line<'a>(
 /// `None` means "the whole raster" — the box is fully on screen, so the
 /// placement omits the source keys entirely and kitty's own defaults apply.
 ///
-/// The mapping is proportional, not cell-geometry-derived: the terminal
-/// scales the source rectangle onto the requested cell box linearly on each
-/// axis, so `top_skip/rows` of the raster's height is `top_skip` cell rows
-/// whatever the terminal's cell size turns out to be. That is deliberate —
-/// this viewer has no reliable cell-pixel query to lean on (`CSI 16t` goes
-/// unanswered under the multiplexer in use), and it does not need one.
+/// The mapping is proportional, not cell-geometry-derived: the ratio is taken
+/// against the raster's *own* measured pixel height, and the terminal scales
+/// the source rectangle onto the requested cell box linearly on each axis, so
+/// `top_skip/rows` of that height is `top_skip` cell rows whatever the
+/// terminal's cell size turns out to be.
+///
+/// That is a stronger claim than "no cell-pixel query is available", which is
+/// what an earlier revision of this comment argued from (and argued from an
+/// environment this code never runs in: `main.rs` disables graphics outright
+/// under a multiplexer, so `GfxMediaSink` never reaches a session where
+/// `CSI 16t` goes unanswered). Cell geometry does feed the *raster* stage —
+/// [`GfxMediaSink::set_cell_px`] and `sizer`'s `ASSUMED_CELL_PX`, whose 24×48
+/// is a live-Ghostty measurement, not a guess — but the crop is correct for
+/// any cell size, so wiring a live query would not change a byte of it.
 fn crop_source(
     raster_px: (u32, u32),
     rows: u16,
@@ -816,25 +856,6 @@ fn png_pixel_size(png: &[u8]) -> Option<(u32, u32)> {
     let width = u32::from_be_bytes(png[16..20].try_into().ok()?);
     let height = u32::from_be_bytes(png[20..24].try_into().ok()?);
     (width > 0 && height > 0).then_some((width, height))
-}
-
-/// Duplicated, minimal equivalent of `crate::painter`'s private barricade
-/// sanitizer (C0/DEL/C1 controls + bidi override/isolate formatting
-/// characters stripped). Kept here rather than reused because
-/// `painter::sanitize` is private and `painter.rs` is out of this phase's
-/// file scope — any text this sink writes directly (alt text, a txm grid
-/// row, literal TeX source) bypasses `Painter`'s own barricade, so it must
-/// carry the same guarantee independently.
-fn sanitize(text: &str) -> String {
-    text.chars()
-        .filter(|&c| {
-            !matches!(
-                c as u32,
-                0x00..=0x1F | 0x7F | 0x80..=0x9F
-                | 0x202A..=0x202E | 0x2066..=0x2069,
-            )
-        })
-        .collect()
 }
 
 fn plain_text_of(children: &[Inline]) -> String {
@@ -893,6 +914,22 @@ mod tests {
             .write_all(&bytes)
             .unwrap();
         path
+    }
+
+    /// The `nth` image id this process's allocator hands out (`nth_id(1)` is
+    /// the first).
+    ///
+    /// Tests name real ids rather than `1, 2, 3`: an id carries a pid-derived
+    /// instance tag (see [`gfx::IdAllocator`]), so a hardcoded `1` would be
+    /// asserting the very global-namespace collision the tag exists to
+    /// prevent. Derived from the same allocator production uses, not from a
+    /// re-implementation of its arithmetic.
+    fn nth_id(nth: u32) -> u32 {
+        let mut alloc = gfx::IdAllocator::for_this_process();
+        for _ in 1..nth {
+            alloc.allocate();
+        }
+        alloc.allocate().get()
     }
 
     fn creates(out: &[u8]) -> usize {
@@ -987,6 +1024,64 @@ mod tests {
         }
     }
 
+    /// Kitty image ids live in a namespace that is **global to the terminal**,
+    /// so an id this sink transmits is an id every other graphics client on the
+    /// same screen can transmit too — and per the spec the second transmit
+    /// deletes the first image and all of its placements. A second stele in a
+    /// neighbouring pane would therefore have blanked this one's images, and
+    /// been blanked in return.
+    ///
+    /// Asserted on the id that actually reaches the wire, parsed out of the
+    /// `a=t` command, because that is the only place the guarantee is real: the
+    /// id must be tagged for this process, i.e. above the whole naive counter
+    /// range that an untagged allocator hands out.
+    #[test]
+    fn test_transmitted_image_ids_are_namespaced_to_this_process() {
+        let dir = scratch_dir("id-namespace");
+        write_png(&dir, "ns.png");
+        let doc = Document::parse("![alt](./ns.png)\n");
+        let node_id = doc
+            .nodes()
+            .find(|n| matches!(n, NodeRef::Inline(i) if matches!(i.kind, InlineKind::Image { .. })))
+            .map(|n| n.id())
+            .unwrap();
+        let mut sink = GfxMediaSink::new(doc, &dir);
+        let mut out = Vec::new();
+        sink.begin_frame(&mut out);
+        sink.paint(
+            &Reserved {
+                node_id,
+                cols: 4,
+                rows: 1,
+                row: 0,
+            },
+            CellRect {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 1,
+            },
+            &mut out,
+        );
+        let transmitted: Vec<u32> = commands(&out)
+            .into_iter()
+            .filter(|&(kind, _)| kind == 't')
+            .map(|(_, id)| id)
+            .collect();
+        assert_eq!(
+            transmitted,
+            vec![nth_id(1)],
+            "one transmit, at the first id"
+        );
+        // 1..=0xFFFFF is the low, untagged slice — what an allocator that
+        // counted from 1 would emit, and what every other naive client emits.
+        assert!(
+            transmitted[0] > 0xFFFFF,
+            "image id {} is in the range a colliding client would use",
+            transmitted[0]
+        );
+    }
+
     /// The bug this module's frame boundary exists to prevent, stated as
     /// directly as the wire allows: after any frame, the images the terminal
     /// is drawing are exactly the images that frame placed.
@@ -1032,7 +1127,6 @@ mod tests {
                         cols: 10,
                         rows: 1,
                         row: 0,
-                        prefix: Vec::new(),
                     },
                     CellRect {
                         x: 0,
@@ -1092,7 +1186,6 @@ mod tests {
             cols: 10,
             rows: 1,
             row: 0,
-            prefix: Vec::new(),
         };
         let rect = CellRect {
             x: 0,
@@ -1106,7 +1199,7 @@ mod tests {
         let mut f1 = Vec::new();
         sink.begin_frame(&mut f1);
         sink.paint(&reserved(nodes[0]), rect, &mut f1);
-        assert_eq!(commands(&f1), vec![('t', 1), ('p', 1)]);
+        assert_eq!(commands(&f1), vec![('t', nth_id(1)), ('p', nth_id(1))]);
         term.apply(&f1);
 
         // A scrolls off. Its placement must go — but its raster must not.
@@ -1115,18 +1208,18 @@ mod tests {
         sink.paint(&reserved(nodes[1]), rect, &mut f2);
         assert_eq!(
             commands(&f2),
-            vec![('u', 1), ('t', 2), ('p', 2)],
+            vec![('u', nth_id(1)), ('t', nth_id(2)), ('p', nth_id(2))],
             "A must be unplaced (d=i), never deleted (d=I), on the frame it leaves"
         );
         term.apply(&f2);
         assert_eq!(
             term.visible,
-            std::collections::BTreeSet::from([2]),
+            std::collections::BTreeSet::from([nth_id(2)]),
             "only B is on the screen once A has scrolled off"
         );
         assert_eq!(
             term.stored,
-            std::collections::BTreeSet::from([1, 2]),
+            std::collections::BTreeSet::from([nth_id(1), nth_id(2)]),
             "A's pixel data must survive its placement — residency and \
              visibility are different lifetimes"
         );
@@ -1159,7 +1252,6 @@ mod tests {
             cols: 10,
             rows: 1,
             row: 0,
-            prefix: Vec::new(),
         };
 
         let mut f1 = Vec::new();
@@ -1174,7 +1266,7 @@ mod tests {
             },
             &mut f1,
         );
-        assert_eq!(commands(&f1), vec![('t', 1), ('p', 1)]);
+        assert_eq!(commands(&f1), vec![('t', nth_id(1)), ('p', nth_id(1))]);
 
         // Same box, next frame, one row higher. The frame boundary unplaces
         // it and the paint puts it back — same id both times.
@@ -1192,12 +1284,16 @@ mod tests {
         );
         assert_eq!(
             commands(&f2),
-            vec![('u', 1), ('p', 1)],
+            vec![('u', nth_id(1)), ('p', nth_id(1))],
             "an unplaced node must keep its id and its raster: no fresh transmit, \
              and no id the earlier raster is no longer reachable through"
         );
         assert!(
-            String::from_utf8_lossy(&f2).contains("\x1b[3;1H\x1b_Ga=p,i=1,p=1"),
+            String::from_utf8_lossy(&f2).contains(&format!(
+                "\x1b[3;1H\x1b_Ga=p,i={},p={},",
+                nth_id(1),
+                nth_id(1)
+            )),
             "and it must be re-placed at its NEW row: {:?}",
             String::from_utf8_lossy(&f2)
         );
@@ -1236,7 +1332,6 @@ mod tests {
                 cols: 10,
                 rows: 1,
                 row: 0,
-                prefix: Vec::new(),
             };
             let rect = CellRect {
                 x: 0,
@@ -1342,7 +1437,6 @@ mod tests {
                 cols: 10,
                 rows: 1,
                 row: 0,
-                prefix: Vec::new(),
             };
             sink.paint(
                 &reserved,
@@ -1367,7 +1461,6 @@ mod tests {
                 cols: 10,
                 rows: 1,
                 row: 0,
-                prefix: Vec::new(),
             },
             rect,
             &mut f2,
@@ -1381,8 +1474,8 @@ mod tests {
         let cmds = commands(&f2);
         assert_eq!(
             cmds.iter().find(|&&(k, _)| k == 'd').copied(),
-            Some(('d', 1)),
-            "the least-recently-painted raster (image 1) must be freed to make room, got {cmds:?}"
+            Some(('d', nth_id(1))),
+            "the least-recently-painted raster (the first id) must be freed to make room, got {cmds:?}"
         );
         assert_eq!(
             cmds.iter().filter(|&&(k, _)| k == 'u').count(),
@@ -1394,7 +1487,7 @@ mod tests {
                 .filter(|&&(k, _)| k == 'p')
                 .map(|&(_, id)| id)
                 .collect::<Vec<_>>(),
-            vec![33],
+            vec![nth_id(33)],
             "the only image visible after frame 2 is the one frame 2 painted, got {cmds:?}"
         );
         assert_eq!(creates(&f2), 1, "the 33rd box must get a real placement");
@@ -1425,7 +1518,6 @@ mod tests {
             cols: 10,
             rows: 1,
             row: 0,
-            prefix: Vec::new(),
         };
         let rect = CellRect {
             x: 0,
@@ -1488,7 +1580,6 @@ mod tests {
                 cols: 10,
                 rows: 1,
                 row: 0,
-                prefix: Vec::new(),
             };
             let rect = CellRect {
                 x: 0,
@@ -1546,7 +1637,6 @@ mod tests {
             cols: 20,
             rows: 1,
             row: 0,
-            prefix: Vec::new(),
         };
         let rect = CellRect {
             x: 0,
@@ -1609,7 +1699,6 @@ mod tests {
             cols: 20,
             rows: 1,
             row: 0,
-            prefix: Vec::new(),
         };
         let rect = CellRect {
             x: 0,
@@ -1639,7 +1728,6 @@ mod tests {
             cols: 20,
             rows: 2,
             row: 0,
-            prefix: Vec::new(),
         };
         let rect = CellRect {
             x: 0,
@@ -1705,7 +1793,6 @@ mod tests {
             cols: 10,
             rows: 1,
             row: 0,
-            prefix: Vec::new(),
         };
         let rect = CellRect {
             x: 0,
@@ -1744,7 +1831,6 @@ mod tests {
             cols: 10,
             rows: 1,
             row: 0,
-            prefix: Vec::new(),
         };
         let at = |y: u16| CellRect {
             x: 0,
@@ -1792,7 +1878,6 @@ mod tests {
             cols: 10,
             rows: 1,
             row: 0,
-            prefix: Vec::new(),
         };
         let rect = CellRect {
             x: 0,
@@ -1888,7 +1973,6 @@ mod tests {
             cols: 8,
             rows: 1,
             row: 0,
-            prefix: Vec::new(),
         };
         let rect = CellRect {
             x: 0,
@@ -1946,7 +2030,6 @@ mod tests {
                 cols: 12,
                 rows: 1,
                 row: 0,
-                prefix: Vec::new(),
             },
             CellRect {
                 x: 7,
@@ -1995,7 +2078,6 @@ mod tests {
                     cols: 10,
                     rows: grid.rows.len() as u16,
                     row: i as u16,
-                    prefix: Vec::new(),
                 },
                 CellRect {
                     x: 5,
@@ -2064,7 +2146,6 @@ mod tests {
                         cols: 10,
                         rows,
                         row: box_row,
-                        prefix: Vec::new(),
                     },
                     CellRect {
                         x: 0,
@@ -2118,7 +2199,6 @@ mod tests {
                 cols: 12,
                 rows: 3,
                 row: 2,
-                prefix: Vec::new(),
             },
             CellRect {
                 x: 0,
@@ -2173,7 +2253,6 @@ mod tests {
                     cols: 10,
                     rows: 1,
                     row: 0,
-                    prefix: Vec::new(),
                 },
                 CellRect {
                     x: 0,
@@ -2193,7 +2272,6 @@ mod tests {
                 cols: 10,
                 rows: 1,
                 row: 0,
-                prefix: Vec::new(),
             },
             CellRect {
                 x: 3,

@@ -12,7 +12,7 @@
 use std::io::{self, Write};
 
 use highlight::{HYPERLINK_CLOSE, hyperlink_open};
-use layout::{LayoutTree, Line, LineItem, Reserved, Run, Semantic, StyleId};
+use layout::{LayoutTree, Line, LineItem, Reserved, ReservedLine, Run, Semantic, StyleId};
 use width::WidthEngine;
 
 use crate::decor::{Decor, StructuralDecor};
@@ -244,7 +244,7 @@ impl Painter {
     ) -> io::Result<()> {
         match line {
             Line::Items(items) => self.paint_items(items, row, size.width, out),
-            Line::Reserved(reserved) => self.paint_reserved(reserved, row, size, out),
+            Line::Reserved(line) => self.paint_reserved(line, row, size, out),
         }
     }
 
@@ -263,14 +263,15 @@ impl Painter {
     /// visible row, painting the image down over the text below it.
     fn paint_reserved(
         &mut self,
-        reserved: &Reserved,
+        line: &ReservedLine,
         row: u16,
         size: Size,
         out: &mut dyn Write,
     ) -> io::Result<()> {
+        let reserved = &line.boxed;
         let mut painted_any = false;
         let mut col: u16 = 0;
-        for run in &reserved.prefix {
+        for run in &line.prefix {
             let remaining = size.width.saturating_sub(col);
             if remaining == 0 {
                 break;
@@ -290,7 +291,7 @@ impl Painter {
         // not painted across it. `x` comes from the laid-out prefix width
         // rather than from what actually got painted, so the box lands in the
         // same column whether or not a narrow viewport clipped the gutter.
-        let x = reserved.prefix_width();
+        let x = line.prefix_width();
         if x >= size.width {
             // The whole box is off the right edge of this (narrower than
             // laid-out) viewport. Painting nothing beats placing at column 0.
@@ -461,7 +462,16 @@ impl Painter {
 /// reorder rendered text to disguise a link or command. The directional
 /// *marks* (LRM/RLM/ALM) that legitimate RTL text needs are left intact;
 /// only the override and isolate controls are removed.
-fn sanitize(text: &str) -> String {
+///
+/// `pub(crate)` because the barricade has a second entrance: [`MediaSink`]
+/// implementations write text straight to the wire (image alt text, the txm
+/// math grid, literal TeX source) without passing through [`Painter::paint_run`],
+/// so they must carry the same guarantee. It used to be a second, hand-copied
+/// body in `media::sink`, with a comment explaining that `painter.rs` was out
+/// of that phase's file scope — a scheduling fact that read to the next reader
+/// as an instruction to keep duplicating. One function is the invariant; two
+/// identical functions are a request to diff two files.
+pub(crate) fn sanitize(text: &str) -> String {
     text.chars()
         .filter(|&c| {
             !matches!(
@@ -478,7 +488,15 @@ fn sanitize(text: &str) -> String {
 /// never split mid-character. Width decisions are accumulated in `usize`
 /// and only the final stored value is saturated to `u16`, per the layout
 /// crate's own width-seam gotcha (never `display_width(..) as u16` bare).
-fn clip_to_width(text: &str, engine: &WidthEngine, max_width: u16) -> (String, u16) {
+///
+/// `pub(crate)` for the same reason [`sanitize`] is: the media sink's fallback
+/// rows are clipped to their reserved box with exactly this budget loop, and
+/// the copy that used to live there had already drifted (it discarded the
+/// measured width instead of saturating it). A CJK or txm double-width glyph
+/// that overruns its box wraps on the bottom viewport row and scrolls the
+/// alternate screen, so the two call sites need the *same* budget arithmetic,
+/// not two that look alike.
+pub(crate) fn clip_to_width(text: &str, engine: &WidthEngine, max_width: u16) -> (String, u16) {
     let budget = max_width as usize;
     let mut used = 0usize;
     let mut out = String::with_capacity(text.len());
@@ -743,7 +761,6 @@ mod tests {
             cols: 10,
             rows: 1,
             row: 0,
-            prefix: Vec::new(),
         };
         let rect = CellRect {
             x: 0,
