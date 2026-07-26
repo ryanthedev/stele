@@ -18,22 +18,27 @@
 //! visible media (an image scrolled fully off-screen was never deleted and
 //! stayed on the terminal for the rest of the session). The boundary drives
 //! two independent mechanisms:
-//! - **LRU cap (32 live placements):** deterministic, and *frame-aware* —
-//!   a placement already painted in the current frame is never a victim. It
-//!   used to be chosen on insertion count alone, and since LRU order within
-//!   a frame is paint order, that deterministically deleted the boxes at the
-//!   top-left of the viewport as soon as a 33rd came into view: transmitted,
-//!   placed, then deleted inside one frame, leaving empty cells with nothing
-//!   painted in their place. A 40-badge README row reaches that. When every
-//!   live placement belongs to the current frame there is no honest slot to
-//!   hand out, so the box takes its **text rung** instead — a rung that
-//!   paints alt text beats one that paints nothing.
-//! - **Pixel-data grace ("one-viewport margin" approximation):** the pinned
-//!   trait carries no scroll-position or viewport-height, so a true
-//!   scroll-distance margin isn't observable from here. A node's transmitted
-//!   *raster* is freed once it has gone unpainted for a full frame beyond the
-//!   frame it was last painted in — the closest achievable analog.
-//!   Documented as a deliberate simplification, not a silently-assumed one.
+//! - **Placement cap (32 live placements):** a per-frame quota, and nothing
+//!   more. Because the boundary unplaces everything (below), the live
+//!   placements at any moment are exactly the boxes this frame has painted so
+//!   far, so the cap is a straight count of them — there is no eviction
+//!   decision left to get wrong. It used to be enforced by evicting an LRU
+//!   entry, and since LRU order within a frame is paint order, that
+//!   deterministically deleted the boxes at the top-left of the viewport as
+//!   soon as a 33rd came into view: transmitted, placed, then deleted inside
+//!   one frame, leaving empty cells with nothing painted in their place. A
+//!   40-badge README row reaches that. Over the quota a box takes its **text
+//!   rung** instead — a rung that paints alt text beats one that paints
+//!   nothing.
+//! - **Raster residency (a byte budget, in [`residency::RasterCache`]):** how
+//!   long the terminal keeps an image's *pixel data*, governed by how many
+//!   bytes of raster this process is asking it to hold, with least-recently-
+//!   used eviction. This was a frame-count grace period approximating a
+//!   one-viewport scroll margin, and its arithmetic was off by one in the
+//!   direction that closed the window before any frame could use it — a node
+//!   absent from frame *N-1* lost its raster at the top of frame *N*, so a
+//!   scroll-back re-transmitted every time. See that module's own doc for why
+//!   bytes are the honest unit and frames were not.
 //!
 //! **Two lifetimes, not one.** Those two mechanisms govern how long the
 //! terminal keeps an image's *pixel data*. Whether an image is *drawn* is a
@@ -59,7 +64,13 @@
 //! The two deletes are therefore not interchangeable: `a=d,d=i` (lowercase,
 //! [`gfx::Emitter::clear_placements`]) ends *visibility*, `a=d,d=I`
 //! (uppercase, [`gfx::Emitter::delete`]) ends *residency* and is what the
-//! grace and the 32-cap emit.
+//! byte budget emits.
+//!
+//! The split is now structural, not just documented: visibility lives in this
+//! file's `placed` list, residency lives in [`residency::RasterCache`], and
+//! neither can see the other's bound. While they shared one map the
+//! 32-placement cap was checked against its `len()`, which capped raster
+//! retention at 32 as a side effect nobody chose.
 //!
 //! **Scroll truncation.** A multi-row box is painted one row at a time, and
 //! a scrolled viewport shows only a contiguous slice of those rows. Two
@@ -83,7 +94,7 @@
 //! screen; a top-truncated box painted its image downward over the document
 //! text below it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -93,54 +104,32 @@ use layout::Reserved;
 use width::WidthEngine;
 
 use crate::media::MediaSink;
+use crate::media::residency::{RasterCache, Resident};
 use crate::media::sizer::MATH_BASELINE_PX_HEIGHT;
 use crate::painter::{CellRect, sanitize};
 
-/// Kitty protocol / DW-6.1 cap: at most this many placements stay live at
-/// once; the (32+1)-th distinct node evicts the least-recently-painted one
-/// first.
+/// Kitty protocol / DW-6.1 cap: at most this many placements may be live at
+/// once, i.e. at most this many media boxes are drawn in any one frame. The
+/// 33rd visible box takes its text rung.
+///
+/// It bounds *placements* and nothing else. It used to be applied to the map
+/// that also held rasters, which capped raster retention at 32 as a silent
+/// side effect; residency is now [`RasterCache`]'s byte budget and this
+/// constant appears nowhere near it.
 const CAP: usize = 32;
 
-/// One frame of grace after a node stops being painted before its
-/// transmitted **raster** is freed — see the module doc comment's
-/// "one-viewport margin" note.
+/// How many bytes of transmitted raster this process asks the terminal to
+/// hold at once, before the least-recently-used one is freed.
 ///
-/// This governs *residency only*. Visibility has no grace at all: a box not
-/// painted this frame is unplaced at the frame boundary, whatever this says.
-/// Conflating the two is what left stale images on the screen — the grace
-/// deferred the eviction to a frame that, in an input-driven painter, only
-/// arrives when the user presses another key.
-const DATA_GRACE_FRAMES: u64 = 1;
-
-struct Placement {
-    id: gfx::ImageId,
-    /// The `(width_px, height_px)` the currently-transmitted raster was
-    /// rendered at. A repaint at the same target size reuses it (no
-    /// re-decode / re-render) — this is DW-6.5's cache.
-    rendered_px: (u32, u32),
-    /// The raster's *actual* `(width_px, height_px)`, read back from the
-    /// transmitted PNG rather than assumed to equal `rendered_px`.
-    ///
-    /// Both producers now go through `gfx::decode`'s letterbox, so in practice
-    /// this equals `rendered_px` — it did not used to: `math::render_fitted`
-    /// letterboxed to the target's *aspect* only, so a formula's raster was a
-    /// different pixel size entirely, and cropping against `rendered_px`
-    /// mis-cropped every one of them. Kept measured rather than collapsed into
-    /// `rendered_px` because source-rectangle cropping is denominated in raster
-    /// pixels: this field is where that unit is *observed*, and a future
-    /// producer that stops matching its target stays correct here instead of
-    /// silently mis-cropping again.
-    raster_px: (u32, u32),
-    /// The last frame this node was painted in. Drives the raster's
-    /// residency (the grace sweep and the LRU cap) — never its visibility.
-    last_seen_frame: u64,
-    /// Whether a placement for this image is currently on the terminal's
-    /// screen. Set by [`GfxMediaSink::place_box`], cleared by the frame
-    /// boundary's unplace sweep. This is the field that makes "visible" an
-    /// answerable question at all: `last_seen_frame` cannot answer it,
-    /// because a raster deliberately outlives its placement.
-    placed: bool,
-}
+/// A raster is letterboxed to exactly its cell box in pixels, so a full-width,
+/// half-screen image at the fallback 24x48 cell geometry is a 2400x2400 PNG —
+/// 1-3 MB depending on content — and an inline formula is a few kilobytes.
+/// 64 MiB therefore holds tens of full-screen images or thousands of formulas:
+/// an order of magnitude past the 32-placement cap that used to bound the same
+/// set, which is the coupling DW-3.6 exists to break. Kitty's own default
+/// image-storage quota is 320 MB, so this stays well inside what a terminal
+/// expects a single client to spend.
+const RASTER_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
 
 /// What a node resolved to this frame, remembered so later rows of the
 /// same (possibly multi-row) box know what to do without re-resolving.
@@ -181,10 +170,19 @@ pub struct GfxMediaSink {
     /// This process's slice of the terminal's global image-id namespace — see
     /// [`gfx::IdAllocator`] for why that is not just `1..`.
     ids: gfx::IdAllocator,
-    placements: HashMap<NodeId, Placement>,
-    /// Least-recently-used order: front = evict first, back = most recent.
-    lru: Vec<NodeId>,
-    frame_counter: u64,
+    /// **Residency**: whose pixel data the terminal is holding, bounded by a
+    /// byte budget. Knows nothing about what is on the screen.
+    cache: RasterCache,
+    /// **Visibility**: the nodes with a live placement right now, in paint
+    /// order. Emptied by the frame boundary's unplace sweep and refilled by
+    /// this frame's paints, so `placed.len()` *is* the live-placement count
+    /// the [`CAP`] quota is spent against, and membership *is* the answer to
+    /// "can the reader see this box".
+    ///
+    /// A `Vec` rather than a set: it is capped at [`CAP`], and the paint
+    /// order it preserves is what makes the unplace sweep's byte stream
+    /// deterministic.
+    placed: Vec<NodeId>,
     width_engine: WidthEngine,
     row_in_frame: HashMap<NodeId, u16>,
     resolved_this_frame: HashMap<NodeId, Resolved>,
@@ -193,6 +191,11 @@ pub struct GfxMediaSink {
     /// one).
     force_ratex_fail: bool,
     force_txm_fail: bool,
+    /// Test-only: reinstate the pre-Phase-3 residency window, where a node
+    /// absent from the previous frame lost its raster at the top of this one.
+    /// Exists so DW-3.5's benchmark measures the real old behaviour rather
+    /// than a stand-in for it. See [`GfxMediaSink::simulate_pre_change_residency_for_test`].
+    pre_change_residency: bool,
 }
 
 impl GfxMediaSink {
@@ -213,19 +216,27 @@ impl GfxMediaSink {
             limits: gfx::Limits::default(),
             cell_px: crate::terminal::FALLBACK_CELL_PX,
             ids: gfx::IdAllocator::for_this_process(),
-            placements: HashMap::new(),
-            lru: Vec::new(),
-            frame_counter: 0,
+            cache: RasterCache::new(RASTER_BUDGET_BYTES),
+            placed: Vec::new(),
             width_engine: WidthEngine::new(width::WidthConfig::default()),
             row_in_frame: HashMap::new(),
             resolved_this_frame: HashMap::new(),
             force_ratex_fail: false,
             force_txm_fail: false,
+            pre_change_residency: false,
         }
     }
 
     pub fn with_limits(mut self, limits: gfx::Limits) -> Self {
         self.limits = limits;
+        self
+    }
+
+    /// How many bytes of transmitted raster the terminal is asked to hold
+    /// before the least-recently-used one is freed. Defaults to 64 MiB — see
+    /// this module's `RASTER_BUDGET_BYTES` for where that number comes from.
+    pub fn with_raster_budget(mut self, bytes: u64) -> Self {
+        self.cache = RasterCache::new(bytes);
         self
     }
 
@@ -271,30 +282,58 @@ impl GfxMediaSink {
         self.force_txm_fail = fail;
     }
 
+    /// Test-only: put the residency window back the way it was before
+    /// Phase 3, so a benchmark can measure against the real pre-change code
+    /// rather than a re-description of it.
+    ///
+    /// The old sweep computed `cutoff = frame - (DATA_GRACE_FRAMES + 1)` and
+    /// freed every raster whose node's `last_seen_frame <= cutoff`, which
+    /// with the shipped grace of 1 is exactly "not painted in the previous
+    /// frame" — and it ran at the *top* of the frame, before that frame's
+    /// paints could claim anything. Reproduced here as that one sentence,
+    /// which is all the arithmetic ever amounted to.
+    #[doc(hidden)]
+    pub fn simulate_pre_change_residency_for_test(&mut self, on: bool) {
+        self.pre_change_residency = on;
+    }
+
+    /// How many bytes of raster the terminal is currently holding for this
+    /// sink — the quantity [`GfxMediaSink::with_raster_budget`] bounds.
+    #[doc(hidden)]
+    pub fn resident_bytes(&self) -> u64 {
+        self.cache.bytes_resident()
+    }
+
+    /// How many nodes have a resident raster. Distinct from the number of
+    /// *placed* boxes, which is what [`CAP`] bounds.
+    #[doc(hidden)]
+    pub fn resident_count(&self) -> usize {
+        self.cache.len()
+    }
+
     /// The next image id for a node that has none: the allocator's next id in
-    /// this process's slice of the namespace, skipping any that a live
-    /// placement still holds.
+    /// this process's slice of the namespace, skipping any that a resident
+    /// raster still holds.
     ///
     /// The skip is what makes the allocator's wrap harmless. Ids are handed out
-    /// fresh on every re-transmit (a node evicted by the grace sweep or the cap
-    /// loses its record and comes back with a new id), so a long session does
-    /// walk the counter round; without this check the id that came round could
-    /// land on a node whose raster is still resident, and transmitting it would
-    /// destroy that node's image and every placement of it. At most [`CAP`]
-    /// records exist, so the loop can iterate at most `CAP` times.
+    /// fresh on every re-transmit (a node the byte budget evicted loses its
+    /// record and comes back with a new id), so a long session does walk the
+    /// counter round; without this check the id that came round could land on a
+    /// node whose raster is still resident, and transmitting it would destroy
+    /// that node's image and every placement of it. The resident set is bounded
+    /// by the byte budget, so the loop terminates.
     fn alloc_id(&mut self) -> gfx::ImageId {
         loop {
             let id = self.ids.allocate();
-            if !self.placements.values().any(|p| p.id == id) {
+            if !self.cache.holds_id(id) {
                 return id;
             }
         }
     }
 
-    /// Starts a frame: resets per-frame bookkeeping, frees rasters past their
-    /// grace period, and takes every remaining placement off the screen so
-    /// that only boxes actually painted in this frame are visible when it
-    /// ends.
+    /// Starts a frame: resets per-frame bookkeeping and takes every remaining
+    /// placement off the screen, so that only boxes actually painted in this
+    /// frame are visible when it ends.
     ///
     /// Driven by `MediaSink::begin_frame`, never inferred from `paint` call
     /// order. Row-order inference was wrong in two ways: on a scroll-up every
@@ -303,26 +342,31 @@ impl GfxMediaSink {
     /// frame containing no media never ran the sweep at all, so an image
     /// scrolled fully off-screen was never deleted and stayed on the
     /// terminal indefinitely.
+    ///
+    /// No raster sweep runs here any more: residency is a byte budget spent at
+    /// transmit time, not a countdown checked at the frame boundary. That is
+    /// the whole of the fix — the old sweep freed, at the top of frame *N*,
+    /// exactly the rasters frame *N* was about to ask for.
     fn begin_frame_inner(&mut self, out: &mut dyn Write) {
-        self.frame_counter += 1;
         self.row_in_frame.clear();
         self.resolved_this_frame.clear();
-        self.evict_stale(out);
+        if self.pre_change_residency {
+            self.evict_everything_absent_last_frame(out);
+        }
         self.unplace_all(out);
     }
 
-    /// Frees the **raster** of every node that has now gone unpainted for a
-    /// full frame beyond its grace (`a=d,d=I` — data and placements both).
-    ///
-    /// Run before [`Self::unplace_all`] so a node being dropped entirely
-    /// costs one escape rather than an unplace followed by a delete.
-    fn evict_stale(&mut self, out: &mut dyn Write) {
-        let cutoff = self.frame_counter.saturating_sub(DATA_GRACE_FRAMES + 1);
+    /// The pre-Phase-3 residency sweep, retained only for
+    /// [`GfxMediaSink::simulate_pre_change_residency_for_test`]'s benchmark
+    /// baseline. Runs before [`Self::unplace_all`], so `placed` still holds
+    /// the *previous* frame's boxes — which is precisely the set the old
+    /// `last_seen_frame` comparison spared.
+    fn evict_everything_absent_last_frame(&mut self, out: &mut dyn Write) {
+        let last_frame: HashSet<NodeId> = self.placed.iter().copied().collect();
         let stale: Vec<NodeId> = self
-            .placements
-            .iter()
-            .filter(|(_, p)| p.last_seen_frame <= cutoff)
-            .map(|(id, _)| *id)
+            .cache
+            .resident_nodes()
+            .filter(|node_id| !last_frame.contains(node_id))
             .collect();
         for node_id in stale {
             self.delete_placement(node_id, out);
@@ -350,95 +394,43 @@ impl GfxMediaSink {
     /// **The record survives, and that is what makes the lowercase delete
     /// safe.** [`gfx::Emitter::delete`]'s doc comment warns that `d=i` would
     /// leave one orphaned raster per eviction, and it is right — but only
-    /// because an *evicted* node loses its entry here, so the next paint
+    /// because an *evicted* node loses its residency record, so the next paint
     /// allocates a **fresh** id via [`Self::alloc_id`] and the old raster
-    /// becomes unreachable. Unplacing is not eviction: nothing is removed
-    /// from `placements`, so the node keeps its id, the id keeps pointing at
+    /// becomes unreachable. Unplacing is not eviction: nothing is removed from
+    /// the [`RasterCache`], so the node keeps its id, the id keeps pointing at
     /// the raster the terminal still holds, and the next `d=I` for that node
-    /// frees exactly the raster the `d=i` left behind. Removing an entry
-    /// here would reintroduce the orphan the uppercase delete exists to
+    /// frees exactly the raster the `d=i` left behind. Dropping the residency
+    /// record here would reintroduce the orphan the uppercase delete exists to
     /// prevent.
     ///
-    /// Order is LRU order, purely for determinism in the byte stream.
+    /// Order is paint order, purely for determinism in the byte stream.
     fn unplace_all(&mut self, out: &mut dyn Write) {
         let live: Vec<gfx::ImageId> = self
-            .lru
+            .placed
             .iter()
-            .filter_map(|node_id| self.placements.get(node_id))
-            .filter(|p| p.placed)
-            .map(|p| p.id)
+            .filter_map(|node_id| self.cache.peek(*node_id))
+            .map(|resident| resident.id)
             .collect();
         for id in live {
             self.emitter.clear_placements(id, out);
         }
-        for placement in self.placements.values_mut() {
-            placement.placed = false;
-        }
-    }
-
-    fn touch_lru(&mut self, node_id: NodeId) {
-        self.lru.retain(|&id| id != node_id);
-        self.lru.push(node_id);
-    }
-
-    /// The least-recently-painted node whose raster is *safe* to free: one
-    /// that is not on the screen right now and was not painted in the
-    /// current frame.
-    ///
-    /// The filter is the whole point. LRU order within a frame is paint
-    /// order, so an unfiltered "evict the front of the LRU" deletes the
-    /// boxes at the top-left of the viewport — ones already transmitted and
-    /// placed *this* frame — leaving blank cells behind with nothing painted
-    /// in their place. See [`Self::evict_lru_if_needed`].
-    ///
-    /// `!placed` and the frame test are two statements of one rule and are
-    /// kept together deliberately: `placed` is the property that actually
-    /// matters (never delete something the viewer can see), while the frame
-    /// test is what makes it true for a node whose placement this frame is
-    /// still in flight.
-    fn evictable_victim(&self) -> Option<NodeId> {
-        self.lru.iter().copied().find(|id| {
-            self.placements
-                .get(id)
-                .is_some_and(|p| !p.placed && p.last_seen_frame < self.frame_counter)
-        })
+        self.placed.clear();
     }
 
     /// Whether `incoming` can be given a placement this frame at all —
-    /// checked *before* any decode or rasterization, so an over-budget box
-    /// degrades to its text rung without paying for a raster it can never
-    /// put on screen (and without re-paying on every subsequent frame).
+    /// checked *before* any decode or rasterization, so an over-quota box
+    /// degrades to its text rung without paying for a raster it can never put
+    /// on screen (and without re-paying on every subsequent frame).
     ///
-    /// Non-mutating on purpose: the real eviction happens only once the
-    /// raster is in hand, so a decode that fails never costs another box
-    /// its live placement.
+    /// This is the whole of the [`CAP`] rule now. The frame boundary unplaces
+    /// everything, so the live placements are exactly the boxes this frame has
+    /// painted so far — there is no stale placement to reclaim and therefore
+    /// no eviction decision to get wrong. Over the quota there is no honest
+    /// placement to hand out, and taking one from a box already on screen this
+    /// frame would blank it, so the caller degrades to its text rung: a rung
+    /// that paints alt text beats one that paints nothing.
     fn has_placement_slot(&self, incoming: NodeId) -> bool {
-        self.placements.contains_key(&incoming)
-            || self.placements.len() < CAP
-            || self.evictable_victim().is_some()
-    }
-
-    /// Enforces the 32-live-placement cap before a *new* node's placement
-    /// is inserted (an update to an already-tracked node never evicts).
-    ///
-    /// Returns `false` when the cap is full of placements that were all
-    /// painted in **this** frame — i.e. more than [`CAP`] media boxes are
-    /// visible at once, which an ordinary README badge row reaches. There
-    /// is no honest placement to give the caller then, and taking one from a
-    /// box already on screen this frame would blank it. The caller degrades
-    /// to its text rung instead, which is what the ladder is for: a rung
-    /// that paints nothing is worse than one that paints alt text.
-    fn evict_lru_if_needed(&mut self, incoming: NodeId, out: &mut dyn Write) -> bool {
-        if self.placements.contains_key(&incoming) {
-            return true;
-        }
-        while self.placements.len() >= CAP {
-            let Some(victim) = self.evictable_victim() else {
-                return false;
-            };
-            self.delete_placement(victim, out);
-        }
-        true
+        self.placed.contains(&incoming) || self.placed.len() < CAP
     }
 
     /// Drops a node entirely: its placement **and** its transmitted raster
@@ -447,10 +439,10 @@ impl GfxMediaSink {
     /// a node deleted this way pays for a full re-transmit when it comes
     /// back, and gets a fresh image id when it does.
     fn delete_placement(&mut self, node_id: NodeId, out: &mut dyn Write) {
-        if let Some(p) = self.placements.remove(&node_id) {
-            self.emitter.delete(p.id, out);
+        if let Some(id) = self.cache.remove(node_id) {
+            self.emitter.delete(id, out);
         }
-        self.lru.retain(|&id| id != node_id);
+        self.placed.retain(|&id| id != node_id);
     }
 
     /// Emits the placement for one media box: the cell rect it actually
@@ -462,12 +454,12 @@ impl GfxMediaSink {
     /// is how many of the box's rows are on screen from here down.
     ///
     /// The single place a placement is created, so it is also the single
-    /// place `placed`/`last_seen_frame` are set — every "this node is on the
-    /// screen" claim in this file traces back to exactly one write. The
-    /// node's record must already exist (a raster has to be transmitted
-    /// before it can be placed); no record means nothing to place, which is
-    /// how a decode that failed after a previous frame's placement stays
-    /// silent rather than emitting a put for freed pixel data.
+    /// place `placed` is appended to — every "this node is on the screen"
+    /// claim in this file traces back to exactly one write. The node's raster
+    /// must already be resident (a raster has to be transmitted before it can
+    /// be placed); no residency means nothing to place, which is how a decode
+    /// that failed after a previous frame's placement stays silent rather
+    /// than emitting a put for freed pixel data.
     fn place_box(
         &mut self,
         node_id: NodeId,
@@ -475,12 +467,13 @@ impl GfxMediaSink {
         rect: CellRect,
         out: &mut dyn Write,
     ) {
-        let Some(placement) = self.placements.get_mut(&node_id) else {
+        let Some(resident) = self.cache.peek(node_id) else {
             return;
         };
-        placement.placed = true;
-        placement.last_seen_frame = self.frame_counter;
-        let (id, raster_px) = (placement.id, placement.raster_px);
+        let (id, raster_px) = (resident.id, resident.raster_px);
+        if !self.placed.contains(&node_id) {
+            self.placed.push(node_id);
+        }
         let rows = reserved.rows.max(1);
         let top_skip = reserved.row.min(rows - 1);
         let visible = rect.height.max(1).min(rows - top_skip);
@@ -582,16 +575,24 @@ impl GfxMediaSink {
 
     /// Re-places an already-resident raster and reports whether it did.
     ///
-    /// `false` means there is no record for this node, or the record's raster
-    /// was rendered for a different target size (a resize) and has to be
-    /// remade. `true` means this frame cost a re-place and nothing else —
-    /// which is what the unplace-at-frame-boundary rule is paid for: a box
-    /// scrolls off, comes back, and the PNG never goes on the wire again.
+    /// `false` means the node has no resident raster, or the resident one was
+    /// rendered for a different target size (a resize) and has to be remade.
+    /// `true` means this frame cost a re-place and nothing else — which is
+    /// what the residency budget is paid for (DW-3.4): a box scrolls off,
+    /// comes back, and the PNG never goes on the wire again.
     ///
     /// Shared by both resolvers on purpose. The two arms of the ladder carried
     /// byte-equivalent copies of this and of [`Self::transmit_and_place`], so
-    /// the LRU/placement invariants had two homes and a fix to one arm left
-    /// the other quietly wrong.
+    /// the residency/placement invariants had two homes and a fix to one arm
+    /// left the other quietly wrong.
+    ///
+    /// The quota is checked here as well as in [`Self::transmit_and_place`],
+    /// and it has to be: once residency stopped being bounded by the
+    /// placement cap, a document could hold more resident rasters than the
+    /// terminal will accept placements for — and every one of those is a
+    /// cache *hit*, which would otherwise walk straight past the only check
+    /// there was. A 33rd visible box takes its text rung whether or not its
+    /// pixels are already in the terminal.
     fn replace_if_cached(
         &mut self,
         node_id: NodeId,
@@ -600,29 +601,29 @@ impl GfxMediaSink {
         rect: CellRect,
         out: &mut dyn Write,
     ) -> bool {
-        let cached = self
-            .placements
-            .get(&node_id)
-            .is_some_and(|existing| existing.rendered_px == target);
-        if !cached {
+        if !self.has_placement_slot(node_id) || self.cache.get(node_id, target).is_none() {
             return false;
         }
-        self.touch_lru(node_id);
         self.place_box(node_id, reserved, rect, out);
         true
     }
 
-    /// Transmits `png` as this node's raster, records it, and places it.
+    /// Transmits `png` as this node's raster, records its residency, and
+    /// places it.
     ///
-    /// `false` — nothing written — when the cap has no honest slot to hand
-    /// out, i.e. every live placement was already painted in this frame. The
-    /// caller degrades to its text rung; taking a slot from a box already on
-    /// screen would blank it.
+    /// `false` — nothing written — when the frame's placement quota is spent,
+    /// i.e. more than [`CAP`] boxes are visible at once. The caller degrades
+    /// to its text rung; taking a slot from a box already on screen would
+    /// blank it.
     ///
     /// `target` is the size the raster was *requested* at and is what the
     /// cache key compares; the raster's real pixel size is measured from the
     /// PNG, because only the image path scales to the target exactly (see
-    /// [`Placement::raster_px`]).
+    /// [`Resident::raster_px`]).
+    ///
+    /// The budget's evictions are emitted here, from the ids the cache hands
+    /// back — and never for a node in `placed`, so a box already on screen
+    /// this frame cannot lose the pixels under it.
     fn transmit_and_place(
         &mut self,
         node_id: NodeId,
@@ -632,29 +633,27 @@ impl GfxMediaSink {
         rect: CellRect,
         out: &mut dyn Write,
     ) -> bool {
-        if !self.evict_lru_if_needed(node_id, out) {
+        if !self.has_placement_slot(node_id) {
             return false;
         }
         let id = self
-            .placements
-            .get(&node_id)
-            .map(|p| p.id)
+            .cache
+            .peek(node_id)
+            .map(|resident| resident.id)
             .unwrap_or_else(|| self.alloc_id());
         let raster_px = png_pixel_size(png).unwrap_or(target);
         self.emitter.transmit(id, png, out);
-        self.touch_lru(node_id);
         // Recorded before it is placed, not after: `place_box` is what marks
         // a node visible, and it can only do that for a node it can find.
-        self.placements.insert(
+        let pinned: HashSet<NodeId> = self.placed.iter().copied().collect();
+        let freed = self.cache.insert(
             node_id,
-            Placement {
-                id,
-                rendered_px: target,
-                raster_px,
-                last_seen_frame: self.frame_counter,
-                placed: false,
-            },
+            Resident::new(id, target, raster_px, png.len() as u64),
+            &pinned,
         );
+        for evicted in freed {
+            self.emitter.delete(evicted, out);
+        }
         self.place_box(node_id, reserved, rect, out);
         true
     }
@@ -831,10 +830,26 @@ impl MediaSink for GfxMediaSink {
     /// placements are state on the **terminal**, and a sink that no longer
     /// knows about them can never take them off the screen.
     fn reload_document(&mut self, doc: Rc<Document>, out: &mut dyn Write) {
-        let known: Vec<NodeId> = self.placements.keys().copied().collect();
+        // Every resident raster, not every *placed* one: since the residency
+        // split those are different sets, and the larger one is what carries
+        // the hazard. A raster outlives its placement on purpose — that is
+        // what makes a scroll-back cheap — so after a reload the cache is
+        // exactly where an image keyed to a node that no longer exists would
+        // survive, silently waiting to be re-placed for whatever the new
+        // parse happens to number 7. Draining the cache is also what stops
+        // `alloc_id` handing a new node an id the terminal still associates
+        // with the old document's pixels.
+        let known: Vec<NodeId> = self.cache.resident_nodes().collect();
         for node_id in known {
             self.delete_placement(node_id, out);
         }
+        // `placed` is a subset of the resident set by construction
+        // (`place_box` refuses a node with no raster), so the loop above has
+        // already emptied it. Cleared anyway: this method's postcondition is
+        // "this sink remembers nothing about the old document", and a
+        // postcondition that holds by an invariant declared 400 lines away is
+        // one edit from not holding.
+        self.placed.clear();
         self.row_in_frame.clear();
         self.resolved_this_frame.clear();
         self.doc = doc;
@@ -1002,6 +1017,37 @@ mod tests {
             .unwrap()
             .write_all(&bytes)
             .unwrap();
+        path
+    }
+
+    /// Writes a `w` x `h` PNG for the residency benchmark, reusing one
+    /// already on disk from an earlier run.
+    ///
+    /// Flat colour and the fastest encoder settings, deliberately: what
+    /// DW-3.5 measures is the *rescale* of 36 megapixels and the transmit of
+    /// the result, both of which are content-independent, so paying seconds
+    /// to compress noise would buy the measurement nothing. The cached copy
+    /// is written to a temporary name and renamed, so two test binaries
+    /// racing here cannot leave a half-written PNG behind.
+    fn write_huge_png(dir: &std::path::Path, name: &str, w: u32, h: u32) -> PathBuf {
+        use image::ImageEncoder;
+
+        let path = dir.join(name);
+        if std::fs::metadata(&path).is_ok_and(|meta| meta.len() > 0) {
+            return path;
+        }
+        let img = image::RgbaImage::from_pixel(w, h, image::Rgba([9, 40, 120, 255]));
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new_with_quality(
+            &mut png,
+            image::codecs::png::CompressionType::Fast,
+            image::codecs::png::FilterType::NoFilter,
+        )
+        .write_image(img.as_raw(), w, h, image::ExtendedColorType::Rgba8)
+        .expect("encode the benchmark fixture");
+        let staging = dir.join(format!("{name}.partial"));
+        std::fs::write(&staging, &png).expect("write the benchmark fixture");
+        std::fs::rename(&staging, &path).expect("publish the benchmark fixture");
         path
     }
 
@@ -1487,12 +1533,18 @@ mod tests {
         }
     }
 
-    /// The cap is a *live-placement* cap, not a no-eviction rule: once a
-    /// box has stopped being painted, its slot is fair game for a new one.
-    /// The complement of the test above — that one proves nothing is evicted
-    /// too eagerly, this one proves eviction still happens at all.
+    /// The cap is a *per-frame placement quota*, not a bound on how many
+    /// rasters may exist. The complement of the test above: that one proves
+    /// nothing on screen is evicted, this one proves a 33rd box still gets a
+    /// real placement in the next frame — and, since DW-3.6, that it does so
+    /// **without** costing any of the first 32 their pixel data.
+    ///
+    /// This used to assert the opposite of that last clause (`d=I` on the
+    /// least-recently-painted node, "to make room"), which was the coupling
+    /// DW-3.6 removes: room was needed only because the placement cap was
+    /// checked against the map that also held rasters.
     #[test]
-    fn test_dw_6_1_a_slot_from_a_previous_frame_is_still_evicted_for_a_new_box() {
+    fn test_dw_3_6_a_thirty_third_box_is_placed_without_costing_any_raster() {
         let dir = scratch_dir("cap-across-frames");
         for i in 0..33u32 {
             write_png(&dir, &format!("pic{i}.png"));
@@ -1540,8 +1592,8 @@ mod tests {
         assert_eq!(deletes(&f1), 0);
 
         // Frame 2 shows only the 33rd. Nothing from frame 1 is on screen, so
-        // the least-recently-painted slot must be taken for it — with a real
-        // graphics placement, not a fallback.
+        // the quota is free again and it must get a real graphics placement,
+        // not a fallback.
         let mut f2 = Vec::new();
         sink.begin_frame(&mut f2);
         sink.paint(
@@ -1554,17 +1606,11 @@ mod tests {
             rect,
             &mut f2,
         );
-        // Frame 2 opens by unplacing all 32 of frame 1's placements (`d=i`,
-        // rasters kept) — none of them is on screen any more. The *raster*
-        // eviction that makes room for the 33rd is the separate `d=I`, and
-        // it must fall on the least-recently-painted node. Asserting on the
-        // first command of any kind would now pass on the unplace sweep
-        // instead, which proves nothing about the cap.
         let cmds = commands(&f2);
-        assert_eq!(
-            cmds.iter().find(|&&(k, _)| k == 'd').copied(),
-            Some(('d', nth_id(1))),
-            "the least-recently-painted raster (the first id) must be freed to make room, got {cmds:?}"
+        assert!(
+            !cmds.iter().any(|&(k, _)| k == 'd'),
+            "no raster may be freed to make room for the 33rd box — retention is \
+             the byte budget's business, not the placement cap's; got {cmds:?}"
         );
         assert_eq!(
             cmds.iter().filter(|&&(k, _)| k == 'u').count(),
@@ -1584,15 +1630,48 @@ mod tests {
             !String::from_utf8_lossy(&f2).contains("alt32"),
             "a box that got a placement must not also paint alt text"
         );
+        assert_eq!(
+            sink.resident_count(),
+            CAP + 1,
+            "all 33 rasters must still be resident: 33 > CAP, and the budget \
+             is nowhere near spent"
+        );
+
+        // The consequence a reader would notice: scrolling back to the first
+        // box re-places it and never re-transmits it.
+        let mut f3 = Vec::new();
+        sink.begin_frame(&mut f3);
+        sink.paint(
+            &Reserved {
+                node_id: nodes[0],
+                cols: 10,
+                rows: 1,
+                row: 0,
+            },
+            rect,
+            &mut f3,
+        );
+        assert_eq!(
+            commands(&f3),
+            vec![('u', nth_id(33)), ('p', nth_id(1))],
+            "scrolling back to box 0 must cost one re-place and no transmit"
+        );
     }
 
+    /// DW-3.4, stated as the wire fact it is: a box that leaves the screen
+    /// and comes back is *re-placed*, with no PNG going out a second time.
+    ///
+    /// This is the case the pre-change grace arithmetic could never reach.
+    /// It freed a raster at the top of the frame after the one that stopped
+    /// painting it — i.e. exactly the frame that wanted it back — so the
+    /// resident window, though documented as one frame wide, was empty. The
+    /// baseline arm below runs that original behaviour and shows it.
     #[test]
-    fn test_dw_6_1_grace_period_evicts_a_node_absent_for_a_full_frame() {
-        let dir = scratch_dir("grace");
+    fn test_dw_3_4_a_box_scrolled_off_and_back_is_re_placed_without_re_transmitting() {
+        let dir = scratch_dir("scroll-back");
         write_png(&dir, "a.png");
         write_png(&dir, "b.png");
         let doc = Document::parse("![alt-a](./a.png)\n\n![alt-b](./b.png)\n");
-        let mut sink = GfxMediaSink::new(doc.clone(), &dir);
         let nodes: Vec<NodeId> = doc
             .nodes()
             .filter(
@@ -1600,8 +1679,6 @@ mod tests {
             )
             .map(|n| n.id())
             .collect();
-        let (node_a, node_b) = (nodes[0], nodes[1]);
-        let mut out = Vec::new();
         let reserved = |id: NodeId| Reserved {
             node_id: id,
             cols: 10,
@@ -1615,31 +1692,362 @@ mod tests {
             height: 1,
         };
 
-        // Frame 1: only A visible.
-        sink.begin_frame(&mut out);
-        sink.paint(&reserved(node_a), rect, &mut out);
-        assert_eq!(creates(&out), 1);
-        assert_eq!(deletes(&out), 0);
+        // Frames: A, then B (A is off screen), then A again.
+        let return_frame = |pre_change: bool| {
+            let mut sink = GfxMediaSink::new(doc.clone(), &dir);
+            sink.simulate_pre_change_residency_for_test(pre_change);
+            let mut scratch = Vec::new();
+            sink.begin_frame(&mut scratch);
+            sink.paint(&reserved(nodes[0]), rect, &mut scratch);
+            sink.begin_frame(&mut scratch);
+            sink.paint(&reserved(nodes[1]), rect, &mut scratch);
+            let mut back = Vec::new();
+            sink.begin_frame(&mut back);
+            sink.paint(&reserved(nodes[0]), rect, &mut back);
+            back
+        };
 
-        // Frame 2: only B visible. A is absent but within its one-frame
-        // grace — must survive.
-        sink.begin_frame(&mut out);
-        sink.paint(&reserved(node_b), rect, &mut out);
-        assert_eq!(deletes(&out), 0, "A must survive its grace frame");
-
-        // Frame 3: only B visible again. A has now been absent a full
-        // frame beyond its grace — must be evicted.
-        sink.begin_frame(&mut out);
-        sink.paint(&reserved(node_b), rect, &mut out);
+        let fixed = return_frame(false);
         assert_eq!(
-            deletes(&out),
+            commands(&fixed)
+                .iter()
+                .filter(|&&(kind, _)| kind == 't')
+                .count(),
+            0,
+            "the return frame must not re-transmit: {:?}",
+            String::from_utf8_lossy(&fixed)
+        );
+        assert!(
+            commands(&fixed)
+                .iter()
+                .any(|&(kind, id)| kind == 'p' && id == nth_id(1)),
+            "...and must re-place A under its original id: {:?}",
+            String::from_utf8_lossy(&fixed)
+        );
+
+        let baseline = return_frame(true);
+        assert_eq!(
+            commands(&baseline)
+                .iter()
+                .filter(|&&(kind, _)| kind == 't')
+                .count(),
             1,
-            "A must be evicted after its grace period elapses"
+            "the fixture is broken: the pre-change window must re-transmit, or \
+             this test cannot tell the two apart"
+        );
+    }
+
+    /// The other side of DW-3.4: residency is a *budget*, so a raster the
+    /// budget could not keep is re-transmitted when it comes back. Without
+    /// this, "never re-transmits" would be indistinguishable from "never
+    /// evicts", and an unbounded cache would pass.
+    #[test]
+    fn test_dw_3_4_a_raster_the_budget_evicted_is_re_transmitted_when_it_returns() {
+        let dir = scratch_dir("budget-evicts");
+        write_png(&dir, "a.png");
+        write_png(&dir, "b.png");
+        let doc = Document::parse("![alt-a](./a.png)\n\n![alt-b](./b.png)\n");
+        let nodes: Vec<NodeId> = doc
+            .nodes()
+            .filter(
+                |n| matches!(n, NodeRef::Inline(i) if matches!(i.kind, InlineKind::Image { .. })),
+            )
+            .map(|n| n.id())
+            .collect();
+        // A budget one byte short of holding two rasters, measured rather
+        // than guessed: paint A alone and read what it actually cost.
+        let mut probe = GfxMediaSink::new(doc.clone(), &dir);
+        let reserved = |id: NodeId| Reserved {
+            node_id: id,
+            cols: 10,
+            rows: 1,
+            row: 0,
+        };
+        let rect = CellRect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 1,
+        };
+        let mut scratch = Vec::new();
+        probe.begin_frame(&mut scratch);
+        probe.paint(&reserved(nodes[0]), rect, &mut scratch);
+        let one_raster = probe.resident_bytes();
+        assert!(one_raster > 0, "a painted box must cost bytes");
+
+        let mut sink = GfxMediaSink::new(doc, &dir).with_raster_budget(one_raster);
+        let mut f1 = Vec::new();
+        sink.begin_frame(&mut f1);
+        sink.paint(&reserved(nodes[0]), rect, &mut f1);
+        let mut f2 = Vec::new();
+        sink.begin_frame(&mut f2);
+        sink.paint(&reserved(nodes[1]), rect, &mut f2);
+        assert!(
+            commands(&f2)
+                .iter()
+                .any(|&(kind, id)| kind == 'd' && id == nth_id(1)),
+            "B's raster must push A's out of a budget that fits only one: {:?}",
+            commands(&f2)
+        );
+        assert_eq!(sink.resident_count(), 1);
+
+        let mut f3 = Vec::new();
+        sink.begin_frame(&mut f3);
+        sink.paint(&reserved(nodes[0]), rect, &mut f3);
+        assert!(
+            commands(&f3).iter().any(|&(kind, _)| kind == 't'),
+            "A lost its raster to the budget, so its return must re-transmit: {:?}",
+            commands(&f3)
+        );
+    }
+
+    /// DW-3.6: a document with more images than the placement cap keeps a
+    /// raster for every one of them, because the budget — not the cap — is
+    /// what governs retention.
+    ///
+    /// Painted one box per frame, so the placement quota is never the binding
+    /// constraint and the only thing that could stop the 33rd..40th rasters
+    /// existing is the coupling this DW removes.
+    #[test]
+    fn test_dw_3_6_forty_images_keep_their_rasters_although_only_32_may_be_placed() {
+        let dir = scratch_dir("retention-past-cap");
+        let count = 40usize;
+        for i in 0..count {
+            write_png(&dir, &format!("r{i}.png"));
+        }
+        let source: String = (0..count)
+            .map(|i| format!("![alt{i}](./r{i}.png)\n\n"))
+            .collect();
+        let doc = Document::parse(&source);
+        let nodes: Vec<NodeId> = doc
+            .nodes()
+            .filter(
+                |n| matches!(n, NodeRef::Inline(i) if matches!(i.kind, InlineKind::Image { .. })),
+            )
+            .map(|n| n.id())
+            .collect();
+        assert_eq!(nodes.len(), count);
+        let mut sink = GfxMediaSink::new(doc, &dir);
+        let rect = CellRect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 1,
+        };
+        let reserved = |id: NodeId| Reserved {
+            node_id: id,
+            cols: 10,
+            rows: 1,
+            row: 0,
+        };
+
+        let mut out = Vec::new();
+        for &node_id in &nodes {
+            sink.begin_frame(&mut out);
+            sink.paint(&reserved(node_id), rect, &mut out);
+        }
+        assert_eq!(
+            sink.resident_count(),
+            count,
+            "all {count} rasters must be resident — CAP is {CAP} and bounds \
+             placements, not retention"
+        );
+        assert_eq!(deletes(&out), 0, "nothing may be freed under the budget");
+        assert!(sink.resident_bytes() < RASTER_BUDGET_BYTES);
+
+        // The reader-visible consequence: every one of the 40 comes back as a
+        // re-place. A cache bounded at 32 would re-transmit the first eight.
+        let mut back = Vec::new();
+        for &node_id in &nodes {
+            sink.begin_frame(&mut back);
+            sink.paint(&reserved(node_id), rect, &mut back);
+        }
+        assert_eq!(
+            creates(&back),
+            0,
+            "revisiting every box must cost re-places only"
+        );
+    }
+
+    /// The hole the residency split opens if the quota is only checked on the
+    /// transmit path: 40 rasters can now be resident at once (that is DW-3.6's
+    /// whole point), so a frame that brings all 40 boxes on screen sees 40
+    /// cache *hits* — and a cache hit used to place unconditionally, because
+    /// under the old shared map "resident" implied "within the cap".
+    ///
+    /// Seeded one box per frame so every raster is resident and nothing is
+    /// blocked on the way in, then all 40 are painted in a single frame.
+    #[test]
+    fn test_the_placement_cap_holds_even_when_every_raster_is_already_resident() {
+        let dir = scratch_dir("cap-with-warm-cache");
+        let count = 40usize;
+        for i in 0..count {
+            write_png(&dir, &format!("w{i}.png"));
+        }
+        let source: String = (0..count)
+            .map(|i| format!("![alt{i}](./w{i}.png)\n\n"))
+            .collect();
+        let doc = Document::parse(&source);
+        let nodes: Vec<NodeId> = doc
+            .nodes()
+            .filter(
+                |n| matches!(n, NodeRef::Inline(i) if matches!(i.kind, InlineKind::Image { .. })),
+            )
+            .map(|n| n.id())
+            .collect();
+        let mut sink = GfxMediaSink::new(doc, &dir);
+        let reserved = |id: NodeId| Reserved {
+            node_id: id,
+            cols: 10,
+            rows: 1,
+            row: 0,
+        };
+
+        let mut warm = Vec::new();
+        for &node_id in &nodes {
+            sink.begin_frame(&mut warm);
+            sink.paint(
+                &reserved(node_id),
+                CellRect {
+                    x: 0,
+                    y: 0,
+                    width: 10,
+                    height: 1,
+                },
+                &mut warm,
+            );
+        }
+        assert_eq!(
+            sink.resident_count(),
+            count,
+            "every raster must be resident"
+        );
+
+        let mut all = Vec::new();
+        sink.begin_frame(&mut all);
+        for (row, &node_id) in nodes.iter().enumerate() {
+            sink.paint(
+                &reserved(node_id),
+                CellRect {
+                    x: 0,
+                    y: row as u16,
+                    width: 10,
+                    height: 1,
+                },
+                &mut all,
+            );
+        }
+        let placements = commands(&all).iter().filter(|&&(k, _)| k == 'p').count();
+        assert_eq!(
+            placements, CAP,
+            "at most {CAP} placements may be live in one frame, warm cache or not"
+        );
+        assert_eq!(creates(&all), 0, "nothing needed re-transmitting");
+        // The boxes that could not be placed are not blank: each paints its
+        // own alt text, as the ladder requires.
+        let text = String::from_utf8_lossy(&all);
+        for row in CAP..count {
+            assert!(
+                text.contains(&format!("\x1b[{};1Halt{row}", row + 1)),
+                "over-quota box {row} must fall back to alt text at its own row"
+            );
+        }
+    }
+
+    /// **DW-3.5, the committed speed claim.** The frame that brings a
+    /// 6000x6000 image back on screen must be at least 10x faster than the
+    /// same frame under the pre-change residency window, measured in this
+    /// harness with that window switched back on.
+    ///
+    /// The baseline is the real old behaviour, not a description of it:
+    /// [`GfxMediaSink::simulate_pre_change_residency_for_test`] reinstates the
+    /// sweep that freed, at the top of frame *N*, every raster absent from
+    /// frame *N-1* — so the return frame re-decodes, re-scales, re-encodes and
+    /// re-transmits the whole image, exactly as it did before this phase.
+    ///
+    /// One sink and two timed frames, so the fixture is decoded twice rather
+    /// than three times: frames 1-3 seed and measure the fixed return, then
+    /// the switch goes on and frames 4-5 measure the pre-change return.
+    ///
+    /// A ratio rather than a latency budget, for the same reason DW-1.7 uses
+    /// one: CI hosts vary, but "one ~40-byte escape" against "decode 36
+    /// megapixels, rescale, PNG-encode and base64 a raster" is an
+    /// architectural difference of three orders of magnitude, so a 10x floor
+    /// has enormous margin against scheduling noise.
+    #[test]
+    fn test_dw_3_5_scroll_back_return_frame_is_at_least_10x_faster_than_the_pre_change_baseline() {
+        let dir = scratch_dir("scroll-back-bench");
+        let name = "huge.png";
+        write_huge_png(&dir, name, 6000, 6000);
+        let doc = Document::parse(&format!("![big](./{name})\n"));
+        let node_id = doc
+            .nodes()
+            .find(|n| matches!(n, NodeRef::Inline(i) if matches!(i.kind, InlineKind::Image { .. })))
+            .unwrap()
+            .id();
+        // A 40x20 cell box at the fallback 24x48 cell geometry: a 960x960
+        // raster target, i.e. a real full-width-ish image box, not a token one.
+        let reserved = Reserved {
+            node_id,
+            cols: 40,
+            rows: 20,
+            row: 0,
+        };
+        let rect = CellRect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 20,
+        };
+        let mut sink = GfxMediaSink::new(doc, &dir);
+        let mut out = Vec::new();
+
+        // Frame 1: on screen, transmitted. Frame 2: scrolled off.
+        sink.begin_frame(&mut out);
+        sink.paint(&reserved, rect, &mut out);
+        assert_eq!(creates(&out), 1, "the fixture must transmit once to start");
+        sink.begin_frame(&mut out);
+
+        // Frame 3: back on screen, with the residency this phase ships.
+        let mut fixed_frame = Vec::new();
+        let start = std::time::Instant::now();
+        sink.begin_frame(&mut fixed_frame);
+        sink.paint(&reserved, rect, &mut fixed_frame);
+        let fixed = start.elapsed();
+        assert_eq!(
+            creates(&fixed_frame),
+            0,
+            "the return frame must not re-transmit"
+        );
+
+        // Frames 4-5: the same scroll-off / scroll-back, with the pre-change
+        // window back on. Frame 4 leaves the box off screen; frame 5's own
+        // boundary is where the old sweep frees the raster the frame is about
+        // to want, so the re-transmit is inside the timed region exactly as it
+        // was before this phase.
+        sink.simulate_pre_change_residency_for_test(true);
+        sink.begin_frame(&mut out);
+        let mut baseline_frame = Vec::new();
+        let start = std::time::Instant::now();
+        sink.begin_frame(&mut baseline_frame);
+        sink.paint(&reserved, rect, &mut baseline_frame);
+        let baseline = start.elapsed();
+        assert_eq!(
+            creates(&baseline_frame),
+            1,
+            "the fixture is broken: the pre-change window must re-transmit, or \
+             there is no baseline to be faster than"
+        );
+
+        assert!(
+            fixed.as_nanos() * 10 <= baseline.as_nanos(),
+            "the scroll-back return frame must be at least 10x faster than the \
+             pre-change baseline: fixed={fixed:?} baseline={baseline:?}"
         );
     }
 
     #[test]
-    fn test_dw_6_1_100_scroll_cycles_stay_balanced_and_never_exceed_cap() {
+    fn test_dw_3_4_100_scroll_cycles_transmit_each_image_exactly_once() {
         let dir = scratch_dir("cycles");
         for i in 0..5 {
             write_png(&dir, &format!("p{i}.png"));
@@ -1680,29 +2088,29 @@ mod tests {
             sink.paint(&reserved, rect, &mut out);
         }
 
-        // Live-set never exceeded the cap at any point in the log.
-        let mut live = 0i64;
-        let mut max_live = 0i64;
-        let text = String::from_utf8_lossy(&out);
-        for token in text.split("\x1b_G").skip(1) {
-            if token.starts_with("a=t,f=100") {
-                live += 1;
-            } else if token.starts_with("a=d,d=I") {
-                live -= 1;
-            }
-            max_live = max_live.max(live);
-        }
-        assert!(
-            max_live <= CAP as i64,
-            "live placements exceeded the cap: {max_live}"
+        // The claim this replaces was `creates - deletes == live` plus
+        // `deletes > 0` — a balance, which stayed green while the resident
+        // window was closed and every one of the 100 cycles paid for a full
+        // re-transmit. The stronger statement a balance cannot make: five
+        // images, five transmits, whatever the cycle count.
+        assert_eq!(
+            creates(&out),
+            nodes.len(),
+            "each image must go on the wire exactly once across 100 cycles"
         );
-        assert!(live >= 0);
-        // Balance: creates - deletes == still-live count at the end.
-        assert_eq!(creates(&out) as i64 - deletes(&out) as i64, live);
-        assert!(
-            deletes(&out) > 0,
-            "at least some scroll-past cycles must have evicted"
+        assert_eq!(
+            deletes(&out),
+            0,
+            "five small rasters are nowhere near the byte budget, so nothing \
+             may be freed"
         );
+        assert_eq!(sink.resident_count(), nodes.len());
+        // The cap is about placements, and exactly one box is visible per
+        // frame here — so the terminal is never asked to draw more than one.
+        let mut term = TerminalGfx::default();
+        term.apply(&out);
+        assert_eq!(term.visible.len(), 1);
+        assert!(sink.resident_bytes() < RASTER_BUDGET_BYTES);
     }
 
     #[test]
@@ -2261,7 +2669,13 @@ mod tests {
 
     /// Once a node scrolls entirely out of view, no `paint` ever fires for
     /// it again — so if the sweep only ran from `paint`, its placement was
-    /// never deleted and the image stayed on the terminal forever.
+    /// never taken down and the image stayed on the terminal forever.
+    ///
+    /// The sweep is the *unplace* (`d=i`), not the delete. It used to be
+    /// asserted as a delete because residency and visibility shared a
+    /// lifetime; keeping that assertion would now pin the very re-transmit
+    /// DW-3.4 exists to stop, so this checks both halves of the split
+    /// instead: the placement goes, the raster stays.
     #[test]
     fn test_placement_is_swept_on_media_free_frames_after_scrolling_off() {
         let dir = scratch_dir("sweep");
@@ -2286,21 +2700,31 @@ mod tests {
             height: 1,
         };
 
-        let mut out = Vec::new();
-        sink.begin_frame(&mut out);
-        sink.paint(&reserved, rect, &mut out);
-        assert_eq!(creates(&out), 1);
-        assert_eq!(deletes(&out), 0);
+        let mut term = TerminalGfx::default();
+        let mut f1 = Vec::new();
+        sink.begin_frame(&mut f1);
+        sink.paint(&reserved, rect, &mut f1);
+        assert_eq!(creates(&f1), 1);
+        assert_eq!(deletes(&f1), 0);
+        term.apply(&f1);
 
         // The image scrolls off: subsequent frames contain no media at all,
         // so only `begin_frame` fires. The sweep must still reach it.
-        sink.begin_frame(&mut out);
-        sink.begin_frame(&mut out);
-        assert_eq!(
-            deletes(&out),
-            1,
-            "a node scrolled fully out of view must still be deleted"
+        let mut f2 = Vec::new();
+        sink.begin_frame(&mut f2);
+        sink.begin_frame(&mut f2);
+        term.apply(&f2);
+        assert!(
+            term.visible.is_empty(),
+            "a node scrolled fully out of view must stop being drawn"
         );
+        assert_eq!(
+            term.stored,
+            std::collections::BTreeSet::from([nth_id(1)]),
+            "...but the terminal must still hold its pixels, so coming back \
+             costs a re-place and not a re-transmit"
+        );
+        assert_eq!(deletes(&f2), 0);
     }
 
     /// The crop is proportional to the raster's own pixel height, so it is
@@ -2832,5 +3256,172 @@ mod tests {
         );
         // And the old `Rc` is no longer held by the sink.
         assert_eq!(std::rc::Rc::strong_count(&doc), 1);
+    }
+
+    /// The reload case the test above cannot see, and the one the residency
+    /// split creates.
+    ///
+    /// That test places an image and reloads immediately, so at the moment of
+    /// the swap the node is both **placed** and **resident** — a sweep that
+    /// walked only the on-screen set would pass it. Since Phase 3 those are
+    /// different sets, and the bigger one is the hazard: a raster deliberately
+    /// outlives its placement, so a node the reader scrolled past is resident
+    /// and invisible, holding pixels keyed to a document that is about to stop
+    /// existing. Nothing on screen would show it; the next document to be
+    /// numbered the same way would inherit it.
+    ///
+    /// Scrolls the image off first, so the reload lands on exactly that state.
+    #[test]
+    fn test_a_reload_frees_a_raster_that_outlived_its_placement() {
+        let dir = scratch_dir("reload-unplaced-raster");
+        write_png(&dir, "off.png");
+        let doc = std::rc::Rc::new(Document::parse("![alt](./off.png)\n"));
+        let node_id = doc
+            .nodes()
+            .find(|n| matches!(n, NodeRef::Inline(i) if matches!(i.kind, InlineKind::Image { .. })))
+            .map(|n| n.id())
+            .unwrap();
+        let mut sink = GfxMediaSink::new(std::rc::Rc::clone(&doc), &dir);
+        let mut screen = TerminalGfx::default();
+
+        // Frame 1: on screen.
+        let mut f1 = Vec::new();
+        sink.begin_frame(&mut f1);
+        sink.paint(
+            &Reserved {
+                node_id,
+                cols: 4,
+                rows: 1,
+                row: 0,
+            },
+            CellRect {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 1,
+            },
+            &mut f1,
+        );
+        screen.apply(&f1);
+
+        // Frame 2: scrolled off. The placement goes, the raster stays — that
+        // is the whole of DW-3.4, and it is what makes this state reachable.
+        let mut f2 = Vec::new();
+        sink.begin_frame(&mut f2);
+        screen.apply(&f2);
+        assert!(
+            screen.visible.is_empty(),
+            "the box is off screen, so nothing may be drawn"
+        );
+        assert_eq!(
+            screen.stored.len(),
+            1,
+            "...and its raster must still be resident, or this test is \
+             asserting nothing"
+        );
+        assert_eq!(sink.resident_count(), 1);
+
+        let replacement = std::rc::Rc::new(Document::parse("# an entirely new document\n"));
+        let mut reload_out = Vec::new();
+        sink.reload_document(std::rc::Rc::clone(&replacement), &mut reload_out);
+        screen.apply(&reload_out);
+
+        assert!(
+            screen.stored.is_empty(),
+            "a raster keyed to a node of the old document must be freed even \
+             though nothing was drawing it: {screen:?}"
+        );
+        assert_eq!(sink.resident_count(), 0);
+        assert_eq!(sink.resident_bytes(), 0, "the byte budget must be refunded");
+    }
+
+    /// The other half of the same hazard: after a reload, a node of the *new*
+    /// document must never be handed the previous document's pixels.
+    ///
+    /// `NodeId` is a dense index, so the first image node of the replacement
+    /// document is very often numbered exactly as the old one was — which is
+    /// what makes "the cache still has an entry for node 7" a wrong picture on
+    /// screen rather than a leak. Asserted on the wire: the paint after the
+    /// reload must transmit, and must transmit under an id the terminal is not
+    /// already holding.
+    #[test]
+    fn test_after_a_reload_a_node_never_inherits_the_previous_documents_pixels() {
+        let dir = scratch_dir("reload-no-inherit");
+        write_png(&dir, "before.png");
+        write_png(&dir, "after.png");
+        let doc = std::rc::Rc::new(Document::parse("![alt](./before.png)\n"));
+        let old_node = doc
+            .nodes()
+            .find(|n| matches!(n, NodeRef::Inline(i) if matches!(i.kind, InlineKind::Image { .. })))
+            .map(|n| n.id())
+            .unwrap();
+        let mut sink = GfxMediaSink::new(std::rc::Rc::clone(&doc), &dir);
+        let rect = CellRect {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 1,
+        };
+        let reserved = |id: NodeId| Reserved {
+            node_id: id,
+            cols: 4,
+            rows: 1,
+            row: 0,
+        };
+
+        let mut screen = TerminalGfx::default();
+        let mut f1 = Vec::new();
+        sink.begin_frame(&mut f1);
+        sink.paint(&reserved(old_node), rect, &mut f1);
+        screen.apply(&f1);
+        let old_ids = screen.stored.clone();
+        assert_eq!(old_ids.len(), 1);
+
+        // A different document that happens to number its image node the same
+        // way — the collision this guards against, made certain rather than
+        // hoped for.
+        let replacement = std::rc::Rc::new(Document::parse("![alt](./after.png)\n"));
+        let new_node = replacement
+            .nodes()
+            .find(|n| matches!(n, NodeRef::Inline(i) if matches!(i.kind, InlineKind::Image { .. })))
+            .map(|n| n.id())
+            .unwrap();
+        assert_eq!(
+            new_node, old_node,
+            "the fixture must reuse the same NodeId, or the collision this \
+             test is about never happens"
+        );
+
+        let mut reload_out = Vec::new();
+        sink.reload_document(std::rc::Rc::clone(&replacement), &mut reload_out);
+        screen.apply(&reload_out);
+
+        let mut f2 = Vec::new();
+        sink.begin_frame(&mut f2);
+        sink.paint(&reserved(new_node), rect, &mut f2);
+        let commands_after = commands(&f2);
+        screen.apply(&f2);
+
+        assert_eq!(
+            commands_after
+                .iter()
+                .filter(|&&(kind, _)| kind == 't')
+                .count(),
+            1,
+            "the new document's node must transmit its own pixels, not re-place \
+             the old one's: {commands_after:?}"
+        );
+        let placed: Vec<u32> = commands_after
+            .iter()
+            .filter(|&&(kind, _)| kind == 'p')
+            .map(|&(_, id)| id)
+            .collect();
+        assert_eq!(placed.len(), 1);
+        assert!(
+            !old_ids.contains(&placed[0]),
+            "the placement reused image id {}, which named the previous \
+             document's raster",
+            placed[0]
+        );
     }
 }

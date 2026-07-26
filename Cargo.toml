@@ -24,3 +24,22 @@ rust-version = "1.95.0"
 strip = true
 lto = true
 codegen-units = 1
+
+# The image stack does per-pixel work in tight loops, which is 20-40x slower
+# unoptimized: a debug `cargo test` spent 11 s decoding and rescaling the
+# 6000x6000 fixture DW-3.5's residency benchmark uses, and ~16 s on `gfx`'s
+# own decode tests. Optimizing only these dependencies leaves every workspace
+# crate built as usual — our own code stays fully debuggable, breakpoints and
+# all — while the suite stops paying for someone else's inner loops.
+[profile.dev.package.image]
+opt-level = 3
+[profile.dev.package.png]
+opt-level = 3
+[profile.dev.package.zune-jpeg]
+opt-level = 3
+[profile.dev.package.fdeflate]
+opt-level = 3
+[profile.dev.package.flate2]
+opt-level = 3
+[profile.dev.package.miniz_oxide]
+opt-level = 3

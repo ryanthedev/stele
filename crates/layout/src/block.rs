@@ -11,8 +11,8 @@ use width::WidthEngine;
 
 use crate::inline::{self, Piece};
 use crate::{
-    AlertTone, CellSize, IntrinsicSizer, Line, LineItem, Reserved, ReservedLine, Run, Semantic,
-    StyleId,
+    AlertTone, CellSize, IntrinsicSizer, Line, LineItem, Outline, OutlineEntry, Reserved,
+    ReservedLine, Run, Semantic, StyleId,
 };
 
 /// Minimum content columns the prefix may never consume (clamped to the
@@ -48,6 +48,11 @@ pub(crate) struct Ctx<'a> {
     /// blockquotes/lists. Only depth 1 sets `current_block`.
     depth: usize,
     prefix: Vec<Seg>,
+    /// The headings emitted so far, with the line each started at. Collected
+    /// here rather than by a later scan over `lines` because this is the only
+    /// point at which a heading's level, its inline children, its anchoring
+    /// block and its first emitted line are all in hand at once.
+    outline: Outline,
 }
 
 impl<'a> Ctx<'a> {
@@ -67,6 +72,7 @@ impl<'a> Ctx<'a> {
             current_block: None,
             depth: 0,
             prefix: Vec::new(),
+            outline: Outline::default(),
         }
     }
 
@@ -77,8 +83,30 @@ impl<'a> Ctx<'a> {
         self.line_blocks.push(self.current_block);
     }
 
-    pub fn into_parts(self) -> (Vec<Line>, Vec<Option<ast::NodeId>>) {
-        (self.lines, self.line_blocks)
+    pub fn into_parts(self) -> (Vec<Line>, Vec<Option<ast::NodeId>>, Outline) {
+        (self.lines, self.line_blocks, self.outline)
+    }
+
+    /// Lay out one heading and record it in the outline.
+    ///
+    /// The line is captured *before* the flow and the entry pushed after, so
+    /// a heading that wraps to several lines is still addressed by its first.
+    /// A heading that emitted no line at all (only reachable from an empty
+    /// heading at a pathological width) is not recorded: an outline entry
+    /// nothing can jump to would be a dead row in the TOC.
+    fn heading(&mut self, level: u8, children: &[ast::Inline], id: ast::NodeId) {
+        let line = self.lines.len();
+        self.flow(children, Semantic::Heading(level));
+        if self.lines.len() > line {
+            self.outline.push(
+                OutlineEntry {
+                    level,
+                    text: heading_text(children),
+                    block: self.current_block.unwrap_or(id),
+                },
+                line,
+            );
+        }
     }
 
     /// Push a container prefix; `first` shows on the next emitted line,
@@ -253,7 +281,7 @@ pub(crate) fn walk_blocks(ctx: &mut Ctx<'_>, blocks: &[Block], separate: bool) {
 fn walk_block(ctx: &mut Ctx<'_>, block: &Block) {
     match &block.kind {
         BlockKind::Paragraph { children } => ctx.flow(children, Semantic::Text),
-        BlockKind::Heading { level, children } => ctx.flow(children, Semantic::Heading(*level)),
+        BlockKind::Heading { level, children } => ctx.heading(*level, children, block.id),
         BlockKind::ThematicBreak => {
             // `─` is East Asian *Ambiguous*: under
             // `WidthConfig::ambiguous_wide` it is 2 cells, and
@@ -392,4 +420,41 @@ fn alert_label(kind: AlertKind) -> (&'static str, AlertTone) {
         AlertKind::Warning => ("[!WARNING]", AlertTone::Warning),
         AlertKind::Caution => ("[!CAUTION]", AlertTone::Caution),
     }
+}
+
+/// A heading's text for the outline: its inline children flattened to plain
+/// text, with runs of whitespace collapsed so a soft-wrapped source heading
+/// reads as one line in the TOC.
+///
+/// Deliberately taken from the AST rather than from the runs the flow just
+/// emitted. A run's style is *overridden* inside emphasis, code spans and
+/// links (`Semantic::Emph`, `CodeInline`, `Link`), so collecting only the
+/// `Semantic::Heading` runs would silently drop those words, while collecting
+/// every run on the line would pick up a blockquote's gutter bar and a list
+/// item's marker for a nested heading.
+///
+/// Iterative rather than recursive, matching `ast`'s own plain-text
+/// rendering: heading inlines are attacker-influenced input in a viewer that
+/// opens arbitrary markdown, and a deeply nested `***...***` must cost stack
+/// depth nothing.
+fn heading_text(children: &[ast::Inline]) -> String {
+    use ast::InlineKind;
+
+    let mut out = String::new();
+    let mut work: Vec<&ast::Inline> = children.iter().rev().collect();
+    while let Some(inline) = work.pop() {
+        match &inline.kind {
+            InlineKind::Text(t) | InlineKind::Code(t) => out.push_str(t),
+            InlineKind::Math { tex, .. } => out.push_str(tex),
+            InlineKind::FootnoteReference { label } => out.push_str(label),
+            InlineKind::SoftBreak | InlineKind::HardBreak => out.push(' '),
+            InlineKind::HtmlInline(_) => {}
+            InlineKind::Emph(c)
+            | InlineKind::Strong(c)
+            | InlineKind::Strikethrough(c)
+            | InlineKind::Link { children: c, .. }
+            | InlineKind::Image { children: c, .. } => work.extend(c.iter().rev()),
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
 }

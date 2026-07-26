@@ -298,4 +298,10 @@ Separately, a measure-first audit found frames 40× slower than necessary on cod
 
 ---
 ## Execution Log
-_To be filled during /code-foundations:build_
+### Phase 1: Status line, viewport chrome, and runtime toggles (Gate: Full)
+- [x] BUILD: Discovery + design + implementation (stub → implement → validate) complete
+- [x] REVIEW: Verification passed
+- [x] Committed
+Commit: 7187b5f
+Summary: Added a reserved status row (position %, document name, TTL-expiring messages), Ctrl-G file info, `+`/`-` width and `T` theme toggles routed through the new `AppState::relayout_preserving_anchor` seam every later phase calls, plus a panic-safe BufWriter on stdout and an ASCII fast path in `display_width`.
+

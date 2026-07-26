@@ -974,3 +974,152 @@ fn test_thematic_break_spans_the_content_width_exactly_under_ambiguous_wide() {
         );
     }
 }
+
+// ---- The heading outline (Phase 3) --------------------------------------
+
+/// The plain text of the tree line at `index` — the oracle every outline
+/// anchoring assertion below is checked against, so a recorded line index is
+/// verified by *what is painted there* rather than by another index.
+fn line_text_at(tree: &LayoutTree, index: usize) -> String {
+    match tree.lines(index..index + 1).next() {
+        Some(Line::Items(items)) => items
+            .iter()
+            .map(|item| match item {
+                LineItem::Run(run) => run.text.clone(),
+                LineItem::Box(_) => String::new(),
+            })
+            .collect(),
+        _ => String::new(),
+    }
+}
+
+#[test]
+fn test_the_outline_records_every_heading_with_its_level_in_document_order() {
+    let doc =
+        Document::parse("# One\n\nbody\n\n### Three\n\nbody\n\n## Two\n\nbody\n\n###### Six\n");
+    let tree = lay(&doc, 60);
+    let levels: Vec<u8> = tree.outline().entries.iter().map(|e| e.level).collect();
+    let texts: Vec<&str> = tree
+        .outline()
+        .entries
+        .iter()
+        .map(|e| e.text.as_str())
+        .collect();
+    assert_eq!(levels, vec![1, 3, 2, 6]);
+    assert_eq!(texts, vec!["One", "Three", "Two", "Six"]);
+}
+
+#[test]
+fn test_a_document_with_no_headings_has_an_empty_outline() {
+    let tree = lay(&Document::parse("just a paragraph\n\nand another\n"), 40);
+    assert!(tree.outline().is_empty());
+    assert_eq!(tree.outline().len(), 0);
+    assert_eq!(tree.outline().next_after(0), None);
+    assert_eq!(tree.outline().previous_before(10), None);
+    assert_eq!(tree.outline().line_of(0), None);
+}
+
+/// Heading text comes from the AST, not from the emitted runs — so the words
+/// inside emphasis, a code span or a link survive. Collecting only the runs
+/// styled `Semantic::Heading` would drop every one of them, because `flow`
+/// overrides the style inside those inlines.
+#[test]
+fn test_outline_text_keeps_words_inside_emphasis_code_and_links() {
+    let doc = Document::parse("## The *fast* `path` in [layout](./x.md)\n");
+    let tree = lay(&doc, 60);
+    assert_eq!(
+        tree.outline().entries[0].text,
+        "The fast path in layout",
+        "a run-derived outline would read \"The  in \""
+    );
+}
+
+/// A heading long enough to wrap is one entry anchored at its *first* line,
+/// with its full text — not one entry per wrapped line, and not a truncated
+/// title.
+#[test]
+fn test_a_wrapped_heading_is_one_entry_anchored_at_its_first_line() {
+    let doc = Document::parse(
+        "# A heading long enough that it certainly wraps across several lines at \
+         a narrow layout width\n\nbody\n",
+    );
+    let tree = lay(&doc, 24);
+    assert_eq!(tree.outline().len(), 1);
+    assert_eq!(tree.outline().line_of(0), Some(0));
+    assert!(
+        tree.outline().entries[0].text.ends_with("layout width"),
+        "the whole title must be recorded: {:?}",
+        tree.outline().entries[0].text
+    );
+    assert!(
+        tree.line_count() > 3,
+        "the fixture must actually wrap, or this proves nothing"
+    );
+}
+
+/// The nested case `first_line_of` cannot answer: a heading inside a
+/// blockquote tags no line with its own node, so the outline's recorded line
+/// is the only exact anchor — and it must point at the heading's own row.
+#[test]
+fn test_a_heading_inside_a_blockquote_is_still_addressable() {
+    let doc = Document::parse("intro\n\n> # Quoted title\n>\n> quoted body\n\nafter\n");
+    let tree = lay(&doc, 60);
+    assert_eq!(tree.outline().len(), 1);
+    let entry = &tree.outline().entries[0];
+    assert_eq!(entry.text, "Quoted title");
+    assert_eq!(entry.level, 1);
+    assert!(
+        tree.first_line_of(entry.block).is_some(),
+        "the anchor block must be the enclosing top-level block, which does tag lines"
+    );
+    let line = tree.outline().line_of(0).expect("a recorded line");
+    assert!(
+        line_text_at(&tree, line).contains("Quoted title"),
+        "the recorded line must be the heading's own row, got {:?}",
+        line_text_at(&tree, line)
+    );
+    assert_eq!(tree.outline().line_for_block(entry.block), Some(line));
+}
+
+#[test]
+fn test_outline_motions_are_strict_so_a_repeated_jump_keeps_moving() {
+    let doc = Document::parse("# A\n\nbody\n\n# B\n\nbody\n\n# C\n");
+    let tree = lay(&doc, 40);
+    let lines: Vec<usize> = (0..3).map(|i| tree.outline().line_of(i).unwrap()).collect();
+    assert_eq!(lines[0], 0);
+
+    // From a heading's own line, `next_after` must not answer with that
+    // heading — otherwise `]]` sticks.
+    assert_eq!(tree.outline().next_after(lines[0]), Some(1));
+    assert_eq!(tree.outline().next_after(lines[1]), Some(2));
+    assert_eq!(tree.outline().next_after(lines[2]), None);
+    assert_eq!(tree.outline().previous_before(lines[2]), Some(1));
+    assert_eq!(tree.outline().previous_before(lines[0]), None);
+
+    // `index_at_or_before` is the other rule: it *does* answer with the
+    // heading you are standing on, which is what "which section am I in"
+    // means.
+    assert_eq!(tree.outline().index_at_or_before(lines[0]), Some(0));
+    assert_eq!(tree.outline().index_at_or_before(lines[1] - 1), Some(0));
+    assert_eq!(tree.outline().index_at_or_before(lines[1]), Some(1));
+}
+
+/// Layout is pure in its inputs, and the outline is part of the tree — so two
+/// layouts of the same document at the same width must produce equal trees,
+/// outline included.
+#[test]
+fn test_the_outline_is_part_of_the_trees_deterministic_identity() {
+    let doc = Document::parse("# A\n\nbody\n\n## B\n\nbody\n");
+    assert_eq!(lay(&doc, 50), lay(&doc, 50));
+}
+
+/// A setext heading (`===` / `---` underline) is a heading too, and reaches
+/// the outline by the same path — the walker matches `BlockKind::Heading`,
+/// not a syntax.
+#[test]
+fn test_a_setext_heading_reaches_the_outline() {
+    let tree = lay(&Document::parse("Underlined\n==========\n\nbody\n"), 40);
+    assert_eq!(tree.outline().len(), 1);
+    assert_eq!(tree.outline().entries[0].level, 1);
+    assert_eq!(tree.outline().entries[0].text, "Underlined");
+}

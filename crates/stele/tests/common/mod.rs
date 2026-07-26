@@ -17,6 +17,7 @@
 
 pub mod fixtures;
 pub mod render;
+pub mod termgfx;
 
 #[cfg(unix)]
 pub mod pty;

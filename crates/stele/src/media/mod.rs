@@ -12,6 +12,7 @@ use layout::Reserved;
 
 use crate::painter::CellRect;
 
+mod residency;
 mod sink;
 mod sizer;
 

@@ -7,7 +7,7 @@ use std::hash::{Hash, Hasher};
 
 use ast::{Document, NodeId};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use layout::{IntrinsicSizer, LayoutConfig, LayoutTree, Line, LineItem, layout};
+use layout::{IntrinsicSizer, LayoutConfig, LayoutTree, Line, LineItem, Outline, layout};
 use width::WidthEngine;
 
 use crate::painter::Size;
@@ -115,6 +115,40 @@ impl StatusLine {
     }
 }
 
+/// What the viewer is showing, and therefore what a key means.
+///
+/// Deliberately a flat enum matched at the top of
+/// [`AppState::handle_key_event`], not an overlay stack: there is exactly one
+/// overlay and it is modal, so a stack would be a general mechanism with one
+/// user and two states it can be in that this cannot express (two overlays
+/// open, and an empty stack that is not `Normal`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// Reading the document. Every pre-existing binding means what it did.
+    Normal,
+    /// The full-screen table of contents, with `selected` indexing
+    /// [`Outline::entries`].
+    Toc { selected: usize },
+}
+
+/// One row of the rendered TOC overlay: the text to paint and whether it is
+/// the selected entry.
+///
+/// [`AppState::toc_rows`] composes these, so which entries are on screen,
+/// how a level is shown, and what happens when the list is taller than the
+/// terminal are all decided in pure code a test can call — the painter only
+/// prints what it is handed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TocRow {
+    pub text: String,
+    pub selected: bool,
+}
+
+/// What the status row says when a heading motion or the TOC has nothing to
+/// work with. One constant, because a document with no headings must answer
+/// the same way whichever key asked (DW-3.1, and the overlay's edge case).
+const NO_HEADINGS: &str = "no headings in this document";
+
 /// The viewer's mutable state: the current layout tree, scroll offset, and
 /// viewport size. Navigation and resize are pure state transitions, driven
 /// directly from tests without a real terminal or timers.
@@ -122,6 +156,16 @@ pub struct AppState {
     tree: LayoutTree,
     scroll: usize,
     size: Size,
+    mode: Mode,
+    /// The first half of a two-keystroke motion (`]]` / `[[`), waiting for
+    /// its twin. Not folded into [`Mode`]: `Mode` answers "what is on the
+    /// screen", and a half-typed bracket is not on the screen — a reader
+    /// mid-sequence is looking at exactly the document they were looking at.
+    pending: Option<char>,
+    /// Where `Esc` puts the reader back when the TOC is dismissed (DW-3.2).
+    /// Captured on the way in, so the restore holds even if some future
+    /// binding moves the viewport while the overlay is up.
+    toc_return_scroll: usize,
     /// The layout width `+`/`-` adjust, independent of the terminal's own
     /// width — see [`AppState::relayout_preserving_anchor`]. Resynced to
     /// `tree.width()` at the end of every [`AppState::relayout`], so a real
@@ -150,6 +194,9 @@ impl AppState {
             tree,
             scroll: 0,
             size,
+            mode: Mode::Normal,
+            pending: None,
+            toc_return_scroll: 0,
             content_width,
             file_info,
             status_message: None,
@@ -159,6 +206,17 @@ impl AppState {
 
     pub fn tree(&self) -> &LayoutTree {
         &self.tree
+    }
+
+    /// What the viewer is showing — the event loop's cue for which painter
+    /// entry point to call.
+    pub fn mode(&self) -> Mode {
+        self.mode
+    }
+
+    /// The document's headings, in document order.
+    pub fn outline(&self) -> &Outline {
+        self.tree.outline()
     }
 
     pub fn scroll(&self) -> usize {
@@ -301,11 +359,43 @@ impl AppState {
     /// correctly re-rendered document for ~100 frames after the file came
     /// back, and `Ctrl-G`'s byte and line counts would have outlived the file
     /// they measured the same way.
+    ///
+    /// An open TOC is re-seated here for the same reason the status message is
+    /// dropped: it describes a document that no longer exists. `selected`
+    /// indexes the *old* outline, and the new one may be shorter or empty, so
+    /// the overlay is either clamped back into range or — when the reloaded
+    /// document has no headings at all — dismissed with the same message `t`
+    /// would have given. Leaving it up would show a list of headings that are
+    /// not in the document behind it, and `Enter` on one of them would jump to
+    /// wherever that index now happens to land.
     pub fn reload_document(&mut self, ctx: &LayoutContext, file_info: FileInfo) {
         self.file_info = file_info;
         self.clear_status();
         self.document_changed = true;
         self.relayout_preserving_anchor(ctx, *ctx.config);
+        self.reseat_toc();
+    }
+
+    /// Puts an open TOC back on a heading that exists in the tree installed
+    /// now. Called after a reload; a no-op in [`Mode::Normal`].
+    fn reseat_toc(&mut self) {
+        let Mode::Toc { selected } = self.mode else {
+            // The overlay is not up, but `toc_return_scroll` is still a line
+            // index into a tree that has just been replaced. Re-seating it on
+            // the anchored scroll keeps the next `Esc` honest.
+            self.toc_return_scroll = self.scroll;
+            return;
+        };
+        let count = self.tree.outline().len();
+        self.toc_return_scroll = self.scroll;
+        if count == 0 {
+            self.mode = Mode::Normal;
+            self.set_status(StatusMessage::new(NO_HEADINGS));
+            return;
+        }
+        self.mode = Mode::Toc {
+            selected: selected.min(count - 1),
+        };
     }
 
     /// The entry point every later phase calls after a width, theme, fold,
@@ -346,21 +436,211 @@ impl AppState {
         (self.page_size() / 2).max(1)
     }
 
+    /// Puts the reader at the top of `block`, if that block is in the tree.
+    ///
+    /// Two lookups, because a heading is addressable two ways and only one of
+    /// them is always available: `first_line_of` answers for any *top-level*
+    /// block, and the outline answers for a heading nested inside a
+    /// blockquote or list item, whose own node tags no line (see
+    /// [`layout::OutlineEntry::block`]). A block that is neither leaves the
+    /// viewport alone rather than guessing.
+    pub fn jump_to_block(&mut self, block: NodeId) {
+        let line = self
+            .tree
+            .first_line_of(block)
+            .or_else(|| self.tree.outline().line_for_block(block));
+        if let Some(line) = line {
+            self.set_scroll(line);
+        }
+    }
+
+    /// `]]` / `[[` (DW-3.1): the next or previous heading, or a status-row
+    /// message when there is none to move to.
+    ///
+    /// Both ends are a clamp, not a wrap: `]]` at the last heading says so
+    /// and stays put. Wrapping would silently teleport a reader to the top of
+    /// a long document on a keystroke they meant as "keep going".
+    ///
+    /// A motion that leaves the viewport where it was reports too, and with
+    /// the same message as no-such-heading — because from the reader's chair
+    /// the two are one fact. It happens for real at the document tail: the
+    /// last heading may sit below `max_scroll`, so the jump to it is honoured,
+    /// clamps, and moves nothing. Silence there reads as a dropped keystroke.
+    fn jump_heading(&mut self, forward: bool) {
+        let outline = self.tree.outline();
+        let index = if forward {
+            outline.next_after(self.scroll)
+        } else {
+            outline.previous_before(self.scroll)
+        };
+        let target = index.and_then(|index| outline.line_of(index));
+        let empty = outline.is_empty();
+        let before = self.scroll;
+        if let Some(line) = target {
+            self.set_scroll(line);
+            if self.scroll != before {
+                return;
+            }
+        }
+        self.set_status(StatusMessage::new(match (empty, forward) {
+            (true, _) => NO_HEADINGS,
+            (false, true) => "last heading",
+            (false, false) => "first heading",
+        }));
+    }
+
+    /// `t` (DW-3.2): opens the TOC on the heading the reader is currently
+    /// under, so `t` followed immediately by `Enter` is a no-op rather than a
+    /// jump to the top of the document.
+    fn open_toc(&mut self) {
+        let outline = self.tree.outline();
+        if outline.is_empty() {
+            self.set_status(StatusMessage::new(NO_HEADINGS));
+            return;
+        }
+        let selected = outline.index_at_or_before(self.scroll).unwrap_or(0);
+        self.toc_return_scroll = self.scroll;
+        self.mode = Mode::Toc { selected };
+    }
+
+    /// The rows the TOC overlay paints into a viewport `height` rows tall,
+    /// scrolled so the selection is always among them (DW-3.2).
+    ///
+    /// Empty outside [`Mode::Toc`], and empty for a zero-row viewport — a
+    /// terminal too short to render the overlay paints nothing rather than
+    /// panicking on the window arithmetic.
+    pub fn toc_rows(&self, height: u16) -> Vec<TocRow> {
+        let Mode::Toc { selected } = self.mode else {
+            return Vec::new();
+        };
+        let entries = &self.tree.outline().entries;
+        let height = usize::from(height).min(entries.len());
+        if height == 0 {
+            return Vec::new();
+        }
+        let first = selected
+            .saturating_sub(height / 2)
+            .min(entries.len() - height);
+        entries[first..first + height]
+            .iter()
+            .enumerate()
+            .map(|(offset, entry)| TocRow {
+                // Level shown twice over, and both are load-bearing: the
+                // indent makes the shape of the document scannable, the
+                // `#`s name the level exactly (an indent alone cannot
+                // distinguish an H3 under an H2 from an H3 under an H1).
+                text: format!(
+                    "{:width$}{} {}",
+                    "",
+                    "#".repeat(usize::from(entry.level.max(1))),
+                    entry.text,
+                    width = 2 * usize::from(entry.level.saturating_sub(1)),
+                ),
+                selected: first + offset == selected,
+            })
+            .collect()
+    }
+
     /// Applies one key press *with its modifiers*. Returns `true` when the
     /// key requests quit. This is the event loop's entry point.
+    ///
+    /// The mode decides what a key means before anything else looks at it, so
+    /// the TOC's `j`/`k` cannot also scroll the document underneath it.
+    pub fn handle_key_event(&mut self, key: KeyEvent) -> bool {
+        match self.mode {
+            Mode::Toc { selected } => self.handle_toc_key(key, selected),
+            Mode::Normal => self.handle_normal_key(key),
+        }
+    }
+
+    /// The document-reading key table.
     ///
     /// Control chords are tried first and **fall through** to the unmodified
     /// table when the chord means nothing to us, so every pre-existing
     /// binding keeps behaving exactly as it did when the event loop passed
     /// `key.code` and dropped the modifiers on the floor: `Ctrl-Down` still
     /// scrolls down, `Ctrl-q` still quits, `Ctrl-G` still jumps to the end.
-    pub fn handle_key_event(&mut self, key: KeyEvent) -> bool {
+    ///
+    /// The bracket motions are checked ahead of both, and only unmodified: a
+    /// chord is never half of a two-keystroke sequence, so `Ctrl-]` cannot
+    /// arm one and cannot complete one either.
+    fn handle_normal_key(&mut self, key: KeyEvent) -> bool {
+        let pending = self.pending.take();
+        if !key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char(bracket @ (']' | '[')) => {
+                    if pending == Some(bracket) {
+                        self.jump_heading(bracket == ']');
+                    } else {
+                        self.pending = Some(bracket);
+                    }
+                    return false;
+                }
+                KeyCode::Char('t') => {
+                    self.open_toc();
+                    return false;
+                }
+                _ => {}
+            }
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL)
             && let Some(quit) = self.handle_control_chord(key.code)
         {
             return quit;
         }
         self.handle_key(key.code)
+    }
+
+    /// The TOC overlay's key table (DW-3.2). `selected` is the mode's own
+    /// field, passed in so this function never has to re-match the mode it
+    /// was dispatched on.
+    ///
+    /// The two quit keys are repeated here rather than delegated: an overlay
+    /// that swallows `q` and Ctrl-C leaves a reader with no way out that they
+    /// would think to try, and raw mode has already made Ctrl-C a keystroke
+    /// rather than a signal.
+    fn handle_toc_key(&mut self, key: KeyEvent, selected: usize) -> bool {
+        let last = self.tree.outline().len().saturating_sub(1);
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Char('q') => return true,
+            KeyCode::Char('c') if ctrl => return true,
+            KeyCode::Esc | KeyCode::Char('t') => {
+                self.mode = Mode::Normal;
+                self.set_scroll(self.toc_return_scroll);
+            }
+            KeyCode::Enter => {
+                let line = self.tree.outline().line_of(selected);
+                if let Some(line) = line {
+                    self.set_scroll(line);
+                }
+                self.mode = Mode::Normal;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.mode = Mode::Toc {
+                    selected: selected.saturating_add(1).min(last),
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.mode = Mode::Toc {
+                    selected: selected.saturating_sub(1),
+                }
+            }
+            KeyCode::Home | KeyCode::Char('g') => self.mode = Mode::Toc { selected: 0 },
+            KeyCode::End | KeyCode::Char('G') => self.mode = Mode::Toc { selected: last },
+            KeyCode::PageDown => {
+                self.mode = Mode::Toc {
+                    selected: selected.saturating_add(self.page_size()).min(last),
+                }
+            }
+            KeyCode::PageUp => {
+                self.mode = Mode::Toc {
+                    selected: selected.saturating_sub(self.page_size()),
+                }
+            }
+            _ => {}
+        }
+        false
     }
 
     /// The Control-chord bindings. `Some(quit)` when the chord is one of
@@ -1640,6 +1920,440 @@ mod tests {
             before_id, after_id,
             "a same-width relayout must not change the reserved box's node identity"
         );
+    }
+
+    // ---- Heading navigation and the TOC overlay (Phase 3) ----------------
+
+    /// `n` headings at cycling levels 1-3, each followed by a body
+    /// paragraph, so consecutive heading lines are several lines apart and
+    /// every heading names itself.
+    fn heading_source(n: usize) -> String {
+        (0..n)
+            .map(|i| {
+                let hashes = "#".repeat(1 + i % 3);
+                format!("{hashes} Heading {i}\n\nbody {i}\n\n")
+            })
+            .collect()
+    }
+
+    /// The tree line each heading starts at — the oracle every jump assertion
+    /// below is checked against, read from the outline the layout built
+    /// rather than recomputed here.
+    fn heading_lines(state: &AppState) -> Vec<usize> {
+        (0..state.outline().len())
+            .map(|i| {
+                state
+                    .outline()
+                    .line_of(i)
+                    .expect("every outline entry has a line")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_dw_3_1_bracket_bracket_moves_to_the_next_heading_and_back() {
+        let (_doc, _config, _engine, mut state) = build(&heading_source(10), 40, 3);
+        let lines = heading_lines(&state);
+        assert_eq!(lines.len(), 10, "the fixture must have ten headings");
+        assert_eq!(
+            lines[0], 0,
+            "the first heading is the document's first line"
+        );
+        assert!(
+            *lines.last().unwrap() <= state.max_scroll(),
+            "the fixture must be tall enough that no jump is clamped"
+        );
+
+        // Forward: `]]` from the top lands on the *second* heading, because
+        // the reader is already looking at the first.
+        for expected in &lines[1..] {
+            assert!(!state.handle_key_event(plain(KeyCode::Char(']'))));
+            assert!(!state.handle_key_event(plain(KeyCode::Char(']'))));
+            assert_eq!(state.scroll(), *expected);
+        }
+
+        // Backward, all the way home.
+        for expected in lines[..lines.len() - 1].iter().rev() {
+            state.handle_key_event(plain(KeyCode::Char('[')));
+            state.handle_key_event(plain(KeyCode::Char('[')));
+            assert_eq!(state.scroll(), *expected);
+        }
+        assert_eq!(state.scroll(), 0);
+    }
+
+    #[test]
+    fn test_dw_3_1_a_document_with_no_headings_reports_instead_of_moving() {
+        let (_doc, _config, _engine, mut state) = build(&non_reflowing_source(50), 40, 10);
+        assert!(
+            state.outline().is_empty(),
+            "the fixture must have no heading"
+        );
+        state.handle_key_event(plain(KeyCode::Char('j')));
+        let before = state.scroll();
+
+        for bracket in [']', '['] {
+            state.handle_key_event(plain(KeyCode::Char(bracket)));
+            assert!(!state.handle_key_event(plain(KeyCode::Char(bracket))));
+            assert_eq!(state.scroll(), before, "`{bracket}{bracket}` must not move");
+            let message = state
+                .status()
+                .message
+                .unwrap_or_else(|| panic!("`{bracket}{bracket}` must report why it did nothing"));
+            assert!(message.contains("no headings"), "{message:?}");
+        }
+    }
+
+    /// The plan's edge case: a heading as the very first block and as the
+    /// very last. Both ends clamp with a message rather than wrapping — a
+    /// wrap would teleport a reader to the other end of the document on a
+    /// keystroke they meant as "keep going".
+    #[test]
+    fn test_dw_3_1_a_heading_as_the_first_and_last_block_clamps_at_both_ends() {
+        let mut source = String::from("# First\n\nbody\n\n");
+        source.push_str(&"filler paragraph\n\n".repeat(20));
+        source.push_str("## Last\n");
+        let (_doc, _config, _engine, mut state) = build(&source, 40, 4);
+        let lines = heading_lines(&state);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], 0, "the first block is a heading");
+
+        // At the top, `[[` has nowhere above it.
+        state.handle_key_event(plain(KeyCode::Char('[')));
+        state.handle_key_event(plain(KeyCode::Char('[')));
+        assert_eq!(state.scroll(), 0);
+        assert!(state.status().message.unwrap().contains("first heading"));
+
+        // Forward to the last heading, then past it.
+        state.handle_key_event(plain(KeyCode::Char(']')));
+        state.handle_key_event(plain(KeyCode::Char(']')));
+        let at_last = state.scroll();
+        assert_eq!(at_last, lines[1].min(state.max_scroll()));
+        state.handle_key_event(plain(KeyCode::Char(']')));
+        state.handle_key_event(plain(KeyCode::Char(']')));
+        assert_eq!(
+            state.scroll(),
+            at_last,
+            "`]]` past the last heading must stay"
+        );
+        assert!(state.status().message.unwrap().contains("last heading"));
+    }
+
+    /// Half a sequence is not a motion, and it must not swallow the key that
+    /// follows it either.
+    #[test]
+    fn test_dw_3_1_a_lone_bracket_is_not_a_motion_and_does_not_eat_the_next_key() {
+        let (_doc, _config, _engine, mut state) = build(&heading_source(6), 40, 4);
+
+        assert!(!state.handle_key_event(plain(KeyCode::Char(']'))));
+        assert_eq!(state.scroll(), 0, "a lone `]` must not move the reader");
+
+        // `]` then `j` is one line down, not a heading jump.
+        assert!(!state.handle_key_event(plain(KeyCode::Char('j'))));
+        assert_eq!(state.scroll(), 1);
+
+        // A mismatched pair (`]` then `[`) arms the second bracket rather
+        // than jumping; the *next* `[` completes it.
+        state.handle_key_event(plain(KeyCode::Char(']')));
+        state.handle_key_event(plain(KeyCode::Char('[')));
+        assert_eq!(state.scroll(), 1, "`][` is not a motion");
+        state.handle_key_event(plain(KeyCode::Char('[')));
+        assert_eq!(state.scroll(), 0, "the following `[` completes `[[`");
+    }
+
+    #[test]
+    fn test_dw_3_2_t_opens_a_toc_listing_every_heading_with_its_level() {
+        let (_doc, _config, _engine, mut state) = build(&heading_source(6), 60, 20);
+        assert_eq!(state.mode(), Mode::Normal);
+
+        assert!(!state.handle_key_event(plain(KeyCode::Char('t'))));
+        assert_eq!(state.mode(), Mode::Toc { selected: 0 });
+
+        let rows = state.toc_rows(20);
+        assert_eq!(rows.len(), 6, "every heading must be listed");
+        for (i, row) in rows.iter().enumerate() {
+            assert!(
+                row.text.contains(&format!("Heading {i}")),
+                "row {i} must name its heading: {:?}",
+                row.text
+            );
+            let level = 1 + i % 3;
+            assert!(
+                row.text
+                    .contains(&format!("{} Heading {i}", "#".repeat(level))),
+                "row {i} must show its level ({level}): {:?}",
+                row.text
+            );
+        }
+        assert!(rows[0].selected, "the reader is under the first heading");
+        assert_eq!(
+            rows.iter().filter(|row| row.selected).count(),
+            1,
+            "exactly one row is selected"
+        );
+    }
+
+    #[test]
+    fn test_dw_3_2_enter_jumps_to_the_selected_heading_and_leaves_the_overlay() {
+        let (_doc, _config, _engine, mut state) = build(&heading_source(8), 60, 4);
+        let lines = heading_lines(&state);
+
+        state.handle_key_event(plain(KeyCode::Char('t')));
+        for _ in 0..3 {
+            state.handle_key_event(plain(KeyCode::Char('j')));
+        }
+        assert_eq!(state.mode(), Mode::Toc { selected: 3 });
+
+        assert!(!state.handle_key_event(plain(KeyCode::Enter)));
+        assert_eq!(state.mode(), Mode::Normal, "Enter closes the overlay");
+        assert_eq!(state.scroll(), lines[3].min(state.max_scroll()));
+        assert!(
+            state.toc_rows(20).is_empty(),
+            "no overlay rows outside Mode::Toc"
+        );
+    }
+
+    #[test]
+    fn test_dw_3_2_esc_returns_to_the_scroll_position_the_toc_was_opened_from() {
+        let (_doc, _config, _engine, mut state) = build(&heading_source(8), 60, 4);
+        for _ in 0..7 {
+            state.handle_key_event(plain(KeyCode::Down));
+        }
+        let before = state.scroll();
+        assert!(before > 0);
+
+        state.handle_key_event(plain(KeyCode::Char('t')));
+        // Move the selection around; none of it may move the document.
+        for _ in 0..4 {
+            state.handle_key_event(plain(KeyCode::Char('j')));
+        }
+        assert_eq!(state.scroll(), before, "browsing the TOC must not scroll");
+
+        assert!(!state.handle_key_event(plain(KeyCode::Esc)));
+        assert_eq!(state.mode(), Mode::Normal);
+        assert_eq!(state.scroll(), before, "Esc restores the prior position");
+
+        // `t` dismisses it too, from the same state.
+        state.handle_key_event(plain(KeyCode::Char('t')));
+        state.handle_key_event(plain(KeyCode::Char('j')));
+        state.handle_key_event(plain(KeyCode::Char('t')));
+        assert_eq!(state.mode(), Mode::Normal);
+        assert_eq!(state.scroll(), before);
+    }
+
+    /// The plan's edge case: more headings than the screen has rows. The
+    /// window must follow the selection, and the selected entry must be
+    /// among the rows painted — otherwise `Enter` jumps somewhere the reader
+    /// cannot see they chose.
+    #[test]
+    fn test_dw_3_2_a_toc_longer_than_the_screen_scrolls_to_keep_the_selection_visible() {
+        let (_doc, _config, _engine, mut state) = build(&heading_source(30), 60, 5);
+        state.handle_key_event(plain(KeyCode::Char('t')));
+
+        // Walk the whole list one row at a time; at every step the selection
+        // must be on screen and the window must be exactly five rows.
+        for step in 0..30usize {
+            let rows = state.toc_rows(5);
+            assert_eq!(
+                rows.len(),
+                5,
+                "step {step}: the window must fill the screen"
+            );
+            let selected: Vec<&TocRow> = rows.iter().filter(|row| row.selected).collect();
+            assert_eq!(
+                selected.len(),
+                1,
+                "step {step}: the selection must be visible"
+            );
+            assert!(
+                selected[0].text.contains(&format!("Heading {step}")),
+                "step {step}: the highlighted row must be the selected heading: {:?}",
+                selected[0].text
+            );
+            state.handle_key_event(plain(KeyCode::Char('j')));
+        }
+
+        // `G`/`g` reach both ends, and the window follows.
+        state.handle_key_event(plain(KeyCode::Char('G')));
+        let rows = state.toc_rows(5);
+        assert!(
+            rows.last().unwrap().selected,
+            "`G` selects the last heading"
+        );
+        assert!(rows.last().unwrap().text.contains("Heading 29"));
+
+        state.handle_key_event(plain(KeyCode::Char('g')));
+        let rows = state.toc_rows(5);
+        assert!(rows[0].selected, "`g` selects the first heading");
+        assert!(rows[0].text.contains("Heading 0"));
+    }
+
+    #[test]
+    fn test_dw_3_2_t_reports_instead_of_opening_when_there_are_no_headings() {
+        let (_doc, _config, _engine, mut state) = build(&non_reflowing_source(20), 40, 10);
+        assert!(!state.handle_key_event(plain(KeyCode::Char('t'))));
+        assert_eq!(
+            state.mode(),
+            Mode::Normal,
+            "an empty TOC must not become a blank screen"
+        );
+        let message = state.status().message.expect("`t` must report why");
+        assert!(message.contains("no headings"), "{message:?}");
+        assert!(state.toc_rows(10).is_empty());
+    }
+
+    /// The plan's edge case: a terminal too short to render the overlay. Zero
+    /// rows of content is a real viewport (a two-row terminal, one row of
+    /// which is the status line), and it must produce no rows rather than
+    /// panic on the window arithmetic.
+    #[test]
+    fn test_dw_3_2_a_viewport_too_short_for_the_overlay_paints_no_rows() {
+        let (_doc, _config, _engine, mut state) = build(&heading_source(6), 40, 1);
+        state.handle_key_event(plain(KeyCode::Char('t')));
+        assert_eq!(state.mode(), Mode::Toc { selected: 0 });
+        assert!(state.toc_rows(0).is_empty());
+        assert_eq!(state.toc_rows(1).len(), 1, "one row still shows one entry");
+        // ...and the overlay is still dismissable from a screen that shows
+        // none of it.
+        state.handle_key_event(plain(KeyCode::Esc));
+        assert_eq!(state.mode(), Mode::Normal);
+    }
+
+    /// The TOC opens on the heading whose section the reader is in, not on
+    /// the top of the document — so `t` then `Enter` leaves them where they
+    /// were rather than teleporting them home.
+    #[test]
+    fn test_the_toc_opens_on_the_heading_the_reader_is_under() {
+        let (_doc, _config, _engine, mut state) = build(&heading_source(8), 60, 4);
+        let lines = heading_lines(&state);
+        while state.scroll() < lines[4] + 1 {
+            state.handle_key_event(plain(KeyCode::Down));
+        }
+
+        state.handle_key_event(plain(KeyCode::Char('t')));
+        assert_eq!(state.mode(), Mode::Toc { selected: 4 });
+    }
+
+    /// An overlay that swallows the two keys every terminal user tries first
+    /// is a trap. Both must still quit.
+    #[test]
+    fn test_q_and_ctrl_c_still_quit_from_inside_the_toc() {
+        for key in [plain(KeyCode::Char('q')), ctrl('c')] {
+            let (_doc, _config, _engine, mut state) = build(&heading_source(4), 40, 10);
+            state.handle_key_event(plain(KeyCode::Char('t')));
+            assert!(
+                state.handle_key_event(key),
+                "{key:?} must quit from the overlay"
+            );
+        }
+    }
+
+    /// A `--watch` reload while the TOC is open: `selected` indexes the
+    /// outline of a document that no longer exists, and the new one may be
+    /// shorter. Left alone, the overlay would highlight nothing the reader can
+    /// see and `Enter` would resolve to no line at all.
+    #[test]
+    fn test_a_reload_reseats_an_open_toc_onto_the_new_documents_headings() {
+        let (_doc, config, engine, mut state) = build(&heading_source(10), 60, 8);
+        state.handle_key_event(plain(KeyCode::Char('t')));
+        state.handle_key_event(plain(KeyCode::Char('G')));
+        assert_eq!(state.mode(), Mode::Toc { selected: 9 });
+
+        reload(&mut state, &heading_source(3), &config, &engine);
+
+        assert_eq!(
+            state.mode(),
+            Mode::Toc { selected: 2 },
+            "the selection must be clamped into the reloaded outline"
+        );
+        let rows = state.toc_rows(8);
+        assert_eq!(rows.len(), 3, "the overlay must list the new document");
+        assert!(
+            rows[2].selected && rows[2].text.contains("Heading 2"),
+            "a visible row must be highlighted: {rows:?}"
+        );
+
+        // ...and `Enter` still resolves to a real line of the new tree.
+        state.handle_key_event(plain(KeyCode::Enter));
+        assert_eq!(state.mode(), Mode::Normal);
+        assert_eq!(
+            state.scroll(),
+            state
+                .outline()
+                .line_of(2)
+                .expect("the third heading has a line")
+                .min(state.max_scroll())
+        );
+    }
+
+    #[test]
+    fn test_a_reload_to_a_document_with_no_headings_dismisses_the_toc() {
+        let (_doc, config, engine, mut state) = build(&heading_source(6), 60, 8);
+        state.handle_key_event(plain(KeyCode::Char('t')));
+        assert!(matches!(state.mode(), Mode::Toc { .. }));
+
+        reload(&mut state, &non_reflowing_source(20), &config, &engine);
+
+        assert_eq!(
+            state.mode(),
+            Mode::Normal,
+            "an overlay with nothing to list is a blank screen the reader is \
+             stuck on"
+        );
+        let message = state
+            .status()
+            .message
+            .expect("the dismissal must say why it happened");
+        assert!(message.contains("no headings"), "{message:?}");
+        assert!(state.toc_rows(8).is_empty());
+    }
+
+    /// The outline is rebuilt with the tree, so its line indices always
+    /// address the tree that is installed now. A width change that rewraps
+    /// every heading is where a stale outline would show.
+    #[test]
+    fn test_the_outline_line_indices_follow_a_relayout() {
+        let source: String = (0..12)
+            .map(|i| {
+                format!(
+                    "## Heading {i} with enough words in its title to wrap at a narrow width\n\n\
+                     body paragraph {i} carrying several words of its own\n\n"
+                )
+            })
+            .collect();
+        let (doc, config, engine, mut state) = build(&source, 90, 10);
+        let ctx = LayoutContext {
+            doc: &doc,
+            config: &config,
+            engine: &engine,
+            sizer: &NullSizer,
+        };
+        let wide = heading_lines(&state);
+
+        state.apply_resize_burst(
+            &ctx,
+            &[Size {
+                width: 30,
+                height: 10,
+            }],
+        );
+        let narrow = heading_lines(&state);
+        assert_eq!(narrow.len(), wide.len(), "the heading count cannot change");
+        assert_ne!(
+            narrow, wide,
+            "the fixture is broken: headings must move when they rewrap, or \
+             this test cannot see a stale outline"
+        );
+
+        // Every recorded line must still be the first line of its heading in
+        // the tree that is installed now — checked against the painted text,
+        // not against another index.
+        for (i, &line) in narrow.iter().enumerate() {
+            assert!(
+                line_text(&state, line).contains(&format!("Heading {i}")),
+                "outline entry {i} points at line {line}, which reads {:?}",
+                line_text(&state, line)
+            );
+        }
     }
 
     fn topmost_line_text(state: &AppState) -> String {

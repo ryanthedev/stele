@@ -292,6 +292,96 @@ impl Line {
     }
 }
 
+/// One heading in the document's [`Outline`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct OutlineEntry {
+    /// The heading's level, 1–6, exactly as [`Semantic::Heading`] carries it.
+    pub level: u8,
+    /// The heading's text, flattened from its inline children — so
+    /// `## a *b* `c`` reads as `a b c` rather than as three styled fragments.
+    /// Taken from the AST rather than from the emitted runs because a run's
+    /// style is overridden inside emphasis and code spans, and an outline
+    /// built from runs would drop exactly those words.
+    pub text: String,
+    /// The block to anchor a jump on: the heading's own node for a top-level
+    /// heading (the ordinary case), and the enclosing top-level block for a
+    /// heading nested inside a blockquote or list item — because the tree's
+    /// per-line block tags name only top-level blocks (see
+    /// [`LayoutTree::block_at`]), so a nested heading's own id would address
+    /// no line at all.
+    ///
+    /// [`Outline::line_of`] is the exact answer for every heading regardless
+    /// of nesting; this field is what the plan's seam promises and what
+    /// callers that think in blocks (folding, in a later phase) will want.
+    pub block: NodeId,
+}
+
+/// Every heading in the laid-out document, in document order — built once
+/// during layout, when level, text, anchoring block and emitted line are all
+/// in hand at the same moment.
+///
+/// The line each heading starts at is kept private rather than published on
+/// [`OutlineEntry`]: it is only meaningful against *this* tree, and the tree
+/// owns the outline, so the pairing cannot come apart. Callers navigate
+/// through [`Outline::next_after`] / [`Outline::previous_before`] /
+/// [`Outline::line_of`] and never hold a line index across a relayout.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct Outline {
+    /// The headings, in document order.
+    pub entries: Vec<OutlineEntry>,
+    /// The tree line each entry's heading starts at, in lockstep with
+    /// `entries` and strictly increasing.
+    lines: Vec<usize>,
+}
+
+impl Outline {
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// The tree line the `index`-th heading starts at.
+    pub fn line_of(&self, index: usize) -> Option<usize> {
+        self.lines.get(index).copied()
+    }
+
+    /// The index of the first heading strictly below `line` — `]]`'s answer.
+    /// Strict, so repeating the jump keeps moving, and `None` at the last
+    /// heading so the caller can clamp rather than wrap.
+    pub fn next_after(&self, line: usize) -> Option<usize> {
+        self.lines.iter().position(|&l| l > line)
+    }
+
+    /// The index of the last heading strictly above `line` — `[[`'s answer.
+    pub fn previous_before(&self, line: usize) -> Option<usize> {
+        self.lines.iter().rposition(|&l| l < line)
+    }
+
+    /// The index of the heading whose section contains `line`: the last one
+    /// at or above it. This is "which heading am I under", which is what the
+    /// TOC opens on — distinct from [`Outline::previous_before`], which is a
+    /// *motion* and must never answer with the heading already at the top of
+    /// the viewport.
+    pub fn index_at_or_before(&self, line: usize) -> Option<usize> {
+        self.lines.iter().rposition(|&l| l <= line)
+    }
+
+    /// The line a heading anchored on `block` starts at, for the nested case
+    /// [`LayoutTree::first_line_of`] cannot answer.
+    pub fn line_for_block(&self, block: NodeId) -> Option<usize> {
+        let index = self.entries.iter().position(|e| e.block == block)?;
+        self.line_of(index)
+    }
+
+    pub(crate) fn push(&mut self, entry: OutlineEntry, line: usize) {
+        self.entries.push(entry);
+        self.lines.push(line);
+    }
+}
+
 /// The retained layout: a flat sequence of lines at one width. Scrolling
 /// and painting (P5) address it purely by line range.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -302,6 +392,7 @@ pub struct LayoutTree {
     /// a new width, then re-anchor to the block that was at the top rather
     /// than guessing a proportional offset.
     line_blocks: Vec<Option<NodeId>>,
+    outline: Outline,
     width: u16,
 }
 
@@ -341,6 +432,13 @@ impl LayoutTree {
     pub fn first_line_of(&self, block: NodeId) -> Option<usize> {
         self.line_blocks.iter().position(|b| *b == Some(block))
     }
+
+    /// Every heading in this tree, in document order — the outline heading
+    /// navigation and the TOC overlay are built on. Rebuilt with the tree, so
+    /// its line indices are always the ones this tree uses.
+    pub fn outline(&self) -> &Outline {
+        &self.outline
+    }
 }
 
 /// Lay out a parsed document at `width` cells.
@@ -360,10 +458,11 @@ pub fn layout(
     let width = width.clamp(min, max);
     let mut ctx = block::Ctx::new(doc, engine, sizer, width);
     block::walk_blocks(&mut ctx, doc.blocks(), true);
-    let (lines, line_blocks) = ctx.into_parts();
+    let (lines, line_blocks, outline) = ctx.into_parts();
     LayoutTree {
         lines,
         line_blocks,
+        outline,
         width,
     }
 }

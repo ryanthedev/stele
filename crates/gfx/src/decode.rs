@@ -275,6 +275,18 @@ fn letterbox_onto(
 /// that reasons about the raster's pixel geometry (placement sizing, and any
 /// source-rect crop over it) is unaffected — and the kitty scale factor is
 /// 1.0 on both axes for both kinds of content.
+///
+/// **One resize, not two, and that is measured.** Phase 3 was chartered to add
+/// a two-stage downscale — repeated halving down to within 2x of the target,
+/// then one Triangle pass — on the strength of an audit that measured it at a
+/// 500x400 target. At the target a real full-width box actually asks for
+/// (~2400 px: 100 cells at the fallback 24 px cell width), it does not pay:
+/// `cargo run --release -p gfx --example downscale_probe` measures a 6000x6000
+/// source at 445 ms one-stage against 417 ms two-stage — **6% end to end**, of
+/// which the 273 ms decode is untouched either way. A second resize path and a
+/// hand-rolled halving loop is not worth 6%, so the two-stage step was
+/// measured and declined rather than shipped as a no-op. Re-run the probe
+/// before reviving it.
 fn letterbox(src: &image::RgbaImage, target_w: u32, target_h: u32) -> image::RgbaImage {
     // Fit: the smaller of the two axis ratios, in a wide-enough type that a
     // 8192-px source against a 1-px target cannot round to zero.

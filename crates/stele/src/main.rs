@@ -17,7 +17,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 use layout::{IntrinsicSizer, LayoutConfig, layout};
 use width::{WidthConfig, WidthEngine};
 
-use stele::app::{AppState, LayoutContext, StatusMessage};
+use stele::app::{AppState, LayoutContext, Mode, StatusMessage};
 use stele::cli::Cli;
 use stele::decor::themed::ThemedDecor;
 use stele::loader::{DocumentSource, LoadOptions};
@@ -399,8 +399,7 @@ fn run_session(
     theme: &mut ThemeState,
     out: &mut dyn Write,
 ) -> io::Result<()> {
-    let status = state.status();
-    painter.frame_with_status(state.tree(), state.scroll(), state.size(), &status, out)?;
+    paint(state, painter, out)?;
 
     loop {
         let mut repaint = false;
@@ -496,12 +495,30 @@ fn run_session(
         }
 
         if repaint {
-            let status = state.status();
-            painter.frame_with_status(state.tree(), state.scroll(), state.size(), &status, out)?;
+            paint(state, painter, out)?;
         }
     }
 
     Ok(())
+}
+
+/// One frame, of whichever kind the current [`Mode`] calls for.
+///
+/// The status row is asked for exactly once per painted frame either way,
+/// because that call is what ages a transient message toward its TTL (see
+/// `AppState::status`) — an overlay frame that skipped it would freeze a
+/// `Ctrl-G` message on screen for as long as the TOC stayed open.
+fn paint(state: &mut AppState, painter: &mut Painter, out: &mut dyn Write) -> io::Result<()> {
+    let status = state.status();
+    match state.mode() {
+        Mode::Normal => {
+            painter.frame_with_status(state.tree(), state.scroll(), state.size(), &status, out)
+        }
+        Mode::Toc { .. } => {
+            let rows = state.toc_rows(state.size().height);
+            painter.frame_overlay(&rows, state.size(), &status, out)
+        }
+    }
 }
 
 /// Bottom-row chrome and layout-affecting toggles that need resources
@@ -511,6 +528,18 @@ fn run_session(
 /// since `FileInfo` is static per-session data baked into `AppState` at
 /// construction.) Returns whether `key` was one of these — when `true`,
 /// the caller must not also pass `key` to `AppState::handle_key_event`.
+///
+/// **These are document-reading keys, so a mode that owns the keyboard gets
+/// them first — which here means it gets them at all.** This function runs
+/// *before* `AppState::handle_key_event` in both call sites, and returning
+/// `true` is what stops the key reaching it. That is a key-stealing shape:
+/// any binding added here silently outranks every mode `AppState` has, and
+/// the mode cannot even see that it happened. Phase 2 already found one half
+/// of this from the other direction — a `T` read during a resize drain was
+/// offered only to `handle_key_event`, which does not know it, and vanished.
+/// The rule that closes both: the chrome table applies to `Mode::Normal` and
+/// nothing else. With the TOC up, `+`/`-`/`T` are inert rather than silently
+/// relaying out the document underneath an overlay that is not showing it.
 fn handle_chrome_key(
     key: KeyEvent,
     session: &Session,
@@ -518,7 +547,7 @@ fn handle_chrome_key(
     painter: &mut Painter,
     theme: &mut ThemeState,
 ) -> bool {
-    if key.modifiers.contains(KeyModifiers::CONTROL) {
+    if key.modifiers.contains(KeyModifiers::CONTROL) || state.mode() != Mode::Normal {
         return false;
     }
     let ctx = session.ctx();

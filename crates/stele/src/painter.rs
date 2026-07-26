@@ -15,7 +15,7 @@ use highlight::{HYPERLINK_CLOSE, hyperlink_open};
 use layout::{LayoutTree, Line, LineItem, Reserved, ReservedLine, Run, Semantic, StyleId};
 use width::WidthEngine;
 
-use crate::app::StatusLine;
+use crate::app::{StatusLine, TocRow};
 use crate::decor::{Decor, StructuralDecor};
 use crate::media::{MediaSink, NoopMediaSink};
 
@@ -177,6 +177,65 @@ impl Painter {
             .and_then(|()| self.paint_status_row(status, size, out));
         let closed = out.write_all(SYNC_END).and_then(|()| out.flush());
         painted.and(closed)
+    }
+
+    /// Paints the TOC overlay (DW-3.2): `rows` over the whole content
+    /// viewport, then the same reserved status row every other frame gets.
+    ///
+    /// **It is a frame, not a decoration**, and that is what DW-3.3 turns on.
+    /// It opens the media sink's frame boundary exactly as
+    /// [`Painter::frame_with_status`] does, which takes every live placement
+    /// off the screen; because no reserved box is painted afterwards, nothing
+    /// puts one back, so an overlay frame ends with the terminal drawing
+    /// nothing — and the next document frame re-places precisely the boxes it
+    /// paints. Skipping `begin_frame` here would leave the previous screen's
+    /// images floating over the overlay, which is the exact bug the frame
+    /// boundary was introduced to kill.
+    ///
+    /// Rows past the end of `rows` are blanked rather than left alone: the
+    /// overlay owns the whole viewport, so document text under a short TOC
+    /// must not show through. The build stamp stands down for the same
+    /// reason.
+    pub fn frame_overlay(
+        &mut self,
+        rows: &[TocRow],
+        size: Size,
+        status: &StatusLine,
+        out: &mut dyn Write,
+    ) -> io::Result<()> {
+        out.write_all(SYNC_BEGIN)?;
+        let painted = self
+            .overlay_body(rows, size, out)
+            .and_then(|()| self.paint_status_row(status, size, out));
+        let closed = out.write_all(SYNC_END).and_then(|()| out.flush());
+        painted.and(closed)
+    }
+
+    /// The body of [`frame_overlay`](Self::frame_overlay), split out for the
+    /// same reason [`frame_body`](Self::frame_body) is: every `?` in here is
+    /// caught before the synchronized-update block is closed.
+    fn overlay_body(&mut self, rows: &[TocRow], size: Size, out: &mut dyn Write) -> io::Result<()> {
+        self.media.begin_frame(out);
+        for row in 0..size.height {
+            write!(out, "\x1b[{};1H", row + 1)?;
+            if let Some(entry) = rows.get(usize::from(row)) {
+                let sanitized = sanitize(&entry.text);
+                let (clipped, _) = clip_to_width(&sanitized, &self.width_engine, size.width);
+                // Reverse video for the selection: the overlay has no theme
+                // roles of its own, and reverse is the one attribute that is
+                // legible against whatever background the terminal is using
+                // in either theme variant.
+                if entry.selected {
+                    out.write_all(b"\x1b[7m")?;
+                }
+                out.write_all(clipped.as_bytes())?;
+                if entry.selected {
+                    out.write_all(SGR_RESET)?;
+                }
+            }
+            out.write_all(CLEAR_TO_EOL)?;
+        }
+        Ok(())
     }
 
     /// Paints `status` into the row immediately below the `size.height`
