@@ -881,7 +881,7 @@ mod tests {
             };
             rendered += 1;
             let (target_w, target_h) = pipeline_target_px(em_w, em_h, 100);
-            let png = render_fitted(tex, 40, target_w, target_h)
+            let png = render_fitted(tex, PIPELINE_EM_PX, target_w, target_h)
                 .unwrap_or_else(|e| panic!("{file}: {} failed to render: {e}", short(tex)));
             let (w, h) = decode_png_dims(png.as_bytes());
             let px = png_pixels_via_manual_decode(png.as_bytes());
@@ -973,29 +973,27 @@ mod tests {
                  px extent its own layout declared at em {em_px}",
                 short(tex)
             );
-            // Underfill floors, per axis and measured at the em the product
-            // actually renders at. A single 0.65 for both axes used to stand
-            // here, and it was not scale-invariant: antialiased strokes spill a
-            // roughly *fixed* number of pixels past the typographic box, so the
-            // measured ratio falls as the em grows. `\frac{a}{b}` ratios 0.7156
-            // wide at em 40 and 0.5963 at em 48 — the same raster, the same
-            // formula, a threshold that only ever held at the smaller em. Some
-            // heights even exceeded 1.0 at em 40, absorbed by the +3 px slack
-            // above.
+            // Ink must fill most of the extent its own layout declared —
+            // catches a raster that renders the formula at the wrong size
+            // inside a correctly-sized box.
             //
-            // Both axes underfill, for the same reason in two directions: a
-            // formula's declared extent is an advance box, and TeX reserves
-            // space in it that no glyph inks. Worst observed across all 31
-            // fixture formulas, measured at the em each one actually renders
-            // at — 0.5963 wide, `\frac{a}{b}`, whose rule is inset from both
-            // edges of the box reserved for it; 0.6738 tall,
-            // `\begin{aligned}`, whose row gap is reserved leading between two
-            // short rows and inks nothing at all.
-            const MIN_INK_FILL_W: f64 = 0.55;
-            const MIN_INK_FILL_H: f64 = 0.62;
+            // This floor was briefly lowered to 0.55/0.62 on the strength of a
+            // measurement that was an artifact: the render call above still
+            // passed a literal em of 40 while `ink_px_w`/`ink_px_h` had moved
+            // to `PIPELINE_EM_PX`, so the ratio was ink-at-40 over
+            // declared-at-48 and every formula appeared to underfill by
+            // exactly 40/48. Measured honestly, with both ems the same, the
+            // worst cases across all 31 fixture formulas are 0.7319 wide
+            // (`\frac{a}{b}`, whose rule is inset from both edges of its
+            // advance box) and 0.7943 tall (`\begin{aligned}`, whose row gap
+            // is reserved leading that inks nothing). 0.65 has margin on both
+            // and needed no change.
+            //
+            // The lesson is in the mismatch, not the number: a fill ratio is
+            // only meaningful when its numerator and denominator are measured
+            // at the same em, and nothing in the assertion said so out loud.
             assert!(
-                f64::from(ink_w) >= MIN_INK_FILL_W * ink_px_w
-                    && f64::from(ink_h) >= MIN_INK_FILL_H * ink_px_h,
+                f64::from(ink_w) >= 0.65 * ink_px_w && f64::from(ink_h) >= 0.65 * ink_px_h,
                 "{file}: {} inked only {ink_w}x{ink_h} px of a declared \
                  {ink_px_w:.0}x{ink_px_h:.0} px extent at em {em_px}",
                 short(tex)
@@ -1128,7 +1126,7 @@ mod tests {
             };
             composed += 1;
             let target = pipeline_target_px(em_w, em_h, 100);
-            let math_png = render_fitted(tex, 40, target.0, target.1).expect("renders");
+            let math_png = render_fitted(tex, PIPELINE_EM_PX, target.0, target.1).expect("renders");
             let (mw, mh) = decode_png_dims(math_png.as_bytes());
 
             // Exactly what `stele::media::sink::resolve_math` does with it.
@@ -1235,7 +1233,8 @@ mod tests {
         let hostile = "W".repeat(MAX_TEX_LEN);
         let (em_w, em_h) = intrinsic_em_size(&hostile).expect("4096 `W`s parse");
         let target = pipeline_target_px(em_w, em_h, 100);
-        let png = render_fitted(&hostile, 40, target.0, target.1).expect("still rasterizes");
+        let png =
+            render_fitted(&hostile, PIPELINE_EM_PX, target.0, target.1).expect("still rasterizes");
         let (w, h) = decode_png_dims(png.as_bytes());
         assert!(
             w > max_dim,
@@ -1257,7 +1256,7 @@ mod tests {
             .filter_map(|f| {
                 let (em_w, em_h) = intrinsic_em_size(&f.tex)?;
                 let target = pipeline_target_px(em_w, em_h, 100);
-                let png = render_fitted(&f.tex, 40, target.0, target.1).ok()?;
+                let png = render_fitted(&f.tex, PIPELINE_EM_PX, target.0, target.1).ok()?;
                 Some(decode_png_dims(png.as_bytes()).0)
             })
             .max()
@@ -1466,6 +1465,14 @@ mod tests {
             // Every box here is at least as big as either formula's ink at em
             // 40 (`e^{i\pi}+1=0` is the larger: 190x39 px), so `em_capped_to_box`
             // leaves the em alone in all of them.
+            //
+            // Deliberately em 40 and not `PIPELINE_EM_PX`: the boxes below were
+            // measured against a 40 px raster, and the property under test —
+            // that the box a formula is given does not change its glyph size —
+            // holds at any em. Tying it to the pipeline's em would mean
+            // re-deriving three box literals for a test whose subject is not
+            // the pipeline. The em and the boxes have to agree with each other
+            // here, not with the product.
             let boxes = [(192u32, 48u32), (312, 96), (2400, 240)];
             let mut dims = Vec::new();
             for (tw, th) in boxes {
@@ -1509,7 +1516,8 @@ mod tests {
         assert!(wide.len() < MAX_TEX_LEN);
         // The box layout lands on: 100 content columns, one row.
         let (target_w, target_h) = (100 * 24, 48);
-        let png = render_fitted(&wide, 40, target_w, target_h).expect("must still render");
+        let png =
+            render_fitted(&wide, PIPELINE_EM_PX, target_w, target_h).expect("must still render");
         let (w, h) = decode_png_dims(png.as_bytes());
         let px = u64::from(w) * u64::from(h);
         assert!(
@@ -1625,6 +1633,10 @@ mod tests {
     fn test_render_fitted_leaves_the_ink_alone_when_the_box_is_far_wider() {
         let _g = test_guard();
         reset_caches_for_test();
+        // Em 40 rather than `PIPELINE_EM_PX` on purpose: what matters is that
+        // this em matches the `render` call below, since the assertion is that
+        // the two produce identical rasters. Any em would do; the pipeline's
+        // is not privileged here.
         let png = render_fitted("a+b=c", 40, 4_000, 48).expect("still renders");
         let (rw, rh) = decode_png_dims(png.as_bytes());
         assert!(rw > 0 && rh > 0);
