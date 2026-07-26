@@ -1,6 +1,7 @@
 # Plan: stele viewer features — navigation, search, links, and the frame budget
 **Created:** 2026-07-25
-**Status:** in-progress
+**Status:** complete
+**Completed:** 2026-07-26
 **Started:** 2026-07-25 12:40
 **Current Phase:** 1
 **Complexity:** complex
@@ -305,3 +306,32 @@ Separately, a measure-first audit found frames 40× slower than necessary on cod
 Commit: 7187b5f
 Summary: Added a reserved status row (position %, document name, TTL-expiring messages), Ctrl-G file info, `+`/`-` width and `T` theme toggles routed through the new `AppState::relayout_preserving_anchor` seam every later phase calls, plus a panic-safe BufWriter on stdout and an ASCII fast path in `display_width`.
 
+### Phase 2: Document sourcing — stdin and `--watch` (Gate: Full)
+- [x] BUILD / REVIEW: Verification passed after 4 fix rounds
+- [x] Committed — a71c649
+Summary: `DocumentSource::{Path,Stdin}` with `stele -` and `--watch`; content-addressed scroll anchor surviving reload; `Rc<Document>` shared with the sink; parse-once. Fixed a pre-existing freeze during window drags and a swallowed `T` key.
+
+### Phase 3: Heading navigation — jump, TOC overlay, image residency (Gate: Full)
+- [x] BUILD / REVIEW: Verification passed; rebase delta covered by batch review 2026-07-26 (phases 3, 5)
+- [x] Committed — f1529e4
+Summary: `Outline` on the layout tree, `]]`/`[[`, `Mode::Toc`; residency split from visibility with a byte-budgeted `RasterCache` (scroll-back 5.018s -> 9us). Two-stage downscale dropped after measurement.
+
+### Phase 4: Incremental search (Gate: Full)
+- [x] BUILD / REVIEW: Verification passed after 2 fix rounds
+- [x] Committed — 1979b09
+Summary: `/`, `n`/`N`, match highlighting, bounded highlight cache, allocation-free `write_sgr` (12.2-12.9x optimized). Key routing moved behind `Mode::captures_all_keys()`.
+
+### Phase 5: Section folding (Gate: Standard)
+- [x] BUILD: complete; REVIEW: DEFERRED — batch pending (tests green at commit)
+- [x] Committed — 1c4192f
+Summary: `z`/`R`/`M` folding as a chrome action; `FoldState` consulted during the layout walk.
+- Covered by batch review 2026-07-26 (phases 3, 5) — FAILED, fixed forward in 75c536a
+
+### Phase 5 fix-forward (Gate: Standard)
+- [x] Fixed batch review findings — marker count clipping, reseat across reload, search-in-fold reporting
+- [x] Committed — 75c536a
+
+### Phase 6: Mouse, link following, and clipboard (Gate: Full, security-sensitive)
+- [x] BUILD / REVIEW: Verification passed after 3 fix rounds
+- [x] Committed — 236b859
+Summary: `Tab`-cycled link selection, document stack, mouse, OSC 52 copy, behind a barricade whose four bypass doors were closed at `gfx::decode::opened`. Test harness can now exercise graphics and reaps orphaned children.
