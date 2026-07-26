@@ -4,13 +4,14 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::ops::Range;
 
 use ast::{Document, NodeId};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use layout::{IntrinsicSizer, LayoutConfig, LayoutTree, Line, LineItem, Outline, layout};
 use width::WidthEngine;
 
-use crate::painter::Size;
+use crate::painter::{SearchOverlay, Size};
 
 /// Mixed into [`AppState::fingerprint`] between lines so two blocks whose runs
 /// concatenate to the same bytes but break differently cannot hash alike.
@@ -115,6 +116,81 @@ impl StatusLine {
     }
 }
 
+/// One literal match of the active query, addressed in the *laid-out* tree
+/// so the painter can restyle exactly the cells it covers.
+///
+/// [`range`](Self::range) is a **byte** range measured from the start of
+/// [`line`](Self::line)'s text, and it may run *past* that line's length —
+/// which is how a match that straddles a wrap boundary is expressed. Layout
+/// breaks a paragraph mid-match without asking; the match is still one
+/// match, so it stays one `Match`, anchored at the line it starts on, and
+/// the painter walks forward subtracting each line's length to find the
+/// piece that falls on each row (DW-4.4). For the overwhelmingly common
+/// case of a match inside one line, `range` is simply that line's local
+/// byte range.
+///
+/// Bytes rather than cell columns, even though columns are what the reader
+/// sees: bytes are what safely slice a `&str`, and restyling a match means
+/// splitting runs. The column follows from the byte offset through the
+/// width engine, which is the only oracle for it anyway; storing columns
+/// would mean converting twice and re-deriving the byte offset regardless.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Match {
+    /// The top-level source block the match falls inside. The one part of a
+    /// match's address that survives a relayout — see
+    /// [`AppState::relayout`], which recomputes the rest.
+    pub block: NodeId,
+    /// Tree line index the match *starts* on.
+    pub line: usize,
+    /// Byte range within the block's laid-out text, measured from the start
+    /// of `line`.
+    pub range: Range<usize>,
+}
+
+/// The active search: what was typed, where it matched, and which match the
+/// reader is on. Outlives [`Mode::Search`] on purpose — `n`/`N` traverse the
+/// last accepted query from normal mode, exactly like vim.
+#[derive(Debug, Clone, Default)]
+pub struct SearchState {
+    pub query: String,
+    /// Every match, in tree order (ascending `line`, then `range.start`).
+    pub matches: Vec<Match>,
+    /// Index into `matches`. Meaningless — and never read — when `matches`
+    /// is empty; [`AppState::search_overlay`] is what enforces that.
+    pub current: usize,
+}
+
+impl SearchState {
+    /// Whether the query is case-sensitive, by vim's smart-case rule: an
+    /// all-lowercase query matches either case, and one uppercase character
+    /// anywhere in it makes the whole query exact (DW-4.2).
+    ///
+    /// `char::is_uppercase` rather than `is_ascii_uppercase`, so the rule
+    /// reads the same way for a reader typing `Ärger` as for one typing
+    /// `Error`.
+    fn case_sensitive(&self) -> bool {
+        self.query.chars().any(char::is_uppercase)
+    }
+
+    /// The status-row text while the prompt is open: the query as typed,
+    /// plus where the reader is in the results — or that there are none
+    /// (DW-4.5).
+    fn prompt(&self) -> String {
+        if self.query.is_empty() {
+            return "/".to_string();
+        }
+        if self.matches.is_empty() {
+            return format!("/{} — no matches", self.query);
+        }
+        format!(
+            "/{}  [{}/{}]",
+            self.query,
+            self.current + 1,
+            self.matches.len()
+        )
+    }
+}
+
 /// What the viewer is showing, and therefore what a key means.
 ///
 /// Deliberately a flat enum matched at the top of
@@ -122,6 +198,11 @@ impl StatusLine {
 /// overlay and it is modal, so a stack would be a general mechanism with one
 /// user and two states it can be in that this cannot express (two overlays
 /// open, and an empty stack that is not `Normal`).
+///
+/// Every match on this type is exhaustive with no wildcard arm, so a new mode
+/// is a compile error everywhere it must be handled rather than a silently
+/// missing case — including at [`Mode::captures_all_keys`], which is the one
+/// question a mode cannot answer from inside itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     /// Reading the document. Every pre-existing binding means what it did.
@@ -129,8 +210,57 @@ pub enum Mode {
     /// The full-screen table of contents, with `selected` indexing
     /// [`Outline::entries`].
     Toc { selected: usize },
+    /// Reading a query into the status row. `origin` is the scroll position
+    /// `/` was pressed at — incremental search moves the viewport as the
+    /// reader types, and `Esc` has to be able to undo all of it (DW-4.1).
+    /// It rides on the variant rather than on [`AppState`] so the datum
+    /// cannot outlive the mode that gives it meaning.
+    Search { origin: usize },
 }
 
+impl Mode {
+    /// Whether this mode reads the keyboard *whole*: every key is its own,
+    /// and no layer above it may act on a key before it does.
+    ///
+    /// **This exists to be asked by code that is not in this file.** The
+    /// event loop in `main.rs` runs a chrome table (`+`, `-`, `T`) *before*
+    /// [`AppState::handle_key_event`], because those keys need a `Painter`
+    /// and a `LayoutContext` that `AppState` does not own. A key that table
+    /// claims never reaches `handle_key_event`, so no guard inside this type
+    /// can defend against it.
+    ///
+    /// Three phases found that independently, from three directions: a `T`
+    /// read during a resize drain vanished (Phase 2), `+`/`-`/`T` relaid out
+    /// a document the TOC overlay was not showing (Phase 3), and `/The`
+    /// searched for `he` while swapping the theme (Phase 4). Phase 3 fixed
+    /// its instance with a `mode() != Mode::Normal` gate in `main.rs`, which
+    /// was correct and would have kept being correct until the next mode
+    /// forgot to be added to it — in a file that mode does not own.
+    ///
+    /// Answering the question here inverts that obligation. The match is
+    /// exhaustive with no wildcard arm, so `Mode::LinkSelect` (Phase 6) is a
+    /// compile error at this line until its author states whether their mode
+    /// owns the keyboard — the same discipline the `Semantic` style tables
+    /// use, applied to the one seam a mode cannot police from inside itself.
+    ///
+    /// A mode answering `true` takes on the whole obligation: every key,
+    /// including ones another layer would like to claim, is handled by that
+    /// mode or deliberately ignored by it.
+    pub fn captures_all_keys(self) -> bool {
+        match self {
+            Mode::Normal => false,
+            // The overlay reads keys of its own (`j`/`k`, `Enter`, `Esc`) and
+            // deliberately ignores the rest. `+`/`-`/`T` are inert while it
+            // is up rather than relaying out or re-theming a document the
+            // reader cannot see — Phase 3's rule, unchanged, now stated by
+            // the mode instead of by the chrome table.
+            Mode::Toc { .. } => true,
+            // Every printable key is a character of the query (DW-4.1); the
+            // rest edit it or end it.
+            Mode::Search { .. } => true,
+        }
+    }
+}
 /// One row of the rendered TOC overlay: the text to paint and whether it is
 /// the selected entry.
 ///
@@ -148,6 +278,31 @@ pub struct TocRow {
 /// work with. One constant, because a document with no headings must answer
 /// the same way whichever key asked (DW-3.1, and the overlay's edge case).
 const NO_HEADINGS: &str = "no headings in this document";
+
+/// A key press the event loop must act on with resources [`AppState`] does
+/// not own: `+`/`-` need a [`LayoutContext`] to relay out against, and `T`
+/// needs the [`crate::painter::Painter`] whose decor it swaps.
+///
+/// **Why this is a value and not a call.** `main.rs` used to hold both the
+/// decision (*is this key chrome?*) and the action (*do the thing*), and its
+/// own module doc says it should hold neither — "all decision logic lives in
+/// the library; this file is thin glue over real crossterm I/O and is not
+/// itself unit-tested". The consequence was not theoretical: because the
+/// decision lived in the one file no test can reach, nothing noticed that it
+/// ran *before* [`AppState::handle_key_event`] and swallowed `T`, `+` and `-`
+/// out of a search query. Two review gates passed over it.
+///
+/// Splitting the decision out returns `main.rs` to the glue it claims to be
+/// and puts the part that can be wrong under test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChromeAction {
+    /// `+` — widen the content column (DW-1.4).
+    Widen,
+    /// `-` — narrow it.
+    Narrow,
+    /// `T` — swap the built-in theme variant (DW-1.5).
+    ToggleTheme,
+}
 
 /// The viewer's mutable state: the current layout tree, scroll offset, and
 /// viewport size. Navigation and resize are pure state transitions, driven
@@ -179,6 +334,7 @@ pub struct AppState {
     /// [`AppState::relayout`]. See [`AppState::no_reflow_occurred`] for why a
     /// width comparison cannot answer this on its own.
     document_changed: bool,
+    search: SearchState,
 }
 
 impl AppState {
@@ -201,6 +357,7 @@ impl AppState {
             file_info,
             status_message: None,
             document_changed: false,
+            search: SearchState::default(),
         }
     }
 
@@ -208,8 +365,10 @@ impl AppState {
         &self.tree
     }
 
-    /// What the viewer is showing — the event loop's cue for which painter
-    /// entry point to call.
+    /// What the viewer is showing, and which key table is live — the event
+    /// loop's cue for which painter entry point to call, and (for
+    /// `Mode::Search`) that the status row is a query prompt rather than the
+    /// ruler.
     pub fn mode(&self) -> Mode {
         self.mode
     }
@@ -217,6 +376,58 @@ impl AppState {
     /// The document's headings, in document order.
     pub fn outline(&self) -> &Outline {
         self.tree.outline()
+    }
+
+    /// Which [`ChromeAction`] `key` requests, or `None` when the key is not
+    /// chrome — and `None` for **every** key while the current mode owns the
+    /// keyboard.
+    ///
+    /// This is the whole of the routing decision the event loop used to make
+    /// for itself, moved to where the mode lives and where a test can reach
+    /// it. The order of the two guards is the part that was wrong: the mode
+    /// question has to be asked first, because a key claimed as chrome never
+    /// reaches [`AppState::handle_key_event`] and so never meets that
+    /// method's own "while the prompt is open, every key is text" guard.
+    /// `/The` searched for `he` and flipped the theme on the way through.
+    ///
+    /// Ordinary navigation is deliberately not here: it needs nothing beyond
+    /// `AppState` and belongs on `handle_key_event` with the rest of the key
+    /// table. Only the keys that genuinely need a painter or a layout context
+    /// have to make this trip.
+    pub fn chrome_action(&self, key: KeyEvent) -> Option<ChromeAction> {
+        if self.mode.captures_all_keys() {
+            return None;
+        }
+        // A chord is not the bare key: `Ctrl-T` must keep falling through to
+        // whatever `handle_control_chord` makes of it, not toggle the theme.
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            return None;
+        }
+        match key.code {
+            KeyCode::Char('+') => Some(ChromeAction::Widen),
+            KeyCode::Char('-') => Some(ChromeAction::Narrow),
+            KeyCode::Char('T') => Some(ChromeAction::ToggleTheme),
+            _ => None,
+        }
+    }
+
+    /// The active search — query, matches, and which one the reader is on.
+    /// Read-only from outside this type: `matches` and `current` are only
+    /// consistent because every mutation here keeps them so.
+    pub fn search(&self) -> &SearchState {
+        &self.search
+    }
+
+    /// What the painter needs to highlight this frame (DW-4.4). `current`
+    /// is `None` — no distinct-styled match — exactly when there is nothing
+    /// to be current *among*, which is what keeps the painter from having
+    /// to re-check the index it is handed.
+    pub fn search_overlay(&self) -> SearchOverlay<'_> {
+        SearchOverlay {
+            matches: &self.search.matches,
+            current: (self.search.current < self.search.matches.len())
+                .then_some(self.search.current),
+        }
     }
 
     pub fn scroll(&self) -> usize {
@@ -295,20 +506,35 @@ impl AppState {
     /// `STATUS_MESSAGE_TTL_FRAMES - 1` calls, then reverts to the permanent
     /// ruler.
     pub fn status(&mut self) -> StatusLine {
-        let message = match self.status_message.take() {
-            Some((text, ttl)) => {
-                if ttl > 1 {
-                    self.status_message = Some((text.clone(), ttl - 1));
-                }
-                Some(text)
-            }
-            None => None,
+        let message = match self.mode {
+            // The query prompt owns the row for as long as it is open
+            // (DW-4.1), and it does not age a transient message on its way
+            // past: a `Ctrl-G` set just before `/` should still have its
+            // remaining frames when the reader escapes back out.
+            Mode::Search { .. } => Some(self.search.prompt()),
+            // The TOC paints this same row (see `main.rs::paint`), and a
+            // transient message has to keep ageing while the overlay is up or
+            // a `Ctrl-G` set just before `t` would hang on screen for as long
+            // as the reader browsed.
+            Mode::Normal | Mode::Toc { .. } => self.take_transient_message(),
         };
         StatusLine {
             position_pct: self.position_pct(),
             name: self.file_info.name.clone(),
             message,
         }
+    }
+
+    /// The transient message, aged by one frame. Split out of
+    /// [`AppState::status`] so the search prompt's arm reads as "the prompt
+    /// instead of the message" rather than "the prompt, and also do not run
+    /// the aging code".
+    fn take_transient_message(&mut self) -> Option<String> {
+        let (text, ttl) = self.status_message.take()?;
+        if ttl > 1 {
+            self.status_message = Some((text.clone(), ttl - 1));
+        }
+        Some(text)
     }
 
     /// `+`/`-` (DW-1.4): widens/narrows [`AppState::content_width`] by
@@ -545,10 +771,12 @@ impl AppState {
     /// key requests quit. This is the event loop's entry point.
     ///
     /// The mode decides what a key means before anything else looks at it, so
-    /// the TOC's `j`/`k` cannot also scroll the document underneath it.
+    /// the TOC's `j`/`k` cannot also scroll the document underneath it, and a
+    /// `q` typed into a search query is a character rather than a quit.
     pub fn handle_key_event(&mut self, key: KeyEvent) -> bool {
         match self.mode {
             Mode::Toc { selected } => self.handle_toc_key(key, selected),
+            Mode::Search { .. } => self.handle_search_key(key),
             Mode::Normal => self.handle_normal_key(key),
         }
     }
@@ -643,6 +871,131 @@ impl AppState {
         false
     }
 
+    /// The key table while a query is being typed (DW-4.1). Returns `true`
+    /// only for the one key that still means quit.
+    ///
+    /// Ctrl-C survives here for the reason it survives everywhere else:
+    /// raw mode clears `ISIG`, so a Ctrl-C keystroke never becomes a
+    /// `SIGINT`, and a reader who opened the prompt by accident would
+    /// otherwise have no chord that works. Every other Control chord is
+    /// swallowed rather than falling through — `Ctrl-d` must not scroll the
+    /// viewport out from under a half-typed query.
+    fn handle_search_key(&mut self, key: KeyEvent) -> bool {
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            return key.code == KeyCode::Char('c');
+        }
+        match key.code {
+            KeyCode::Esc => self.cancel_search(),
+            KeyCode::Enter => self.accept_search(),
+            KeyCode::Backspace => {
+                self.search.query.pop();
+                self.refresh_incremental();
+            }
+            KeyCode::Char(c) => {
+                self.search.query.push(c);
+                self.refresh_incremental();
+            }
+            _ => {}
+        }
+        false
+    }
+
+    /// `/` (DW-4.1): opens the prompt on an empty query, remembering where
+    /// the reader was so `Esc` can put them back.
+    fn begin_search(&mut self) {
+        self.mode = Mode::Search {
+            origin: self.scroll,
+        };
+        self.search = SearchState::default();
+    }
+
+    /// `Esc` (DW-4.1): abandons the query *and* every viewport movement
+    /// incremental search made on the way to it.
+    fn cancel_search(&mut self) {
+        if let Mode::Search { origin } = self.mode {
+            self.set_scroll(origin);
+        }
+        self.mode = Mode::Normal;
+        self.search = SearchState::default();
+    }
+
+    /// `Enter`: keeps the query and its matches so `n`/`N` can traverse them
+    /// from normal mode, and leaves the reader on the current match.
+    fn accept_search(&mut self) {
+        self.mode = Mode::Normal;
+        if self.search.matches.is_empty() {
+            self.report_no_matches();
+            return;
+        }
+        self.reveal_current_match();
+    }
+
+    /// Re-runs the search after every edit to the query, and moves the
+    /// reader to the first match at or after where they started — the
+    /// "incremental" half of incremental search.
+    ///
+    /// A query with no matches deliberately does nothing at all to the
+    /// scroll position (DW-4.5): the viewport stays where the last matching
+    /// prefix left it, so typing one character too many does not throw the
+    /// reader somewhere else on its way to being deleted again.
+    fn refresh_incremental(&mut self) {
+        let origin = match self.mode {
+            Mode::Search { origin } => origin,
+            // Only reachable from `handle_search_key`, so these arms are the
+            // compiler's price for the exhaustiveness that makes a new mode a
+            // compile error everywhere. "Wherever the reader is" is the
+            // honest answer for a caller that arrived without an origin.
+            Mode::Normal | Mode::Toc { .. } => self.scroll,
+        };
+        self.search.matches = find_matches(&self.tree, &self.search);
+        self.search.current = first_match_at_or_after(&self.search.matches, origin);
+        if self.search.matches.is_empty() {
+            return;
+        }
+        self.reveal_current_match();
+    }
+
+    /// `n`/`N` (DW-4.3): steps to the next or previous match, wrapping at
+    /// both ends. Modular arithmetic on `usize`, with the backward step
+    /// written as `+ len - 1` so it never underflows at index 0.
+    fn step_match(&mut self, forward: bool) {
+        let count = self.search.matches.len();
+        if count == 0 {
+            self.report_no_matches();
+            return;
+        }
+        let step = if forward { 1 } else { count - 1 };
+        self.search.current = (self.search.current + step) % count;
+        self.reveal_current_match();
+    }
+
+    /// Scrolls the current match into view, moving as little as possible: a
+    /// match already on screen does not move the viewport at all, which is
+    /// what keeps `n` through a cluster of nearby matches from lurching.
+    fn reveal_current_match(&mut self) {
+        let Some(found) = self.search.matches.get(self.search.current) else {
+            return;
+        };
+        let line = found.line;
+        let height = self.page_size();
+        if line < self.scroll {
+            self.set_scroll(line);
+        } else if line >= self.scroll.saturating_add(height) {
+            self.set_scroll(line + 1 - height);
+        }
+    }
+
+    /// DW-4.5's status-row half. Silent on an empty query — pressing `n`
+    /// before ever searching has nothing to report, and "no matches" would
+    /// be a lie about a query that was never made.
+    fn report_no_matches(&mut self) {
+        if self.search.query.is_empty() {
+            return;
+        }
+        let query = self.search.query.clone();
+        self.set_status(StatusMessage::new(format!("no matches: {query}")));
+    }
+
     /// The Control-chord bindings. `Some(quit)` when the chord is one of
     /// ours, `None` when it means nothing — which is what lets
     /// [`AppState::handle_key_event`] fall through to the unmodified binding
@@ -692,6 +1045,11 @@ impl AppState {
             KeyCode::PageDown => self.scroll_by(self.page_size() as isize),
             KeyCode::Home | KeyCode::Char('g') => self.set_scroll(0),
             KeyCode::End | KeyCode::Char('G') => self.set_scroll(self.max_scroll()),
+            // Search (Phase 4). All three were unbound before this phase,
+            // so nothing pre-existing is displaced.
+            KeyCode::Char('/') => self.begin_search(),
+            KeyCode::Char('n') => self.step_match(true),
+            KeyCode::Char('N') => self.step_match(false),
             _ => {}
         }
         false
@@ -745,7 +1103,8 @@ impl AppState {
         // through here, so a resize always overrides a stale toggle.
         self.content_width = self.tree.width();
 
-        let target = if !document_changed && self.no_reflow_occurred(previous_width) {
+        let reflowed = document_changed || !self.no_reflow_occurred(previous_width);
+        let target = if !reflowed {
             previous_scroll
         } else {
             anchor
@@ -759,6 +1118,70 @@ impl AppState {
                 .unwrap_or_else(|| (ratio * self.max_scroll() as f64).round() as usize)
         };
         self.set_scroll(target);
+        self.reseat_search(reflowed);
+        self.recompute_matches();
+    }
+
+    /// Puts an open search prompt's `origin` back on a line that exists in
+    /// the tree installed now.
+    ///
+    /// `Mode::Search { origin }` is where `Esc` returns the reader, captured
+    /// as a raw line index when `/` was pressed — the same shape, and the
+    /// same staleness, as the `toc_return_scroll` [`AppState::reseat_toc`]
+    /// exists to fix. A `--watch` reload replaces the document under a live
+    /// prompt and a resize rewraps it; either way the old index names
+    /// different text afterwards, and `Esc` would drop the reader somewhere
+    /// they never were.
+    ///
+    /// The answer is the same one the TOC gives, for the same reason: after
+    /// the tree is replaced, the anchored current position is the best
+    /// available account of where the reader is, and a defensible position
+    /// beats a precisely wrong one. The cost is honest and worth stating —
+    /// resize or reload mid-query and `Esc` returns you to where the reflow
+    /// left you rather than to the line you pressed `/` on.
+    ///
+    /// Skipped entirely when nothing reflowed: `relayout` runs on every theme
+    /// swap too, and there the tree is identical, so the index still means
+    /// exactly what it meant and re-seating it would throw away a good answer.
+    fn reseat_search(&mut self, reflowed: bool) {
+        let Mode::Search { .. } = self.mode else {
+            return;
+        };
+        if !reflowed {
+            return;
+        }
+        self.mode = Mode::Search {
+            origin: self.scroll,
+        };
+    }
+
+    /// Re-runs the active search against the tree that is installed *now*.
+    ///
+    /// **The plan's Phase 4 assumption — "match positions survive relayout
+    /// without full recomputation" — is false, and this is the correctness
+    /// answer to it.** A [`Match`] is addressed by tree line index and by a
+    /// byte offset into that line's *laid-out* text. A relayout at a new
+    /// width rewraps paragraphs: both the line index and the split points
+    /// move, so every match but its `block` would be pointing at text that
+    /// is no longer there — and the painter would highlight whatever now
+    /// occupies those bytes. Recomputing is cheap next to `layout()` itself
+    /// (one literal scan of already-materialized text, no parse and no
+    /// width measurement) and it happens on the resize path, not the
+    /// per-keystroke one.
+    ///
+    /// `current` is clamped rather than re-derived: the reader was on the
+    /// n-th match before the resize and, since matching is deterministic and
+    /// the document did not change, the n-th match after it is the same
+    /// text. Only a query whose match count somehow shrank needs the clamp.
+    fn recompute_matches(&mut self) {
+        if self.search.query.is_empty() {
+            return;
+        }
+        self.search.matches = find_matches(&self.tree, &self.search);
+        self.search.current = self
+            .search
+            .current
+            .min(self.search.matches.len().saturating_sub(1));
     }
 
     /// The reader's current position as an [`Anchor`], or `None` when the top
@@ -988,6 +1411,192 @@ impl AppState {
             self.relayout(ctx, last.width, last);
         }
     }
+}
+
+/// Every match of `search`'s query in `tree`, in tree order.
+///
+/// Matching runs over the **laid-out** line text, per the phase constraint,
+/// because that is the only text a match can be addressed in: a match has to
+/// name a line and a column range for the painter to restyle, and source
+/// text has neither. Lines are joined per top-level block so a match can
+/// straddle a wrap boundary and still be found as one match (DW-4.4).
+///
+/// The accepted cost of matching post-layout: greedy wrapping *consumes* the
+/// space it breaks at, so a paragraph wrapped between "hello" and "world"
+/// joins as `helloworld`. A query for the two-word phrase does not match
+/// across that break; a query for `lowo` does. Matching source text instead
+/// would fix the former and make every match unaddressable, which is the
+/// worse trade for a viewer whose whole job is highlighting what it found.
+///
+/// One `String` and one index vector are reused across blocks rather than
+/// allocated per block — this runs on every keystroke.
+fn find_matches(tree: &LayoutTree, search: &SearchState) -> Vec<Match> {
+    if search.query.is_empty() {
+        return Vec::new();
+    }
+    let case_sensitive = search.case_sensitive();
+    let mut matches = Vec::new();
+    let mut joined = String::new();
+    let mut starts: Vec<(usize, usize)> = Vec::new();
+    let mut line = 0;
+    while line < tree.line_count() {
+        // A line belonging to no block (the gaps between them) can hold no
+        // addressable match — a `Match` names a block — so it is skipped
+        // rather than joined into a neighbour it does not belong to.
+        let Some(block) = tree.block_at(line) else {
+            line += 1;
+            continue;
+        };
+        joined.clear();
+        starts.clear();
+        let mut past = line;
+        while past < tree.line_count() && tree.block_at(past) == Some(block) {
+            starts.push((past, joined.len()));
+            append_line_text(tree, past, &mut joined);
+            past += 1;
+        }
+        collect_block_matches(
+            block,
+            &joined,
+            &starts,
+            &search.query,
+            case_sensitive,
+            &mut matches,
+        );
+        line = past;
+    }
+    matches
+}
+
+/// Appends every match of `query` in one block's joined text to `out`,
+/// translating each back to a `(line, byte range from that line's start)`
+/// address. Matches are non-overlapping: the scan resumes past the end of
+/// each one, so `aa` finds two matches in `aaaa`, not three.
+fn collect_block_matches(
+    block: NodeId,
+    joined: &str,
+    starts: &[(usize, usize)],
+    query: &str,
+    case_sensitive: bool,
+    out: &mut Vec<Match>,
+) {
+    let mut from = 0usize;
+    while let Some((at, len)) = find_from(joined, query, from, case_sensitive) {
+        let Some((line, line_start)) = line_containing(starts, at) else {
+            return;
+        };
+        out.push(Match {
+            block,
+            line,
+            range: (at - line_start)..(at + len - line_start),
+        });
+        from = at + len;
+    }
+}
+
+/// The `(line index, offset in the join)` entry covering byte `at`: the last
+/// line whose own offset does not exceed it. `None` only for an empty
+/// `starts`, which cannot happen for an `at` that came from a real match —
+/// returned rather than indexed so a future caller cannot turn that into a
+/// panic on a painted frame.
+fn line_containing(starts: &[(usize, usize)], at: usize) -> Option<(usize, usize)> {
+    let index = starts
+        .partition_point(|&(_, start)| start <= at)
+        .saturating_sub(1);
+    starts.get(index).copied()
+}
+
+/// Byte offset and byte length of the first match of `needle` in `haystack`
+/// at or after `from`.
+///
+/// The length is measured **in the haystack**, not in the needle: a
+/// case-insensitive match can consume a different number of bytes than the
+/// query occupies (`İ` and `i` are one byte apart in UTF-8), and it is the
+/// haystack's bytes that have to be highlighted.
+fn find_from(
+    haystack: &str,
+    needle: &str,
+    from: usize,
+    case_sensitive: bool,
+) -> Option<(usize, usize)> {
+    for (offset, _) in haystack.get(from..)?.char_indices() {
+        let at = from + offset;
+        if let Some(len) = match_len_at(&haystack[at..], needle, case_sensitive) {
+            return Some((at, len));
+        }
+    }
+    None
+}
+
+/// How many bytes of `text` `needle` matches at `text`'s start, or `None`.
+///
+/// Compares one `char` at a time rather than lowercasing either side first.
+/// `str::to_lowercase` is not length-preserving — U+0130 lowercases to two
+/// chars — so folding the haystack would shift every byte offset after such
+/// a character and the highlight would land on the wrong text. Per-char
+/// comparison keeps haystack offsets exact by construction. The price is no
+/// full Unicode case folding (`İ` will not match `i̇`), which is inside the
+/// phase's literal-matching scope.
+fn match_len_at(text: &str, needle: &str, case_sensitive: bool) -> Option<usize> {
+    let mut consumed = 0usize;
+    let mut haystack = text.chars();
+    for wanted in needle.chars() {
+        let found = haystack.next()?;
+        if !chars_match(found, wanted, case_sensitive) {
+            return None;
+        }
+        consumed += found.len_utf8();
+    }
+    Some(consumed)
+}
+
+fn chars_match(found: char, wanted: char, case_sensitive: bool) -> bool {
+    found == wanted || (!case_sensitive && found.to_lowercase().eq(wanted.to_lowercase()))
+}
+
+/// Index of the first match at or after `line`, wrapping to the first match
+/// in the document when every match is above it — so opening a search near
+/// the tail still lands somewhere rather than nowhere.
+fn first_match_at_or_after(matches: &[Match], line: usize) -> usize {
+    matches
+        .iter()
+        .position(|found| found.line >= line)
+        .unwrap_or(0)
+}
+
+/// Appends the painted text of tree line `index` to `out`: its runs
+/// concatenated, in paint order.
+///
+/// This is the string search offsets and paint offsets are both measured in,
+/// which is why it includes container prefix runs (a blockquote's gutter
+/// bar, a list marker) — they occupy real bytes on the painted row, and an
+/// offset that skipped them would restyle the wrong cells. A reserved media
+/// box contributes nothing: it carries no text.
+pub(crate) fn append_line_text(tree: &LayoutTree, index: usize, out: &mut String) {
+    let Some(Line::Items(items)) = tree.lines(index..index + 1).next() else {
+        return;
+    };
+    for item in items {
+        if let LineItem::Run(run) = item {
+            out.push_str(&run.text);
+        }
+    }
+}
+
+/// Byte length of [`append_line_text`]'s output for one line, without
+/// building the string. The painter walks this to project a match's range
+/// across the lines it spans.
+pub(crate) fn line_text_len(tree: &LayoutTree, index: usize) -> usize {
+    let Some(Line::Items(items)) = tree.lines(index..index + 1).next() else {
+        return 0;
+    };
+    items
+        .iter()
+        .filter_map(|item| match item {
+            LineItem::Run(run) => Some(run.text.len()),
+            LineItem::Box(_) => None,
+        })
+        .sum()
 }
 
 #[cfg(test)]
@@ -2354,6 +2963,782 @@ mod tests {
                 line_text(&state, line)
             );
         }
+    }
+
+    // ---- Incremental search (Phase 4) -------------------------------------
+
+    /// Drives a whole search the way a reader does — `/`, the query one
+    /// keystroke at a time, `Enter` — and hands back the matches. Every
+    /// search test goes through the real key table rather than calling the
+    /// private helpers, so a binding that stops being reachable fails here.
+    fn search_for(state: &mut AppState, query: &str) -> Vec<Match> {
+        state.handle_key_event(plain(KeyCode::Char('/')));
+        for c in query.chars() {
+            state.handle_key_event(plain(KeyCode::Char(c)));
+        }
+        state.handle_key_event(plain(KeyCode::Enter));
+        state.search().matches.clone()
+    }
+
+    /// 80 numbered paragraphs, each one line at any width used here — so a
+    /// match's line index is stable and a search for `paragraph 60` has
+    /// exactly one hit, far below the top of a 10-row viewport.
+    fn numbered_paragraphs(n: usize) -> String {
+        (0..n).map(|i| format!("paragraph {i:02}\n\n")).collect()
+    }
+
+    /// The text a `Match` actually addresses, sliced back out of the tree it
+    /// was computed against. This is the oracle every search test asserts
+    /// through: a `(line, range)` pair that merely *exists* proves nothing,
+    /// but one that slices to the query proves it points at real text.
+    fn matched_text(state: &AppState, found: &Match) -> String {
+        let mut text = String::new();
+        let mut line = found.line;
+        while line < state.tree().line_count() && text.len() < found.range.len() + found.range.start
+        {
+            append_line_text(state.tree(), line, &mut text);
+            line += 1;
+        }
+        text[found.range.clone()].to_string()
+    }
+
+    #[test]
+    fn test_dw_4_1_slash_opens_a_prompt_typing_updates_it_and_esc_restores_the_scroll_position() {
+        let (_doc, _config, _engine, mut state) = build(&numbered_paragraphs(80), 40, 10);
+        assert_eq!(state.mode(), Mode::Normal);
+        assert_eq!(state.scroll(), 0);
+
+        // `/` opens the prompt, and it takes over the status row from the
+        // ruler immediately — before a single character is typed.
+        state.handle_key_event(plain(KeyCode::Char('/')));
+        assert!(matches!(state.mode(), Mode::Search { .. }));
+        assert_eq!(state.status().message.as_deref(), Some("/"));
+
+        // Typing updates the prompt.
+        for c in "paragraph 60".chars() {
+            state.handle_key_event(plain(KeyCode::Char(c)));
+        }
+        assert_eq!(state.search().query, "paragraph 60");
+        let prompt = state.status().message.expect("the prompt owns the row");
+        assert!(
+            prompt.starts_with("/paragraph 60"),
+            "the row must show what was typed: {prompt:?}"
+        );
+
+        // The fixture's match is far below a 10-row viewport, so incremental
+        // search must have moved the reader — otherwise `Esc` restoring the
+        // position below would be restoring nothing and prove nothing.
+        assert!(
+            state.scroll() > 0,
+            "typing must scroll an off-screen match into view"
+        );
+
+        state.handle_key_event(plain(KeyCode::Esc));
+        assert_eq!(state.mode(), Mode::Normal);
+        assert_eq!(
+            state.scroll(),
+            0,
+            "Esc must restore the position `/` was pressed at"
+        );
+        assert!(state.search().query.is_empty());
+        assert!(state.search().matches.is_empty());
+    }
+
+    /// `Esc` has to restore from wherever the reader started, not from the
+    /// top — and it has to work after the query has been backspaced away,
+    /// which is the state a reader lands in when they change their mind one
+    /// character at a time.
+    #[test]
+    fn test_dw_4_1_backspace_shortens_the_query_and_esc_from_an_empty_query_still_restores() {
+        let (_doc, _config, _engine, mut state) = build(&numbered_paragraphs(80), 40, 10);
+        for _ in 0..20 {
+            state.handle_key_event(plain(KeyCode::Down));
+        }
+        let origin = state.scroll();
+        assert_eq!(origin, 20);
+
+        state.handle_key_event(plain(KeyCode::Char('/')));
+        for c in "paragraph 70".chars() {
+            state.handle_key_event(plain(KeyCode::Char(c)));
+        }
+        assert_ne!(state.scroll(), origin, "the match is below the viewport");
+
+        for _ in 0..12 {
+            state.handle_key_event(plain(KeyCode::Backspace));
+        }
+        assert!(state.search().query.is_empty());
+        assert_eq!(state.status().message.as_deref(), Some("/"));
+
+        // One more backspace on an already-empty query must not panic.
+        state.handle_key_event(plain(KeyCode::Backspace));
+
+        state.handle_key_event(plain(KeyCode::Esc));
+        assert_eq!(state.scroll(), origin);
+    }
+
+    /// While the prompt is open every printable key is text. `q` in
+    /// particular: it is the quit key one keystroke earlier, and a viewer
+    /// that exits when you search for "query" is worse than one with no
+    /// search at all.
+    #[test]
+    fn test_a_command_letter_is_just_text_while_a_query_is_being_typed() {
+        let (_doc, _config, _engine, mut state) = build(&numbered_paragraphs(80), 40, 10);
+        state.handle_key_event(plain(KeyCode::Char('/')));
+        for c in "qgGjkn".chars() {
+            assert!(
+                !state.handle_key_event(plain(KeyCode::Char(c))),
+                "`{c}` must not act as a command while typing a query"
+            );
+        }
+        assert_eq!(state.search().query, "qgGjkn");
+        assert_eq!(state.scroll(), 0, "no motion key may have moved the reader");
+
+        // Ctrl-C is the deliberate exception: raw mode clears ISIG, so it is
+        // the only chord left that can get a stuck reader out.
+        assert!(
+            state.handle_key_event(ctrl('c')),
+            "Ctrl-C must still quit from the prompt"
+        );
+        // ...and an ordinary chord is swallowed rather than falling through
+        // to its normal-mode motion.
+        assert!(!state.handle_key_event(ctrl('d')));
+        assert_eq!(state.scroll(), 0, "Ctrl-d must not scroll under the prompt");
+    }
+
+    #[test]
+    fn test_dw_4_2_lowercase_query_is_case_insensitive_and_an_uppercase_one_is_not() {
+        let source = "alpha one\n\nAlpha two\n\nALPHA three\n";
+        let (_doc, _config, _engine, mut state) = build(source, 40, 10);
+
+        let insensitive = search_for(&mut state, "alpha");
+        assert_eq!(
+            insensitive.len(),
+            3,
+            "an all-lowercase query must match every case: {insensitive:?}"
+        );
+        // Each one addresses real text, in the case the document actually
+        // uses — not the case that was typed.
+        let matched: Vec<String> = insensitive
+            .iter()
+            .map(|found| matched_text(&state, found))
+            .collect();
+        assert_eq!(matched, ["alpha", "Alpha", "ALPHA"]);
+
+        let sensitive = search_for(&mut state, "Alpha");
+        assert_eq!(
+            sensitive.len(),
+            1,
+            "one uppercase character must make the whole query exact: {sensitive:?}"
+        );
+        assert_eq!(matched_text(&state, &sensitive[0]), "Alpha");
+    }
+
+    /// Smart case reads `char::is_uppercase`, not `is_ascii_uppercase`, so
+    /// the rule means the same thing to a reader typing `Ärger` as to one
+    /// typing `Error`. An ASCII-only flag would call this query lowercase
+    /// and quietly match both.
+    #[test]
+    fn test_dw_4_2_smart_case_reads_the_uppercase_flag_from_non_ascii_letters_too() {
+        let source = "ärger hier\n\nÄrger dort\n";
+        let (_doc, _config, _engine, mut state) = build(source, 40, 10);
+
+        assert_eq!(search_for(&mut state, "ärger").len(), 2);
+
+        let sensitive = search_for(&mut state, "Ärger");
+        assert_eq!(
+            sensitive.len(),
+            1,
+            "`Ä` is uppercase, so the query is exact: {sensitive:?}"
+        );
+        assert_eq!(matched_text(&state, &sensitive[0]), "Ärger");
+    }
+
+    #[test]
+    fn test_dw_4_3_n_and_shift_n_cycle_forward_and_backward_and_wrap_at_both_ends() {
+        // Three hits, spread far enough apart that each step is a real move.
+        let mut source = String::new();
+        for i in 0..60 {
+            if i % 20 == 5 {
+                source.push_str("a needle here\n\n");
+            } else {
+                source.push_str(&format!("filler {i:02}\n\n"));
+            }
+        }
+        let (_doc, _config, _engine, mut state) = build(&source, 40, 10);
+        let matches = search_for(&mut state, "needle");
+        assert_eq!(matches.len(), 3, "fixture must hold exactly three matches");
+        assert_eq!(state.search().current, 0);
+
+        // Forward, then past the end and back to the first.
+        for expected in [1, 2, 0] {
+            state.handle_key_event(plain(KeyCode::Char('n')));
+            assert_eq!(state.search().current, expected);
+        }
+        // Backward from the first wraps to the last, then keeps stepping down.
+        for expected in [2, 1, 0] {
+            state.handle_key_event(plain(KeyCode::Char('N')));
+            assert_eq!(state.search().current, expected);
+        }
+
+        // Traversal is not bookkeeping: the reader is actually taken to each
+        // match, and every match still addresses the query text.
+        for _ in 0..3 {
+            state.handle_key_event(plain(KeyCode::Char('n')));
+            let found = &state.search().matches[state.search().current];
+            assert_eq!(matched_text(&state, found), "needle");
+            let visible = state.scroll()..state.scroll() + state.size().height as usize;
+            assert!(
+                visible.contains(&found.line),
+                "match on line {} is outside the viewport {visible:?}",
+                found.line
+            );
+        }
+    }
+
+    #[test]
+    fn test_dw_4_5_a_query_with_no_matches_leaves_the_viewport_unmoved_and_says_so() {
+        let (_doc, _config, _engine, mut state) = build(&numbered_paragraphs(80), 40, 10);
+        for _ in 0..25 {
+            state.handle_key_event(plain(KeyCode::Down));
+        }
+        let before = state.scroll();
+
+        state.handle_key_event(plain(KeyCode::Char('/')));
+        for c in "zzzznotinthisdocument".chars() {
+            state.handle_key_event(plain(KeyCode::Char(c)));
+            assert_eq!(
+                state.scroll(),
+                before,
+                "a query with no matches must not move the viewport"
+            );
+        }
+        assert!(state.search().matches.is_empty());
+        let prompt = state.status().message.expect("the prompt owns the row");
+        assert!(
+            prompt.contains("no matches"),
+            "the status row must report it: {prompt:?}"
+        );
+
+        // Accepting an unmatched query says so too, and still does not move.
+        state.handle_key_event(plain(KeyCode::Enter));
+        assert_eq!(state.scroll(), before);
+        let message = state.status().message.expect("accept must set a message");
+        assert!(message.contains("no matches"), "{message:?}");
+
+        // ...and so does `n` afterward, rather than silently doing nothing.
+        state.handle_key_event(plain(KeyCode::Char('n')));
+        assert_eq!(state.scroll(), before);
+        assert!(
+            state
+                .status()
+                .message
+                .is_some_and(|m| m.contains("no matches"))
+        );
+    }
+
+    /// `n` before any search has been made must be silent, not claim the
+    /// empty query found nothing.
+    #[test]
+    fn test_n_before_any_search_reports_nothing_rather_than_no_matches() {
+        let (_doc, _config, _engine, mut state) = build(&numbered_paragraphs(20), 40, 10);
+        state.handle_key_event(plain(KeyCode::Char('n')));
+        assert_eq!(state.status().message, None);
+        assert_eq!(state.scroll(), 0);
+    }
+
+    /// The empty query matches nothing rather than everything — pressing `/`
+    /// and `Enter` must not fill the screen with zero-width highlights.
+    #[test]
+    fn test_an_empty_query_produces_no_matches_at_all() {
+        let (_doc, _config, _engine, mut state) = build(&numbered_paragraphs(20), 40, 10);
+        assert!(search_for(&mut state, "").is_empty());
+        assert!(state.search_overlay().current.is_none());
+    }
+
+    /// The constraint that decides how matching is done at all: a match that
+    /// straddles a wrap boundary must be *found*, as one match, with a range
+    /// that runs past the end of the line it starts on. Per-line matching
+    /// would miss it entirely; this is what makes the painter's two-row
+    /// highlight (DW-4.4) possible.
+    ///
+    /// The wrap point is discovered from the laid-out tree rather than
+    /// assumed, so the test cannot silently stop straddling anything if
+    /// wrapping ever changes.
+    #[test]
+    fn test_a_match_straddling_a_wrap_boundary_is_found_as_one_match() {
+        let source: String = (0..400).map(|i| format!("w{i:04} ")).collect();
+        let (_doc, _config, _engine, mut state) = build(&source, 40, 10);
+
+        // Find a real wrap: two consecutive lines of the same block.
+        let block = state.tree().block_at(0).expect("one paragraph, one block");
+        assert_eq!(state.tree().block_at(1), Some(block), "it must wrap");
+        let mut first = String::new();
+        let mut second = String::new();
+        append_line_text(state.tree(), 0, &mut first);
+        append_line_text(state.tree(), 1, &mut second);
+
+        // A query built from the last word of one line and the first of the
+        // next — text that exists only across the boundary.
+        let tail: String = first
+            .chars()
+            .rev()
+            .take(3)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        let head: String = second.chars().take(3).collect();
+        let query = format!("{tail}{head}");
+
+        let matches = search_for(&mut state, &query);
+        assert_eq!(
+            matches.len(),
+            1,
+            "expected one straddling match: {matches:?}"
+        );
+        let found = &matches[0];
+        assert_eq!(found.line, 0, "it is anchored on the line it starts on");
+        assert!(
+            found.range.end > line_text_len(state.tree(), 0),
+            "the range must run past line 0's own text ({} bytes) to reach line 1: {:?}",
+            line_text_len(state.tree(), 0),
+            found.range
+        );
+        assert_eq!(matched_text(&state, found), query);
+    }
+
+    /// A multi-byte query must address whole characters: a range that landed
+    /// mid-character would panic the painter's slice, and one that counted
+    /// chars instead of bytes would highlight the wrong cells.
+    #[test]
+    fn test_a_multi_byte_query_addresses_whole_characters() {
+        let source = "prefix 日本語 suffix\n\nanother 日本 line\n";
+        let (_doc, _config, _engine, mut state) = build(source, 40, 10);
+        let matches = search_for(&mut state, "日本");
+        assert_eq!(matches.len(), 2);
+        for found in &matches {
+            assert_eq!(found.range.len(), "日本".len(), "six bytes, not two chars");
+            assert_eq!(matched_text(&state, found), "日本");
+        }
+    }
+
+    /// Matches are non-overlapping: the scan resumes past the end of each
+    /// one, so `aa` finds two matches in `aaaa` rather than three.
+    #[test]
+    fn test_overlapping_occurrences_are_counted_once_each() {
+        let (_doc, _config, _engine, mut state) = build("aaaa\n", 40, 10);
+        assert_eq!(search_for(&mut state, "aa").len(), 2);
+    }
+
+    /// **The plan's Phase 4 assumption, verified false and handled.** Match
+    /// positions do *not* survive a relayout: a width change rewraps the
+    /// paragraph and both the line index and the byte offsets move. The
+    /// contract is that `relayout` recomputes them, and the proof is that
+    /// every match still slices to the query in the *new* tree — an
+    /// assertion a stale match set fails, because it would be pointing at
+    /// whatever now occupies those offsets.
+    #[test]
+    fn test_matches_are_recomputed_after_a_relayout_that_rewraps_them() {
+        let mut source = String::new();
+        for i in 0..40 {
+            source.push_str(&format!(
+                "Paragraph {i:02} carries enough words to wrap to a different number of \
+                 lines at ninety cells than it does at thirty, needle included.\n\n"
+            ));
+        }
+        let (doc, config, engine, mut state) = build(&source, 90, 10);
+        let ctx = LayoutContext {
+            doc: &doc,
+            config: &config,
+            engine: &engine,
+            sizer: &NullSizer,
+        };
+
+        let before = search_for(&mut state, "needle");
+        assert_eq!(before.len(), 40);
+        let lines_before = state.tree().line_count();
+
+        state.apply_resize_burst(
+            &ctx,
+            &[Size {
+                width: 30,
+                height: 10,
+            }],
+        );
+        assert_ne!(
+            state.tree().line_count(),
+            lines_before,
+            "the fixture is broken: the resize must actually rewrap, or this \
+             test cannot tell a recomputed match set from a stale one"
+        );
+
+        let after = &state.search().matches;
+        assert_eq!(after.len(), 40, "every match must still be found");
+        for found in after {
+            assert_eq!(
+                matched_text(&state, found),
+                "needle",
+                "match {found:?} addresses the wrong text in the new tree"
+            );
+        }
+        // At least one of them genuinely moved — otherwise the recomputation
+        // could be a no-op and this test would pass on a stale set.
+        assert!(
+            after.iter().zip(before.iter()).any(|(new, old)| new != old),
+            "no match changed address across a reflowing resize"
+        );
+    }
+
+    /// The width toggle goes through the same `relayout`, so it gets the
+    /// same guarantee — this is the path a reader actually hits, pressing
+    /// `-` while a search is active.
+    #[test]
+    fn test_narrowing_while_a_search_is_active_keeps_every_match_addressing_its_text() {
+        let source: String = (0..30)
+            .map(|i| {
+                format!(
+                    "Line {i:02} with a target word buried in a sentence long enough to \
+                     rewrap when the viewport narrows.\n\n"
+                )
+            })
+            .collect();
+        let (doc, config, engine, mut state) = build(&source, 90, 10);
+        let ctx = LayoutContext {
+            doc: &doc,
+            config: &config,
+            engine: &engine,
+            sizer: &NullSizer,
+        };
+
+        assert_eq!(search_for(&mut state, "target").len(), 30);
+        for _ in 0..6 {
+            state.narrow(&ctx);
+        }
+        assert_eq!(state.search().matches.len(), 30);
+        for found in &state.search().matches {
+            assert_eq!(matched_text(&state, found), "target");
+        }
+    }
+
+    /// The overlay is the painter's whole view of the search, so its
+    /// `current` must never name an index that is not there — the painter
+    /// would otherwise have to re-check what this method already knows.
+    #[test]
+    fn test_the_search_overlay_never_reports_a_current_index_it_cannot_back() {
+        let (_doc, _config, _engine, mut state) = build(&numbered_paragraphs(40), 40, 10);
+        assert!(state.search_overlay().current.is_none());
+        assert!(state.search_overlay().matches.is_empty());
+
+        search_for(&mut state, "paragraph 07");
+        let overlay = state.search_overlay();
+        assert_eq!(overlay.matches.len(), 1);
+        assert_eq!(overlay.current, Some(0));
+
+        // Cancelling clears both halves together.
+        state.handle_key_event(plain(KeyCode::Char('/')));
+        state.handle_key_event(plain(KeyCode::Esc));
+        assert!(state.search_overlay().current.is_none());
+    }
+
+    // ---- The routing seam: chrome vs. the query ---------------------------
+
+    /// **The regression this exists for.** `main.rs` runs its chrome table
+    /// before `AppState::handle_key_event`, so a key the table claims never
+    /// reaches the guard that would have protected it. `T`, `+` and `-` were
+    /// claimed unconditionally: `/The` searched for `he` and swapped the
+    /// theme on the way through.
+    ///
+    /// Asserted over **every printable ASCII character**, not over the three
+    /// that were wrong. The three are today's chrome bindings; the property
+    /// is that a mode owning the keyboard owns all of it, and a fourth
+    /// binding added tomorrow has to obey it too. That is only checkable by
+    /// asking about every character.
+    #[test]
+    fn test_dw_4_1_no_printable_key_is_claimed_as_chrome_while_a_query_is_open() {
+        let (_doc, _config, _engine, mut state) = build(&numbered_paragraphs(40), 40, 10);
+        state.handle_key_event(plain(KeyCode::Char('/')));
+        assert!(matches!(state.mode(), Mode::Search { .. }));
+
+        for c in ' '..='~' {
+            assert_eq!(
+                state.chrome_action(plain(KeyCode::Char(c))),
+                None,
+                "`{c}` was claimed as chrome while a query was open — it would \
+                 never reach the query"
+            );
+        }
+    }
+
+    /// The same property stated as the reader experiences it: type the chrome
+    /// keys into a query and every one of them lands in the query.
+    ///
+    /// Drives the real routing order — `chrome_action` first, then
+    /// `handle_key_event`, exactly as `run_session` does — because the defect
+    /// was in that order and a test that skipped straight to
+    /// `handle_key_event` could not see it.
+    #[test]
+    fn test_dw_4_1_the_chrome_keys_are_ordinary_characters_inside_a_query() {
+        let (_doc, _config, _engine, mut state) = build("a line with T+-z in it\n", 40, 10);
+
+        // The event loop's routing, reproduced: chrome gets first refusal,
+        // and only a key it declines goes to the key table.
+        fn route(state: &mut AppState, key: KeyEvent) -> Option<ChromeAction> {
+            match state.chrome_action(key) {
+                Some(action) => Some(action),
+                None => {
+                    state.handle_key_event(key);
+                    None
+                }
+            }
+        }
+
+        route(&mut state, plain(KeyCode::Char('/')));
+        let typed = "T+-z";
+        for c in typed.chars() {
+            let claimed = route(&mut state, plain(KeyCode::Char(c)));
+            assert_eq!(claimed, None, "`{c}` was routed to chrome, not the query");
+        }
+
+        assert_eq!(
+            state.search().query,
+            typed,
+            "every typed character must reach the query"
+        );
+        assert_eq!(
+            state.search().matches.len(),
+            1,
+            "and the query must actually be the one the reader typed"
+        );
+    }
+
+    /// The guard must scope chrome to the mode, not disable it. A fix that
+    /// simply stopped routing `+`/`-`/`T` would satisfy every assertion above
+    /// and silently delete DW-1.4 and DW-1.5.
+    #[test]
+    fn test_the_chrome_keys_still_route_to_chrome_in_normal_mode() {
+        let (_doc, _config, _engine, state) = build(&numbered_paragraphs(40), 40, 10);
+        assert_eq!(state.mode(), Mode::Normal);
+
+        assert_eq!(
+            state.chrome_action(plain(KeyCode::Char('+'))),
+            Some(ChromeAction::Widen)
+        );
+        assert_eq!(
+            state.chrome_action(plain(KeyCode::Char('-'))),
+            Some(ChromeAction::Narrow)
+        );
+        assert_eq!(
+            state.chrome_action(plain(KeyCode::Char('T'))),
+            Some(ChromeAction::ToggleTheme)
+        );
+
+        // A chord is not the bare key: Ctrl-T must fall through to the chord
+        // table rather than toggling the theme.
+        for c in ['+', '-', 'T'] {
+            assert_eq!(
+                state.chrome_action(ctrl(c)),
+                None,
+                "Ctrl-{c} must not be treated as chrome"
+            );
+        }
+        // ...and an ordinary letter is not chrome either.
+        assert_eq!(state.chrome_action(plain(KeyCode::Char('j'))), None);
+    }
+
+    /// `Mode::captures_all_keys` is the question every future mode has to
+    /// answer, so pin what the two current answers are — and that the
+    /// `Search` answer is what makes the property above hold.
+    #[test]
+    fn test_only_a_mode_that_owns_the_keyboard_captures_every_key() {
+        assert!(!Mode::Normal.captures_all_keys());
+        assert!(Mode::Search { origin: 0 }.captures_all_keys());
+        // The origin is irrelevant to the answer — it is the *mode* that
+        // owns the keyboard, not a particular scroll position.
+        assert!(Mode::Search { origin: 99 }.captures_all_keys());
+    }
+
+    // ---- Search meets the modes and features that landed beside it -------
+
+    /// The TOC is the other mode that owns the keyboard, and it must not lose
+    /// the chrome keys either. Phase 3 got this right with its own
+    /// `mode() != Mode::Normal` gate in `main.rs`; this asserts the property
+    /// survived being restated as `Mode::captures_all_keys`, which is what
+    /// replaced that gate.
+    #[test]
+    fn test_the_toc_overlay_does_not_lose_the_chrome_keys_either() {
+        let source: String = (0..8)
+            .map(|i| format!("# Heading {i}\n\nbody\n\n"))
+            .collect();
+        let (_doc, _config, _engine, mut state) = build(&source, 40, 10);
+        state.handle_key_event(plain(KeyCode::Char('t')));
+        assert!(
+            matches!(state.mode(), Mode::Toc { .. }),
+            "the TOC must open"
+        );
+
+        for c in ' '..='~' {
+            assert_eq!(
+                state.chrome_action(plain(KeyCode::Char(c))),
+                None,
+                "`{c}` was claimed as chrome while the TOC was up — it would \
+                 relay out or re-theme a document the overlay is not showing"
+            );
+        }
+    }
+
+    /// The property stated once over every mode there is, so a mode added
+    /// later cannot satisfy `captures_all_keys` and still leak keys to
+    /// chrome. The `match` in `captures_all_keys` is wildcard-free, so a new
+    /// variant is a compile error there; this is what makes the answer it
+    /// gives actually load-bearing.
+    #[test]
+    fn test_a_mode_that_captures_the_keyboard_is_refused_by_the_chrome_table() {
+        let (_doc, _config, _engine, mut state) = build(&numbered_paragraphs(20), 40, 10);
+        for mode in [
+            Mode::Normal,
+            Mode::Toc { selected: 0 },
+            Mode::Search { origin: 0 },
+        ] {
+            state.mode = mode;
+            let claimed = ['+', '-', 'T']
+                .iter()
+                .filter(|&&c| state.chrome_action(plain(KeyCode::Char(c))).is_some())
+                .count();
+            if mode.captures_all_keys() {
+                assert_eq!(claimed, 0, "{mode:?} captures the keyboard but leaked keys");
+            } else {
+                assert_eq!(
+                    claimed, 3,
+                    "{mode:?} does not capture, so chrome still works"
+                );
+            }
+        }
+    }
+
+    /// A `--watch` reload under a live query. `SearchState` addresses the
+    /// *laid-out* tree, and a reload replaces it wholesale — so every match
+    /// must be recomputed against the document that now exists, not carried
+    /// across pointing at bytes that moved or vanished.
+    #[test]
+    fn test_a_reload_while_a_search_is_open_leaves_every_match_addressing_the_new_document() {
+        let before: String = (0..12)
+            .map(|i| format!("paragraph {i:02} mentions target here\n\n"))
+            .collect();
+        let (_doc, config, engine, mut state) = build(&before, 40, 10);
+        assert_eq!(search_for(&mut state, "target").len(), 12);
+
+        // The reloaded document has fewer matches and different surrounding
+        // text, so a stale match set cannot survive by coincidence.
+        let after: String = (0..4)
+            .map(|i| format!("rewritten section {i:02} still mentions target\n\n"))
+            .collect();
+        reload(&mut state, &after, &config, &engine);
+
+        assert_eq!(
+            state.search().matches.len(),
+            4,
+            "matches must be recomputed against the reloaded document"
+        );
+        for found in &state.search().matches {
+            assert_eq!(
+                matched_text(&state, found),
+                "target",
+                "match {found:?} addresses the wrong text after a reload"
+            );
+        }
+        assert!(
+            state.search().current < state.search().matches.len(),
+            "the current index must stay inside the new match set"
+        );
+    }
+
+    /// The other half of the same staleness: `Mode::Search { origin }` is a
+    /// raw line index into the tree `/` was pressed on, and `Esc` returns the
+    /// reader to it. A reload replaces that tree, so the index must be
+    /// re-seated or `Esc` drops the reader somewhere they never were —
+    /// exactly what `reseat_toc` fixes for the TOC's own return scroll.
+    #[test]
+    fn test_a_reload_while_a_search_is_open_reseats_the_escape_origin() {
+        let before: String = (0..60)
+            .map(|i| format!("line {i:02} of the original\n\n"))
+            .collect();
+        let (_doc, config, engine, mut state) = build(&before, 40, 10);
+        for _ in 0..30 {
+            state.handle_key_event(plain(KeyCode::Down));
+        }
+        state.handle_key_event(plain(KeyCode::Char('/')));
+        let Mode::Search { origin } = state.mode() else {
+            panic!("the prompt must be open");
+        };
+        assert_eq!(origin, 30);
+
+        // A much shorter document: line 30 may not exist at all afterwards.
+        reload(
+            &mut state,
+            "only three\n\nshort\n\nparagraphs\n",
+            &config,
+            &engine,
+        );
+
+        let Mode::Search { origin } = state.mode() else {
+            panic!("the prompt must still be open across a reload");
+        };
+        assert!(
+            origin <= state.max_scroll(),
+            "the escape origin ({origin}) points past the reloaded document's \
+             last scrollable line ({})",
+            state.max_scroll()
+        );
+        // And Esc actually lands there rather than clamping from nowhere.
+        state.handle_key_event(plain(KeyCode::Esc));
+        assert_eq!(state.mode(), Mode::Normal);
+        assert_eq!(state.scroll(), origin);
+    }
+
+    /// A theme swap relays out at an unchanged width, so nothing reflows and
+    /// the origin still means what it meant. Re-seating it there would throw
+    /// away a good answer for no reason.
+    #[test]
+    fn test_a_relayout_that_reflows_nothing_leaves_the_escape_origin_alone() {
+        let (doc, config, engine, mut state) = build(&numbered_paragraphs(60), 40, 10);
+        let ctx = LayoutContext {
+            doc: &doc,
+            config: &config,
+            engine: &engine,
+            sizer: &NullSizer,
+        };
+        for _ in 0..20 {
+            state.handle_key_event(plain(KeyCode::Down));
+        }
+        state.handle_key_event(plain(KeyCode::Char('/')));
+
+        // What `T` does: same width, same tree.
+        state.relayout_preserving_anchor(&ctx, config);
+
+        assert_eq!(
+            state.mode(),
+            Mode::Search { origin: 20 },
+            "a no-reflow relayout must not disturb the escape origin"
+        );
+    }
+
+    /// A search prompt opened over a live `Ctrl-G` message must not spend
+    /// that message's frames while it is invisible — the reader should get
+    /// the rest of it back when they escape out.
+    #[test]
+    fn test_the_prompt_does_not_age_the_transient_message_it_is_covering() {
+        let (_doc, _config, _engine, mut state) = build("hello\n", 40, 10);
+        state.handle_key_event(ctrl('g'));
+        state.handle_key_event(plain(KeyCode::Char('/')));
+        for _ in 0..STATUS_MESSAGE_TTL_FRAMES * 2 {
+            let message = state.status().message.expect("the prompt is showing");
+            assert!(message.starts_with('/'), "{message:?}");
+        }
+        state.handle_key_event(plain(KeyCode::Esc));
+        assert!(
+            state.status().message.is_some_and(|m| m.contains("bytes")),
+            "the file-info message must still have frames left"
+        );
     }
 
     fn topmost_line_text(state: &AppState) -> String {

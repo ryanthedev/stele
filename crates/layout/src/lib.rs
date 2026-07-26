@@ -132,6 +132,15 @@ pub enum Semantic {
     FrontMatter,
     /// The `…` clip indicator (code blocks, table rung 3).
     OverflowIndicator,
+    /// A stretch of text matching the active search query. Layout never
+    /// emits this — the search overlay (`crates/stele/src/app.rs`) re-tags
+    /// runs with it at paint time — but it lives here because it is a style
+    /// *role*, and the exhaustive tables that must answer for it
+    /// (`highlight::theme`, `stele::decor`) are keyed on this enum.
+    SearchMatch,
+    /// The one match the reader is currently on, styled distinctly from the
+    /// rest so `n`/`N` traversal is visible.
+    SearchCurrent,
 }
 
 /// Style identity on a run. Layout emits **only** [`StyleId::Semantic`];

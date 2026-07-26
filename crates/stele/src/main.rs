@@ -13,11 +13,11 @@ use std::time::{Duration, Instant};
 
 use ast::Document;
 use clap::Parser;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, Event, KeyEvent, KeyEventKind};
 use layout::{IntrinsicSizer, LayoutConfig, layout};
 use width::{WidthConfig, WidthEngine};
 
-use stele::app::{AppState, LayoutContext, Mode, StatusMessage};
+use stele::app::{AppState, ChromeAction, LayoutContext, Mode, StatusMessage};
 use stele::cli::Cli;
 use stele::decor::themed::ThemedDecor;
 use stele::loader::{DocumentSource, LoadOptions};
@@ -508,12 +508,22 @@ fn run_session(
 /// because that call is what ages a transient message toward its TTL (see
 /// `AppState::status`) — an overlay frame that skipped it would freeze a
 /// `Ctrl-G` message on screen for as long as the TOC stayed open.
+///
+/// `Mode::Search` paints the *document*, not an overlay: incremental search
+/// is read against what is on screen, so the reader has to keep seeing it.
+/// The query itself lives in the status row and the matches are painted into
+/// the document by the search overlay, so the two modes share this arm.
 fn paint(state: &mut AppState, painter: &mut Painter, out: &mut dyn Write) -> io::Result<()> {
     let status = state.status();
     match state.mode() {
-        Mode::Normal => {
-            painter.frame_with_status(state.tree(), state.scroll(), state.size(), &status, out)
-        }
+        Mode::Normal | Mode::Search { .. } => painter.frame_with_search(
+            state.tree(),
+            state.scroll(),
+            state.size(),
+            &status,
+            state.search_overlay(),
+            out,
+        ),
         Mode::Toc { .. } => {
             let rows = state.toc_rows(state.size().height);
             painter.frame_overlay(&rows, state.size(), &status, out)
@@ -534,12 +544,22 @@ fn paint(state: &mut AppState, painter: &mut Painter, out: &mut dyn Write) -> io
 /// *before* `AppState::handle_key_event` in both call sites, and returning
 /// `true` is what stops the key reaching it. That is a key-stealing shape:
 /// any binding added here silently outranks every mode `AppState` has, and
-/// the mode cannot even see that it happened. Phase 2 already found one half
-/// of this from the other direction — a `T` read during a resize drain was
-/// offered only to `handle_key_event`, which does not know it, and vanished.
-/// The rule that closes both: the chrome table applies to `Mode::Normal` and
-/// nothing else. With the TOC up, `+`/`-`/`T` are inert rather than silently
-/// relaying out the document underneath an overlay that is not showing it.
+/// the mode cannot even see that it happened. Three phases found it
+/// independently — Phase 2 from the resize drain (a `T` read mid-drag was
+/// offered only to `handle_key_event`, which does not know it, and
+/// vanished), Phase 3 from the TOC (`+`/`-`/`T` relaying out a document the
+/// overlay was not showing), Phase 4 from the search prompt (`/The` searched
+/// for `he` and swapped the theme on the way).
+///
+/// **So the decision of whether `key` is chrome is not made here at all.**
+/// It is `AppState::chrome_action`'s, for two reasons: it depends on the
+/// mode, and this file is not unit-tested (see the module doc), which is
+/// precisely why the same defect could be found three times without any of
+/// the three being caught by a test. Phase 3's `state.mode() != Mode::Normal`
+/// gate fixed the instance correctly; asking `Mode::captures_all_keys`
+/// instead makes the *next* mode a compile error rather than a fourth
+/// rediscovery. What is left in this function is the part that genuinely
+/// cannot move: performing the action against a painter and a layout context.
 fn handle_chrome_key(
     key: KeyEvent,
     session: &Session,
@@ -547,14 +567,14 @@ fn handle_chrome_key(
     painter: &mut Painter,
     theme: &mut ThemeState,
 ) -> bool {
-    if key.modifiers.contains(KeyModifiers::CONTROL) || state.mode() != Mode::Normal {
+    let Some(action) = state.chrome_action(key) else {
         return false;
-    }
+    };
     let ctx = session.ctx();
-    match key.code {
-        KeyCode::Char('+') => state.widen(&ctx),
-        KeyCode::Char('-') => state.narrow(&ctx),
-        KeyCode::Char('T') => {
+    match action {
+        ChromeAction::Widen => state.widen(&ctx),
+        ChromeAction::Narrow => state.narrow(&ctx),
+        ChromeAction::ToggleTheme => {
             theme.variant = toggled_variant(theme.variant);
             painter.register_decor(Box::new(ThemedDecor::new(highlight::Theme::new(
                 theme.variant,
@@ -562,7 +582,6 @@ fn handle_chrome_key(
             ))));
             state.relayout_preserving_anchor(&ctx, *ctx.config);
         }
-        _ => return false,
     }
     true
 }

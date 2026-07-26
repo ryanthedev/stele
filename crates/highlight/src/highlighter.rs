@@ -44,6 +44,23 @@ const HIGHLIGHT_TIME_CAP: Duration = Duration::from_millis(250);
 /// cost of a hard, real timeout guard.
 const THREADED_GUARD_THRESHOLD: usize = 4096;
 
+/// A highlight result, plus whether it is safe to memoize.
+///
+/// The flag is the whole reason this type exists. [`highlight_line`]'s
+/// answer for a given `(line, lang)` is normally a pure function of its
+/// inputs and can be cached forever — except when it is the
+/// [`HIGHLIGHT_TIME_CAP`] fallback, which says "this attempt did not finish
+/// in time *this time*", not "this is how the line highlights". Caching that
+/// would freeze a transient scheduling hiccup into the rest of the session,
+/// so [`crate::HighlightCache`] retains only `cacheable` results. Nothing
+/// outside this module can make that distinction, which is why the flag
+/// travels with the runs rather than being inferred by the caller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Highlighted {
+    pub runs: Vec<Run>,
+    pub cacheable: bool,
+}
+
 /// Highlights one code-block line. `lang` is the fence's info string, if
 /// any; `None`, an empty string, or a tag lumis doesn't recognize (the OUT
 /// scope in the plan: "language auto-detection without an info string" —
@@ -53,17 +70,54 @@ const THREADED_GUARD_THRESHOLD: usize = 4096;
 /// unchanged for unhighlighted code. Never panics, never hangs past
 /// [`HIGHLIGHT_TIME_CAP`] (pathological input degrades to plain instead).
 pub fn highlight_line(line_text: &str, lang: Option<&str>) -> Vec<Run> {
+    highlight_detailed(line_text, lang).runs
+}
+
+/// [`highlight_line`] with the memoizability verdict attached — the entry
+/// point [`crate::HighlightCache`] calls. The runs are identical to what
+/// [`highlight_line`] returns for the same inputs; only the flag is extra.
+pub fn highlight_detailed(line_text: &str, lang: Option<&str>) -> Highlighted {
     let Some(lang) = lang.filter(|l| !l.trim().is_empty()) else {
-        return plain_run(line_text);
+        return cacheable(plain_run(line_text));
     };
     let language = Language::guess(Some(lang), "");
     if language == Language::PlainText {
         // Unknown/unrecognized language tag -> plain block (edge case).
-        return plain_run(line_text);
+        // Deterministic, so it memoizes like any other real answer.
+        return cacheable(plain_run(line_text));
     }
-    match highlight_with_timeout(line_text, language) {
-        Some(runs) if !runs.is_empty() => runs,
-        _ => plain_run(line_text),
+    classify(line_text, highlight_with_timeout(line_text, language))
+}
+
+/// Turns [`highlight_with_timeout`]'s answer into a [`Highlighted`].
+///
+/// `None` is the fallback signal — the call either exceeded
+/// [`HIGHLIGHT_TIME_CAP`] or the highlighter itself errored — and that is
+/// the one outcome the Phase 4 constraint forbids caching. Both are treated
+/// the same, deliberately: an errored attempt is no more "how this line
+/// highlights" than a timed-out one, and collapsing them costs nothing
+/// beyond re-running a call that already failed once.
+///
+/// Split out as a named function so that rule is testable without having to
+/// make a real highlighter genuinely exceed a 250 ms wall clock, which no
+/// honest test can pin on an arbitrary host.
+fn classify(line_text: &str, outcome: Option<Vec<Run>>) -> Highlighted {
+    match outcome {
+        Some(runs) if !runs.is_empty() => cacheable(runs),
+        // An empty run set is a real, reproducible answer (an empty source
+        // line), not a failure — it degrades to plain and memoizes.
+        Some(_) => cacheable(plain_run(line_text)),
+        None => Highlighted {
+            runs: plain_run(line_text),
+            cacheable: false,
+        },
+    }
+}
+
+fn cacheable(runs: Vec<Run>) -> Highlighted {
+    Highlighted {
+        runs,
+        cacheable: true,
     }
 }
 

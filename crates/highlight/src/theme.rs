@@ -31,13 +31,33 @@ pub enum Variant {
     Light,
 }
 
-/// Number of distinct-colored `Semantic` roles (see [`semantic_role_index`]).
-/// Capture roles (excluding the uncolored `Plain` catch-all) are appended
-/// after these, so the full palette has `SEMANTIC_ROLES + (role::ALL.len() - 1)`
-/// entries — kept in one constant so the palette size and the role-index
-/// functions can never drift apart. The first [`HEADING_TIERS`] entries are
-/// the heading ramp, not one shared heading slot.
+/// Number of distinct-colored `Semantic` roles allocated *before* the
+/// capture block (see [`semantic_role_index`]). Capture roles (excluding the
+/// uncolored `Plain` catch-all) follow these, and anything added later
+/// follows the captures — see [`TRAILING_ROLE_BASE`]. Kept in one constant
+/// so the palette size and the role-index functions can never drift apart.
+/// The first [`HEADING_TIERS`] entries are the heading ramp, not one shared
+/// heading slot.
+///
+/// **Do not raise this to make room for a new role.** [`build_palette`]
+/// generates slots in index order, so every slot at or after an inserted one
+/// takes the color that used to belong to its neighbour. Raising it by two
+/// for the Phase 4 search roles silently repainted all 24 colored capture
+/// roles — `Comment` moved from `rgb(232,205,186)` to `rgb(153,243,134)`,
+/// `Keyword` from `rgb(193,110,103)` to `rgb(222,33,183)` — which no
+/// invariant here forbids and no test caught, because distinctness survives
+/// any permutation. New roles go at [`TRAILING_ROLE_BASE`], where appending
+/// is inert.
 const SEMANTIC_ROLES: usize = 22;
+
+/// The first palette slot past every historically-allocated role. A role
+/// added here inherits a brand-new color and disturbs nothing that already
+/// had one, which is the property that makes adding a role a local change.
+const TRAILING_ROLE_BASE: usize = SEMANTIC_ROLES + CAPTURE_ROLES;
+
+/// Colored `Capture` roles: every variant of [`role::ALL`] except `Plain`,
+/// which never carries color.
+const CAPTURE_ROLES: usize = role::ALL.len() - 1;
 
 /// How many heading levels CommonMark defines. `crates/layout` guarantees
 /// `Semantic::Heading`'s level is 1–6; every consumer here still clamps, so
@@ -151,6 +171,22 @@ fn semantic_attrs(semantic: Semantic) -> Style {
         Semantic::AlertTitle(_) => bold,
         Semantic::Emph | Semantic::ImageAlt | Semantic::MathTex => italic,
         Semantic::Link | Semantic::FootnoteRef => underline,
+        // Kept identical to the themeless table in `crates/stele/src/decor`,
+        // and for that table's reason rather than this one's: under
+        // `ColorMode::NoColor` these attributes are all a reader gets here
+        // too, so `SearchMatch` sharing `Link`'s bare underline would make a
+        // match inside a link invisible. `italic` is the free combination
+        // that separates both search roles from `Link`, `FootnoteRef` and
+        // `Heading(1)` alike.
+        Semantic::SearchMatch => Style {
+            italic: true,
+            ..underline
+        },
+        Semantic::SearchCurrent => Style {
+            italic: true,
+            underline: true,
+            ..bold
+        },
         Semantic::BlockquoteMarker
         | Semantic::Rule
         | Semantic::TableBorder
@@ -246,6 +282,15 @@ fn semantic_role_index(semantic: Semantic) -> Option<usize> {
         Semantic::Html => 19,
         Semantic::FrontMatter => 20,
         Semantic::OverflowIndicator => 21,
+        // The two search roles take their own palette slots rather than
+        // sharing one, so DW-4.8's "distinct after 256-color downsampling"
+        // holds by construction of `build_palette` — the same greedy
+        // distinctness filter every other role passes through. Placed past
+        // the capture block rather than inserted at 22/23: see
+        // [`SEMANTIC_ROLES`] for the colors that move if a role is inserted
+        // instead of appended.
+        Semantic::SearchMatch => TRAILING_ROLE_BASE,
+        Semantic::SearchCurrent => TRAILING_ROLE_BASE + 1,
         Semantic::Text
         | Semantic::Strong
         | Semantic::Emph
@@ -278,11 +323,16 @@ fn capture_role_index(capture: Capture) -> Option<usize> {
 const GOLDEN_ANGLE_TURNS: f64 = 0.618_033_988_75;
 
 /// Total number of colored roles this theme allocates a palette slot to —
-/// `SEMANTIC_ROLES` plus every non-`Plain` `Capture`. Exposed for tests that
-/// must exercise every role, not just a hand-picked sample.
+/// every `Semantic` role, every non-`Plain` `Capture`, and the trailing
+/// roles past them. Exposed for tests that must exercise every role, not
+/// just a hand-picked sample.
 pub fn role_count() -> usize {
-    SEMANTIC_ROLES + (role::ALL.len() - 1)
+    TRAILING_ROLE_BASE + TRAILING_ROLES
 }
+
+/// How many roles sit past the capture block: `SearchMatch` and
+/// `SearchCurrent`.
+const TRAILING_ROLES: usize = 2;
 
 /// A candidate truecolor for palette-generation `attempt` N: hue rotates by
 /// the golden angle per attempt (spreading hues with minimal clustering),
@@ -538,7 +588,46 @@ mod tests {
         }
     }
 
+    /// Every `Semantic` variant. The `match` has no wildcard arm, so a new
+    /// variant is a **compile error here** until this list names it.
+    ///
+    /// The guard is load-bearing rather than tidy. This list is what
+    /// `test_dw_7_2_downsample_256_keeps_every_role_distinct...` compares the
+    /// generated palette against, and the "no wildcard arms over `Semantic`"
+    /// rule that protects the style tables does not reach a `vec![]`. When
+    /// Phase 4 added two variants the list silently went stale, and that test
+    /// failed with an opaque set-inequality dump rather than naming the roles
+    /// it was missing.
     fn all_semantics() -> Vec<Semantic> {
+        fn _exhaustiveness_guard(semantic: Semantic) {
+            match semantic {
+                Semantic::Text
+                | Semantic::Heading(_)
+                | Semantic::Emph
+                | Semantic::Strong
+                | Semantic::Strikethrough
+                | Semantic::CodeInline
+                | Semantic::CodeBlock
+                | Semantic::Link
+                | Semantic::ImageAlt
+                | Semantic::MathTex
+                | Semantic::ListMarker
+                | Semantic::TaskMarker
+                | Semantic::BlockquoteMarker
+                | Semantic::AlertTitle(_)
+                | Semantic::Rule
+                | Semantic::TableBorder
+                | Semantic::TableHeader
+                | Semantic::FootnoteRef
+                | Semantic::FootnoteLabel
+                | Semantic::Html
+                | Semantic::FrontMatter
+                | Semantic::OverflowIndicator
+                | Semantic::SearchMatch
+                | Semantic::SearchCurrent => {}
+            }
+        }
+
         let mut v = vec![
             Semantic::Text,
             Semantic::Emph,
@@ -560,6 +649,8 @@ mod tests {
             Semantic::Html,
             Semantic::FrontMatter,
             Semantic::OverflowIndicator,
+            Semantic::SearchMatch,
+            Semantic::SearchCurrent,
         ];
         for level in 1..=6 {
             v.push(Semantic::Heading(level));
@@ -574,6 +665,186 @@ mod tests {
             v.push(Semantic::AlertTitle(tone));
         }
         v
+    }
+
+    /// DW-4.8. The two search roles are new palette slots, so
+    /// `build_palette`'s greedy filter already guarantees they land on their
+    /// own 256-color cells — this asserts that guarantee through the public
+    /// `resolve` entry point, role by role, rather than trusting the
+    /// generator. `test_dw_7_2_downsample_256_keeps_every_role_distinct...`
+    /// covers the whole palette as a set; this names the two roles the phase
+    /// added, so a failure says *which* roles collided.
+    #[test]
+    fn test_dw_4_8_search_roles_stay_distinct_from_every_other_role_after_256_downsample() {
+        for variant in [Variant::Dark, Variant::Light] {
+            let theme = Theme::new(variant, ColorMode::Downsample256);
+            let color = |semantic: Semantic| theme.resolve(StyleId::Semantic(semantic)).fg;
+
+            let matched = color(Semantic::SearchMatch)
+                .expect("SearchMatch must carry a palette color, not paint plain");
+            let current = color(Semantic::SearchCurrent)
+                .expect("SearchCurrent must carry a palette color, not paint plain");
+            assert_ne!(
+                matched, current,
+                "the current match must be a different 256-color cell from the \
+                 other matches in {variant:?} — otherwise `n` moves nothing visible"
+            );
+
+            for semantic in all_semantics() {
+                if matches!(semantic, Semantic::SearchMatch | Semantic::SearchCurrent) {
+                    continue;
+                }
+                let Some(other) = color(semantic) else {
+                    continue;
+                };
+                assert_ne!(
+                    other, matched,
+                    "{semantic:?} downsamples onto SearchMatch's cell in {variant:?}"
+                );
+                assert_ne!(
+                    other, current,
+                    "{semantic:?} downsamples onto SearchCurrent's cell in {variant:?}"
+                );
+            }
+
+            // Capture roles too: a match inside a code block sits directly
+            // beside these, which is where a collision would actually be seen.
+            for &capture in role::ALL.iter() {
+                let Some(other) = theme.resolve(StyleId::Capture(capture.id())).fg else {
+                    continue;
+                };
+                assert_ne!(
+                    other, matched,
+                    "capture {capture:?} downsamples onto SearchMatch's cell in {variant:?}"
+                );
+                assert_ne!(
+                    other, current,
+                    "capture {capture:?} downsamples onto SearchCurrent's cell in {variant:?}"
+                );
+            }
+        }
+    }
+
+    /// **Regression gate for the whole palette's stability.** Every existing
+    /// role's color must survive a role being added.
+    ///
+    /// This exists because it did not. Phase 4 raised `SEMANTIC_ROLES` from
+    /// 22 to 24 to make room for the two search roles, which shifted
+    /// `capture_role_index = SEMANTIC_ROLES + pos` by two and silently gave
+    /// all 24 colored capture roles somebody else's color — every keyword
+    /// and comment in every code block in the viewer repainted. Nothing
+    /// caught it: `test_dw_7_2_downsample_256_keeps_every_role_distinct...`
+    /// asserts the palette is a *set* of distinct colors, and a permutation
+    /// of a set is still that set.
+    ///
+    /// The values below are the pre-Phase-4 colors, read off the base commit
+    /// and diffed against the current palette to confirm they were restored
+    /// exactly. Pinned in both variants and at both ends of the capture
+    /// block, so an insertion anywhere inside it fails here. If a deliberate
+    /// palette change ever makes these wrong, the fix is to re-record them
+    /// in the same commit as the change — not to loosen the assertion.
+    #[test]
+    fn test_capture_colors_are_pinned_so_a_new_role_cannot_silently_restyle_code_blocks() {
+        let expected = [
+            (Variant::Dark, Capture::Keyword, Color::new(193, 110, 103)),
+            (Variant::Dark, Capture::Comment, Color::new(232, 205, 186)),
+            (Variant::Dark, Capture::String, Color::new(134, 194, 243)),
+            (Variant::Light, Capture::Keyword, Color::new(13, 122, 211)),
+            (Variant::Light, Capture::Comment, Color::new(201, 195, 64)),
+            (Variant::Light, Capture::String, Color::new(211, 45, 13)),
+        ];
+        for (variant, capture, color) in expected {
+            let theme = Theme::new(variant, ColorMode::Truecolor);
+            assert_eq!(
+                theme.resolve(StyleId::Capture(capture.id())).fg,
+                Some(color),
+                "{capture:?} changed color in {variant:?} — a role was inserted \
+                 into the palette rather than appended at TRAILING_ROLE_BASE, \
+                 which moves every slot after it"
+            );
+        }
+    }
+
+    /// The structural half of the same guarantee: the capture block starts
+    /// where it has always started, so the pinned colors above are not
+    /// merely two lucky slots.
+    #[test]
+    fn test_the_capture_block_still_begins_immediately_after_the_semantic_roles() {
+        assert_eq!(capture_role_index(role::ALL[0]), Some(SEMANTIC_ROLES));
+        // `capture_role_index` is `SEMANTIC_ROLES + position in ALL`, so the
+        // uncolored `Plain` has to sit *last* or it would punch an unused
+        // hole in the middle of the block and push the final capture one
+        // slot past the palette's end.
+        assert_eq!(role::ALL.last(), Some(&Capture::Plain));
+        assert_eq!(capture_role_index(Capture::Plain), None);
+        assert_eq!(
+            capture_role_index(role::ALL[CAPTURE_ROLES - 1]),
+            Some(TRAILING_ROLE_BASE - 1),
+            "the last colored capture must sit immediately before the trailing block"
+        );
+        assert_eq!(
+            semantic_role_index(Semantic::SearchMatch),
+            Some(TRAILING_ROLE_BASE),
+            "a new role belongs past the captures, not inside them"
+        );
+        // No assertion that `TRAILING_ROLE_BASE == SEMANTIC_ROLES +
+        // CAPTURE_ROLES`: that is its definition, so the check could not
+        // fail. The two above are the ones with content — they read the
+        // index *functions*, which is where a real mistake would live.
+        assert_eq!(role_count(), TRAILING_ROLE_BASE + TRAILING_ROLES);
+        assert_eq!(
+            build_palette(Variant::Dark).len(),
+            role_count(),
+            "the palette must have a slot for every role the index functions hand out"
+        );
+    }
+
+    /// Color is not the only channel, and it is the one a `NO_COLOR`
+    /// terminal does not have. The two roles must still be told apart by
+    /// their attributes alone, and must still read as *matches* rather than
+    /// as some unrelated role.
+    #[test]
+    fn test_dw_4_8_search_roles_differ_by_attributes_even_with_color_stripped() {
+        let theme = Theme::new(Variant::Dark, ColorMode::NoColor);
+        let style = |semantic| theme.resolve(StyleId::Semantic(semantic));
+        let matched = style(Semantic::SearchMatch);
+        let current = style(Semantic::SearchCurrent);
+        assert_eq!(matched.fg, None);
+        assert_eq!(current.fg, None);
+        assert_ne!(
+            matched, current,
+            "with color stripped the attributes are all that is left"
+        );
+        assert!(
+            matched.underline && current.underline,
+            "both read as matches"
+        );
+        assert!(
+            current.bold && !matched.bold,
+            "weight is what separates the current match: {current:?} vs {matched:?}"
+        );
+
+        // Under NO_COLOR this table has exactly the problem the themeless
+        // `StructuralDecor` path has: attributes are the only channel, so
+        // sharing an attribute set with another role *is* a collision.
+        // Checked against every role rather than a sample — `Link` and
+        // `Heading(1)` are the two these roles used to collide with, and are
+        // exactly the two a hand-picked sample is most likely to omit.
+        for semantic in all_semantics() {
+            if matches!(semantic, Semantic::SearchMatch | Semantic::SearchCurrent) {
+                continue;
+            }
+            assert_ne!(
+                style(semantic),
+                matched,
+                "{semantic:?} is indistinguishable from a search match under NO_COLOR"
+            );
+            assert_ne!(
+                style(semantic),
+                current,
+                "{semantic:?} is indistinguishable from the current match under NO_COLOR"
+            );
+        }
     }
 
     #[test]

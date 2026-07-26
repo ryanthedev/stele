@@ -5,6 +5,7 @@
 //! blockquote gutters, and so on) — no color, since the full theme engine
 //! arrives in P7.
 
+use highlight::Highlighted;
 use layout::{Run, Semantic, StyleId};
 
 use crate::painter::Style;
@@ -28,7 +29,15 @@ pub trait Decor {
     /// `lang` the fence's language tag if known. Returned runs leave
     /// `width` unset (`0`) — the painter recomputes it via the width
     /// engine after this call.
-    fn highlight(&self, line_text: &str, lang: Option<&str>) -> Vec<Run>;
+    ///
+    /// The [`Highlighted::cacheable`] flag is how an implementation tells
+    /// the painter whether it may memoize this answer across frames
+    /// (Phase 4's highlight cache). Say `false` for anything produced by a
+    /// timeout or an error fallback — that is a statement about *this
+    /// attempt*, not about the line, and caching it would make a transient
+    /// stall permanent. An implementation with no such failure mode should
+    /// say `true` unconditionally.
+    fn highlight(&self, line_text: &str, lang: Option<&str>) -> Highlighted;
 
     /// Resolves a style identity to concrete attributes.
     fn resolve(&self, style_id: StyleId) -> Style;
@@ -41,15 +50,20 @@ pub trait Decor {
 pub struct StructuralDecor;
 
 impl Decor for StructuralDecor {
-    fn highlight(&self, line_text: &str, _lang: Option<&str>) -> Vec<Run> {
+    fn highlight(&self, line_text: &str, _lang: Option<&str>) -> Highlighted {
         // Identity: no highlighting engine is wired yet (P7), so the whole
         // line comes back unchanged as a single run, still tagged as code.
-        vec![Run {
-            text: line_text.to_string(),
-            style_id: StyleId::Semantic(Semantic::CodeBlock),
-            width: 0,
-            aux: None,
-        }]
+        // Always cacheable — this path has no timeout and no failure mode,
+        // so its answer is a pure function of `line_text`.
+        Highlighted {
+            runs: vec![Run {
+                text: line_text.to_string(),
+                style_id: StyleId::Semantic(Semantic::CodeBlock),
+                width: 0,
+                aux: None,
+            }],
+            cacheable: true,
+        }
     }
 
     fn resolve(&self, style_id: StyleId) -> Style {
@@ -90,6 +104,26 @@ fn structural_style(semantic: Semantic) -> Style {
         | Semantic::AlertTitle(_) => bold,
         Semantic::Emph | Semantic::ImageAlt | Semantic::MathTex => italic,
         Semantic::Link | Semantic::FootnoteRef => underline,
+        // This path carries no color at all, so the attribute set is the
+        // *only* thing that separates any role from any other — which makes
+        // a shared attribute set a genuine collision here, not the harmless
+        // duplicate it is on the themed path where a ramp color still
+        // distinguishes them.
+        //
+        // Both search roles therefore need combinations nothing else uses.
+        // Bare `underline` is taken by `Link`/`FootnoteRef` and
+        // `bold + underline` by `Heading(1)`, so the search pair adds
+        // `italic` to clear both: a match reads as underlined-and-slanted,
+        // and the current one adds weight on top (DW-4.4/DW-4.8).
+        Semantic::SearchMatch => Style {
+            italic: true,
+            ..underline
+        },
+        Semantic::SearchCurrent => Style {
+            italic: true,
+            underline: true,
+            ..bold
+        },
         Semantic::BlockquoteMarker
         | Semantic::Rule
         | Semantic::TableBorder
@@ -156,11 +190,16 @@ mod tests {
     #[test]
     fn test_identity_highlight_returns_unchanged_single_run() {
         let decor = StructuralDecor;
-        let runs = decor.highlight("let x = 1;", Some("rust"));
+        let highlighted = decor.highlight("let x = 1;", Some("rust"));
+        let runs = &highlighted.runs;
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].text, "let x = 1;");
         assert_eq!(runs[0].width, 0);
         assert_eq!(runs[0].style_id, StyleId::Semantic(Semantic::CodeBlock));
+        assert!(
+            highlighted.cacheable,
+            "the identity path has no failure mode, so its answer memoizes"
+        );
     }
 
     #[test]
@@ -253,6 +292,127 @@ mod tests {
                 "H{level}"
             );
         }
+    }
+
+    /// Every `Semantic` variant, so a test can check a property across all
+    /// of them instead of a hand-picked sample.
+    ///
+    /// The `match` inside has no wildcard arm, so adding a `Semantic`
+    /// variant is a **compile error here** until the list below names it —
+    /// the same discipline the style tables use, applied to the list that
+    /// checks them. That guard is not decoration: the first version of the
+    /// DW-4.8 test below checked five roles and happened to omit `Link`,
+    /// which is precisely the role `SearchMatch` was colliding with, so the
+    /// test passed over a real collision.
+    fn every_semantic() -> Vec<Semantic> {
+        fn _exhaustiveness_guard(semantic: Semantic) {
+            match semantic {
+                Semantic::Text
+                | Semantic::Heading(_)
+                | Semantic::Emph
+                | Semantic::Strong
+                | Semantic::Strikethrough
+                | Semantic::CodeInline
+                | Semantic::CodeBlock
+                | Semantic::Link
+                | Semantic::ImageAlt
+                | Semantic::MathTex
+                | Semantic::ListMarker
+                | Semantic::TaskMarker
+                | Semantic::BlockquoteMarker
+                | Semantic::AlertTitle(_)
+                | Semantic::Rule
+                | Semantic::TableBorder
+                | Semantic::TableHeader
+                | Semantic::FootnoteRef
+                | Semantic::FootnoteLabel
+                | Semantic::Html
+                | Semantic::FrontMatter
+                | Semantic::OverflowIndicator
+                | Semantic::SearchMatch
+                | Semantic::SearchCurrent => {}
+            }
+        }
+
+        let mut all = vec![
+            Semantic::Text,
+            Semantic::Emph,
+            Semantic::Strong,
+            Semantic::Strikethrough,
+            Semantic::CodeInline,
+            Semantic::CodeBlock,
+            Semantic::Link,
+            Semantic::ImageAlt,
+            Semantic::MathTex,
+            Semantic::ListMarker,
+            Semantic::TaskMarker,
+            Semantic::BlockquoteMarker,
+            Semantic::Rule,
+            Semantic::TableBorder,
+            Semantic::TableHeader,
+            Semantic::FootnoteRef,
+            Semantic::FootnoteLabel,
+            Semantic::Html,
+            Semantic::FrontMatter,
+            Semantic::OverflowIndicator,
+            Semantic::SearchMatch,
+            Semantic::SearchCurrent,
+        ];
+        all.extend((1..=6u8).map(Semantic::Heading));
+        all.extend(
+            [
+                AlertTone::Note,
+                AlertTone::Tip,
+                AlertTone::Important,
+                AlertTone::Warning,
+                AlertTone::Caution,
+            ]
+            .map(Semantic::AlertTitle),
+        );
+        all
+    }
+
+    /// DW-4.8's themeless half. This path has no palette at all, so the
+    /// 256-color argument does not apply to it — what has to hold instead is
+    /// the property that argument exists to protect: a search match must be
+    /// tellable from everything it can sit on or next to.
+    ///
+    /// Checked against **every** role rather than a sample, because a sample
+    /// is what let the original collision through: `SearchMatch` resolved to
+    /// bare `underline`, identical to `Link` and `FootnoteRef`, and
+    /// `SearchCurrent` to `bold + underline`, identical to `Heading(1)` —
+    /// none of which the five-role list happened to include.
+    #[test]
+    fn test_dw_4_8_search_roles_are_distinguishable_on_the_themeless_path_too() {
+        let decor = StructuralDecor;
+        let style = |semantic| decor.resolve(StyleId::Semantic(semantic));
+        let matched = style(Semantic::SearchMatch);
+        let current = style(Semantic::SearchCurrent);
+
+        assert_ne!(
+            matched, current,
+            "the current match must not resolve identically to the others"
+        );
+        for semantic in every_semantic() {
+            if matches!(semantic, Semantic::SearchMatch | Semantic::SearchCurrent) {
+                continue;
+            }
+            assert_ne!(
+                style(semantic),
+                matched,
+                "{semantic:?} is indistinguishable from a search match on the \
+                 themeless path, where attributes are the only channel there is"
+            );
+            assert_ne!(
+                style(semantic),
+                current,
+                "{semantic:?} is indistinguishable from the current match on the \
+                 themeless path"
+            );
+        }
+        // Nothing here may smuggle in color — this path has none to give.
+        assert!(matched.fg.is_none() && matched.bg.is_none());
+        assert!(current.fg.is_none() && current.bg.is_none());
     }
 
     /// Levels outside CommonMark's 1–6 cannot reach here through `crates/layout`,

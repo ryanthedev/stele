@@ -22,6 +22,7 @@
 //! `crates/layout`/`crates/stele/src/painter.rs` to actually supply them.
 #![forbid(unsafe_code)]
 
+mod cache;
 mod color;
 mod footnote;
 mod highlighter;
@@ -29,9 +30,10 @@ mod hyperlink;
 mod role;
 mod theme;
 
+pub use cache::{DEFAULT_CACHE_CAPACITY, HighlightCache};
 pub use color::{Color, ColorMode};
 pub use footnote::{CLOSE as FOOTNOTE_CLOSE, backref_osc8, def_anchor_id, ref_anchor_id, ref_osc8};
-pub use highlighter::highlight_line;
+pub use highlighter::{Highlighted, highlight_detailed, highlight_line};
 pub use hyperlink::{CLOSE as HYPERLINK_CLOSE, open as hyperlink_open, sanitize_url};
 pub use role::Capture;
 pub use theme::{Style, Theme, Variant, role_count, variant_from_osc11_reply};

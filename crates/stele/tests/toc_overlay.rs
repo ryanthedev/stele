@@ -74,13 +74,18 @@ impl Harness {
         let status = self.state.status();
         let size = self.state.size();
         match self.state.mode() {
-            Mode::Normal => self
+            // Mirrors `main.rs::paint`, which routes both document-showing
+            // modes through the search-aware entry point. With no search
+            // active the overlay is empty and this is byte-identical to the
+            // `frame_with_status` this used to call.
+            Mode::Normal | Mode::Search { .. } => self
                 .painter
-                .frame_with_status(
+                .frame_with_search(
                     self.state.tree(),
                     self.state.scroll(),
                     size,
                     &status,
+                    self.state.search_overlay(),
                     &mut buf,
                 )
                 .expect("paint"),

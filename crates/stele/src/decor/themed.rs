@@ -7,7 +7,8 @@
 //! Registration is the one line the phase's scope boundary promises:
 //! `painter.register_decor(Box::new(ThemedDecor::detect(bg_reply)))`.
 
-use layout::{Run, StyleId};
+use highlight::Highlighted;
+use layout::StyleId;
 
 use crate::decor::Decor;
 use crate::painter::{Color, Style};
@@ -46,8 +47,11 @@ impl ThemedDecor {
 }
 
 impl Decor for ThemedDecor {
-    fn highlight(&self, line_text: &str, lang: Option<&str>) -> Vec<Run> {
-        highlight::highlight_line(line_text, lang)
+    fn highlight(&self, line_text: &str, lang: Option<&str>) -> Highlighted {
+        // `highlight_detailed`, not `highlight_line`: the extra bit it
+        // carries is whether the answer came from the 250 ms timeout
+        // fallback, which the painter's cache must not retain.
+        highlight::highlight_detailed(line_text, lang)
     }
 
     fn resolve(&self, style_id: StyleId) -> Style {
@@ -139,10 +143,14 @@ mod tests {
             highlight::Variant::Dark,
             highlight::ColorMode::Truecolor,
         ));
-        let runs = decor.highlight("let x = 1;", Some("rust"));
-        assert!(runs.len() > 1);
-        let text: String = runs.iter().map(|r| r.text.as_str()).collect();
+        let highlighted = decor.highlight("let x = 1;", Some("rust"));
+        assert!(highlighted.runs.len() > 1);
+        let text: String = highlighted.runs.iter().map(|r| r.text.as_str()).collect();
         assert_eq!(text, "let x = 1;");
+        assert!(
+            highlighted.cacheable,
+            "a real highlight (not a timeout fallback) must be memoizable"
+        );
     }
 
     #[test]
