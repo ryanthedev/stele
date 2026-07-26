@@ -1014,15 +1014,11 @@ fn push_piece(
 /// as an instruction to keep duplicating. One function is the invariant; two
 /// identical functions are a request to diff two files.
 pub(crate) fn sanitize(text: &str) -> String {
-    text.chars()
-        .filter(|&c| {
-            !matches!(
-                c as u32,
-                0x00..=0x1F | 0x7F | 0x80..=0x9F      // C0, DEL, C1 controls
-                | 0x202A..=0x202E | 0x2066..=0x2069,  // bidi override / isolate
-            )
-        })
-        .collect()
+    // Delegated rather than enumerated. This function used to carry its own
+    // copy of the range list and fell a range behind `highlight`'s when the
+    // deprecated format controls were added there — the drift the shared
+    // definition exists to make impossible.
+    highlight::strip_display_hazards(text)
 }
 
 /// Clips `text` to at most `max_width` cells, measuring by grapheme cluster
@@ -1218,6 +1214,31 @@ mod tests {
                 .chars()
                 .any(|c| matches!(c as u32, 0x202A..=0x202E | 0x2066..=0x2069))
         );
+    }
+
+    /// The paint boundary strips *exactly* what `highlight::is_display_hazard`
+    /// names — no narrower.
+    ///
+    /// This is the anti-drift pin. `sanitize` used to enumerate its own
+    /// ranges, and when the deprecated format controls were added to the OSC 8
+    /// sanitizer this function kept the old set: two barricades in the same
+    /// codebase disagreeing about what a control character is. Anyone who
+    /// re-inlines a list here fails this test rather than shipping the same
+    /// divergence again.
+    #[test]
+    fn test_sanitize_strips_the_whole_shared_hazard_set_not_a_local_subset() {
+        for cp in 0u32..=0x2100 {
+            let Some(c) = char::from_u32(cp) else {
+                continue;
+            };
+            let survived = sanitize(&c.to_string()).contains(c);
+            assert_eq!(
+                survived,
+                !highlight::is_display_hazard(c),
+                "U+{cp:04X}: the painter and the shared hazard predicate disagree \
+                 (painter kept it: {survived})"
+            );
+        }
     }
 
     #[test]

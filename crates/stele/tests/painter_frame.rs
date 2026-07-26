@@ -48,10 +48,11 @@ const FRAME_FIXED_SEQUENCES: &[&str] = &[
 /// 1. No C0/DEL/C1 control code point except ESC — content is sanitized and
 ///    the framing is ESC-based only, so any such code point is a sanitize
 ///    regression.
-/// 2. No bidi override or isolate (U+202A-U+202E, U+2066-U+2069). Not a
-///    control in the C1 sense, but the Trojan Source class: they reorder what
-///    a reader sees without changing a byte of the text. `painter::sanitize`
-///    strips exactly this range, and this is what asserts it.
+/// 2. No bidi override, isolate, or deprecated format control. Not controls
+///    in the C1 sense, but the Trojan Source class: they reorder what a
+///    reader sees without changing a byte of the text. The set comes from
+///    `highlight::is_display_hazard` — the same predicate `painter::sanitize`
+///    filters by — so this rule cannot fall behind what it checks.
 /// 3. Every ESC opens either a fixed sequence above, a cursor position
 ///    `ESC [ <digits> ; <digits> H`, an SGR `ESC [ <digits/;> m`, or a
 ///    well-formed OSC 8 hyperlink whose URI carries no controls. A
@@ -60,14 +61,18 @@ fn assert_only_known_escapes(bytes: &[u8]) {
     let text = String::from_utf8(bytes.to_vec()).expect("the painter emits valid UTF-8");
     let c: Vec<char> = text.chars().collect();
     let at = |i: usize| -> String { c[i..(i + 20).min(c.len())].iter().collect() };
-    let forbidden = |cp: u32| matches!(cp, 0x00..=0x1F | 0x7F | 0x80..=0x9F | 0x202A..=0x202E | 0x2066..=0x2069);
+    // The same predicate the painter and the OSC 8 sanitizer filter by, not a
+    // restatement of it. A checker with its own copy of the list can only
+    // catch the ranges it happened to be told about, and this one had already
+    // fallen a range behind the code it checks.
+    let forbidden = |c: char| highlight::is_display_hazard(c);
 
     let mut i = 0;
     while i < c.len() {
         let ch = c[i];
         if ch != '\u{1b}' {
             assert!(
-                !forbidden(ch as u32),
+                !forbidden(ch),
                 "raw control code point {:#x} on the wire at char {i}: {:?}",
                 ch as u32,
                 at(i)
@@ -89,7 +94,7 @@ fn assert_only_known_escapes(bytes: &[u8]) {
                 .unwrap_or_else(|| panic!("unterminated OSC 8 at {i}: {:?}", at(i)));
             for u in body[..end].chars() {
                 assert!(
-                    !forbidden(u as u32),
+                    !forbidden(u),
                     "control code point {:#x} inside an OSC 8 URI at {i}",
                     u as u32
                 );

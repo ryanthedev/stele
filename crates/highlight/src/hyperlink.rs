@@ -71,17 +71,14 @@ pub fn sanitize_url(url: &str) -> Option<String> {
     {
         return None;
     }
+    // The code-point set is [`crate::is_display_hazard`]'s, shared with the
+    // painter and the frame checker so the three cannot drift. `;` is the
+    // one rule that stays local: it is hostile only *here*, as OSC 8's own
+    // parameter separator, and stripping it from displayed text would eat
+    // ordinary punctuation.
     let cleaned: String = url
         .chars()
-        .filter(|&c| {
-            !matches!(
-                c as u32,
-                0x00..=0x1F | 0x7F | 0x80..=0x9F      // C0, DEL, C1 controls
-                | 0x202A..=0x202E                     // bidi embedding / override
-                | 0x2066..=0x2069                     // bidi isolate
-                | 0x206A..=0x206F,                    // deprecated format controls
-            ) && c != ';'
-        })
+        .filter(|&c| !crate::is_display_hazard(c) && c != ';')
         .collect();
     // A scheme match on the raw `url` is meaningless if stripping emptied
     // it out or mangled the scheme prefix itself (e.g. control bytes

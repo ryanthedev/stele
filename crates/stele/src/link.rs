@@ -330,13 +330,29 @@ fn percent_decoded(path: &str) -> String {
 }
 
 /// The URL-activation half of the barricade: scheme allowlist, length
-/// ceiling, and a refusal of every ASCII control byte (which is what a
-/// newline, a carriage return and a NUL all are).
+/// ceiling, and a refusal of every code point
+/// [`highlight::is_display_hazard`] names — the C0/DEL/C1 controls (which is
+/// what a newline, a carriage return and a NUL all are) plus the bidi
+/// reordering class.
+///
+/// **The bidi half is not redundant with the OSC 8 sanitizer, and the
+/// difference is the whole point.** That sanitizer *strips* hazards from the
+/// URI it prints, so the destination a reader inspects on hover is clean.
+/// This function validates the destination that actually *opens*, and it
+/// reads the raw dest straight off the AST. If it only refused ASCII
+/// controls, a link could preview as `safe.md` — cleaned — and activate
+/// `dm.exe`, the spoof surviving into the one moment it matters. What is
+/// shown and what is opened have to agree about the same set.
+///
+/// Refused rather than stripped, matching this function's existing contract:
+/// it already rejects a URL containing a newline instead of quietly removing
+/// it, because silently opening *a different URL than the document asked
+/// for* is its own surprise.
 fn validated_url(url: &str) -> Result<String, LinkError> {
     if url.len() > MAX_URL_BYTES {
         return Err(LinkError::MalformedUrl);
     }
-    if url.chars().any(|c| c.is_control()) {
+    if url.chars().any(highlight::is_display_hazard) {
         return Err(LinkError::MalformedUrl);
     }
     let scheme = url_scheme(url).ok_or(LinkError::MalformedUrl)?;
@@ -946,6 +962,50 @@ mod tests {
                 "{hostile:?} produced {err:?}"
             );
         }
+    }
+
+    /// A URL whose *preview* was cleaned must not still open dirty.
+    ///
+    /// The OSC 8 sanitizer strips bidi controls from the URI it prints, so
+    /// the destination on hover reads honestly. This path validates the raw
+    /// dest off the AST instead, and if it accepted what the printer cleaned,
+    /// a link would preview as one destination and activate another — the
+    /// spoof surviving into the only moment that has consequences.
+    #[test]
+    fn test_a_bidi_spoofed_url_is_refused_so_preview_and_activation_agree() {
+        for hostile in [
+            // Override: everything after it renders reversed.
+            "https://example.com/\u{202e}exe.dm",
+            // Isolate pair: hides a span from the surrounding direction.
+            "https://example.com/\u{2066}safe.md\u{2069}/evil.exe",
+            // Deprecated format control: invisible, and no browser wants it.
+            "https://example.com/\u{206b}payload",
+        ] {
+            let err = LinkTarget::classify(hostile)
+                .expect("the scheme is allowed; the body is what is hostile")
+                .resolve(Path::new("."))
+                .expect_err("a bidi control in a URL must be refused, not opened");
+            assert!(
+                matches!(err, LinkError::MalformedUrl),
+                "{hostile:?} produced {err:?}"
+            );
+        }
+    }
+
+    /// The refusal above must not have been bought by rejecting RTL URLs
+    /// wholesale. Directional *marks* are legitimate in a URL that names an
+    /// Arabic or Hebrew resource, and they cannot mount the spoof.
+    #[test]
+    fn test_a_url_carrying_a_directional_mark_still_opens() {
+        let url = "https://example.com/\u{200f}מסמך.md";
+        let resolved = LinkTarget::classify(url)
+            .expect("scheme is fine")
+            .resolve(Path::new("."))
+            .expect("a directional mark is not a spoof and must not be refused");
+        assert!(
+            matches!(&resolved, LinkTarget::Url(u) if u.contains('\u{200f}')),
+            "the mark must survive validation intact, got {resolved:?}"
+        );
     }
 
     #[test]

@@ -124,6 +124,37 @@ fn test_bidi_controls_in_a_link_reach_neither_the_label_nor_the_url() {
     );
 }
 
+/// The deprecated format controls (U+206A-206F) do not reach the wire from a
+/// link's *displayed label* either.
+///
+/// Separate from the test above on purpose. That one's fixture carries only
+/// overrides and isolates, so its assertion loop covered U+206A-206F while
+/// nothing in the document ever produced one — the range was asserted, never
+/// exercised. `painter::sanitize` did not strip it at the time, and the test
+/// passed anyway. This fixture puts one in the label, where only the painter
+/// can stop it.
+#[test]
+fn test_deprecated_format_controls_in_a_label_do_not_reach_the_wire() {
+    // U+206B (activate symmetric swapping) and U+206E (national digit
+    // shapes): invisible, unimplemented, and enough to make a label's text
+    // differ from what the reader believes they matched.
+    let src = "see [in\u{206b}voice\u{206e}.pdf](https://example.com/safe.md) here\n";
+    let out = render(src, 80, 4);
+    let text = String::from_utf8_lossy(&out);
+
+    for c in text.chars() {
+        assert!(
+            !matches!(c as u32, 0x206A..=0x206F),
+            "deprecated format control U+{:04X} reached the wire from a label: {text:?}",
+            c as u32
+        );
+    }
+    assert!(
+        text.contains("invoice.pdf"),
+        "the label must still render, cleaned: {text:?}"
+    );
+}
+
 /// A URL carrying embedded control bytes cannot inject: the sanitized URL on
 /// the wire has no raw ESC/BEL and the `;` framing byte is stripped.
 #[test]
