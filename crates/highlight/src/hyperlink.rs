@@ -18,7 +18,9 @@
 //! `;` bytes stripped: C0/DEL/C1 because they could reintroduce an ESC
 //! that starts a new, injected sequence; `;` because it is OSC 8's own
 //! parameter separator — an unstripped `;` inside the URI could be
-//! misread as closing the URI field early and starting a new one.
+//! misread as closing the URI field early and starting a new one. The
+//! Unicode bidi formatting controls go too, for the reason spelled out on
+//! [`sanitize_url`].
 
 /// Schemes this crate will ever emit an OSC 8 hyperlink for. Deliberately
 /// small and explicit — an allowlist, not a denylist — so a new hostile
@@ -29,7 +31,38 @@ const ALLOWED_SCHEMES: [&str; 4] = ["http", "https", "file", "mailto"];
 /// Validates and sanitizes `url` for use inside an OSC 8 sequence. Returns
 /// `None` if the scheme isn't in [`ALLOWED_SCHEMES`] — including malformed
 /// URLs with no recognizable scheme at all. The returned string, if any,
-/// contains no C0/DEL/C1 control bytes and no `;`.
+/// contains no C0/DEL/C1 control bytes, no `;`, and no Unicode bidi
+/// formatting control.
+///
+/// **The bidi strip is the Trojan-Source half of this barricade, and it is
+/// here rather than at a call site on purpose.** A URI is not printed as
+/// glyphs by the emulator, so the naive reading is that reordering controls
+/// inside it are inert — but the OSC 8 URI is exactly what a terminal shows
+/// the reader when they ask where a link goes (Ghostty's hover/status
+/// preview) and exactly what "copy link address" puts on their clipboard.
+/// A `U+202E` in the middle of an otherwise honest `https://` URL flips the
+/// remainder of that preview, so the destination the reader inspects before
+/// clicking is not the destination the sequence carries. The overrides and
+/// isolates (U+202A-202E, U+2066-2069) do the reordering; the deprecated
+/// format controls (U+206A-206F) are invisible, unimplemented, and have no
+/// business in a URL either, so they go with them rather than being left as
+/// the next reviewer's finding.
+///
+/// **Stripped, not replaced with U+FFFD.** Making tampering visible is the
+/// better answer when the tampered text is something a human reads, which
+/// is why it is tempting here — but a URI is machine-consumed. A U+FFFD
+/// left in the middle of a path percent-encodes into `%EF%BF%BD` on its way
+/// to a browser and turns a spoofed-but-working link into a 404, trading a
+/// display lie for a broken destination. Stripping also keeps one policy
+/// across the whole barricade: C0/DEL/C1 and `;` are already stripped here,
+/// and `crates/stele/src/painter.rs`'s `sanitize` strips the same bidi
+/// controls out of the *displayed label* of that same link. A link whose
+/// label and whose URI disagreed about what a control character means would
+/// be a barricade with a seam in it.
+///
+/// The directional *marks* (LRM/RLM/ALM) legitimate RTL text needs are left
+/// alone, matching that painter-side policy: they influence ordering, they
+/// do not override it.
 pub fn sanitize_url(url: &str) -> Option<String> {
     let scheme = url.split_once(':').map(|(s, _)| s)?;
     if !ALLOWED_SCHEMES
@@ -40,7 +73,15 @@ pub fn sanitize_url(url: &str) -> Option<String> {
     }
     let cleaned: String = url
         .chars()
-        .filter(|&c| !matches!(c as u32, 0x00..=0x1F | 0x7F | 0x80..=0x9F) && c != ';')
+        .filter(|&c| {
+            !matches!(
+                c as u32,
+                0x00..=0x1F | 0x7F | 0x80..=0x9F      // C0, DEL, C1 controls
+                | 0x202A..=0x202E                     // bidi embedding / override
+                | 0x2066..=0x2069                     // bidi isolate
+                | 0x206A..=0x206F,                    // deprecated format controls
+            ) && c != ';'
+        })
         .collect();
     // A scheme match on the raw `url` is meaningless if stripping emptied
     // it out or mangled the scheme prefix itself (e.g. control bytes
@@ -140,6 +181,37 @@ mod tests {
             !seq[5..].contains(';'),
             "a stray `;` in the URI could be misread as a new OSC 8 parameter field: {seq:?}"
         );
+    }
+
+    #[test]
+    fn test_bidi_controls_in_a_url_never_reach_the_sequence() {
+        // An honest-looking host with an override and an isolate buried in
+        // the path: rendered in a terminal's link preview, the tail reads
+        // backwards and the reader inspects a destination that is not the
+        // one the sequence carries.
+        let hostile = "https://example.com/\u{202e}dm.exe\u{202c}/\u{2066}safe.md\u{2069}\u{206f}x";
+        let seq = open(hostile).expect("scheme is allowed; only the body is hostile");
+        assert_no_bidi_controls(&seq);
+        // Everything else about the URL survives — this is a strip, not a
+        // rejection, so the link still works.
+        assert!(
+            seq.contains("https://example.com/dm.exe/safe.mdx"),
+            "{seq:?}"
+        );
+    }
+
+    /// Asserts no Unicode bidi formatting control survived anywhere in
+    /// `seq` — the reordering overrides and isolates, plus the deprecated
+    /// format controls. Directional marks are deliberately not listed:
+    /// they are permitted, here and in the painter.
+    fn assert_no_bidi_controls(seq: &str) {
+        for c in seq.chars() {
+            assert!(
+                !matches!(c as u32, 0x202A..=0x202E | 0x2066..=0x2069 | 0x206A..=0x206F),
+                "bidi control U+{:04X} survived into an OSC 8 sequence: {seq:?}",
+                c as u32
+            );
+        }
     }
 
     /// Scans `seq` byte-by-byte for anything that is not part of a

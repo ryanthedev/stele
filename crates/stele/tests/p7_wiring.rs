@@ -86,6 +86,44 @@ fn test_hostile_link_scheme_never_reaches_osc8() {
     }
 }
 
+/// Neither half of a link — the displayed label nor the OSC 8 URI — can carry
+/// a Unicode bidi formatting control onto the wire.
+///
+/// This is the Trojan-Source display spoof, and it needs the *whole* path to
+/// prove: `highlight::sanitize_url` cleans the URI and `painter::sanitize`
+/// cleans the label, two barricades in two crates that a unit test on either
+/// one alone would leave half-checked. So it goes `Document -> layout ->
+/// Painter::frame` and reads the bytes, which is what the terminal sees.
+#[test]
+fn test_bidi_controls_in_a_link_reach_neither_the_label_nor_the_url() {
+    // U+202E flips the tail of whatever follows it; U+2066/U+2069 isolate a
+    // span. One of each on both sides of the link.
+    let src = "see [safe\u{202e}gpj.exe\u{202c} \u{2066}doc\u{2069}](\
+               https://example.com/\u{202e}dm.exe\u{202c}/\u{2066}safe.md\u{2069}) here\n";
+    let out = render(src, 80, 4);
+    let text = String::from_utf8_lossy(&out);
+
+    for c in text.chars() {
+        assert!(
+            !matches!(c as u32, 0x202A..=0x202E | 0x2066..=0x2069 | 0x206A..=0x206F),
+            "bidi control U+{:04X} reached the wire: {text:?}",
+            c as u32
+        );
+    }
+
+    // Stripped, not rejected: the link is still emitted and still usable, so
+    // a passing assertion above cannot be the trivial one where nothing was
+    // written at all.
+    assert!(
+        text.contains("\x1b]8;;https://example.com/dm.exe/safe.md\x1b\\"),
+        "expected the cleaned URL in an OSC 8 open, got {text:?}"
+    );
+    assert!(
+        text.contains("safegpj.exe"),
+        "label must still render: {text:?}"
+    );
+}
+
 /// A URL carrying embedded control bytes cannot inject: the sanitized URL on
 /// the wire has no raw ESC/BEL and the `;` framing byte is stripped.
 #[test]
