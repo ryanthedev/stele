@@ -43,9 +43,27 @@ fn usable_cell_px(cell_px: (u32, u32)) -> (u32, u32) {
     )
 }
 
-/// The em-pixel baseline a formula is measured and rastered at: **one em is
-/// one terminal row**, so `cell_px.1` is the answer and there is no constant
-/// to pick.
+/// How much of a terminal cell's height one em occupies.
+///
+/// A cell is not an em. Its height is ascent + descent + line gap, and for the
+/// monospace faces a terminal ships the font's em is roughly five-sixths of
+/// it. Rendering math at a full cell height therefore draws it about 20%
+/// larger than the text beside it, and — worse — puts the baseline-riding
+/// threshold at exactly 1.0 em, which is where ordinary inline formulas sit.
+/// `f'(x)=2x` measures 1.0519 em and `x^2+y^2=r^2` measures 1.0585: a prime or
+/// a superscript is enough to cross it. Every formula in `02-math.md`'s
+/// "Inline math mid-sentence" paragraph did, and that paragraph broke into 13
+/// lines while its own prose promised it would flow.
+///
+/// Five-sixths puts the threshold back at 1.2 em, which is above the
+/// superscript-and-prime cluster and below a fraction (1.79 em). It is also
+/// exactly what the old hardcoded 40 px meant at the 48 px fallback cell —
+/// that constant was never wrong about the *ratio*, only about being fixed in
+/// pixels while the cell it was a ratio of varied.
+const MATH_EM_PER_CELL: f64 = 5.0 / 6.0;
+
+/// The em-pixel baseline a formula is rastered at, from the terminal's own
+/// cell height and [`MATH_EM_PER_CELL`].
 ///
 /// This used to be a hardcoded 40 px, matching RaTeX's default `font_size`,
 /// and it produced two visible defects at once. A cell is whatever the
@@ -63,15 +81,37 @@ fn usable_cell_px(cell_px: (u32, u32)) -> (u32, u32) {
 /// fixture prose in `testdocs/02-math.md` quotes those fallback numbers as
 /// "verified". They were — in a geometry the product never runs in.
 ///
-/// Tying the baseline to the cell makes the row count a property of the
-/// formula alone: a one-em formula is one row on every terminal, whatever
-/// it reports.
+/// Tying the baseline to the cell as a *ratio* makes the row count a property
+/// of the formula alone — see [`math_rows`], which computes it from the em
+/// directly rather than from this pixel value.
+///
 /// `pub(crate)` because the raster half of the pipeline must render at the
 /// same baseline this half measured against: `media::sink` hands it to
 /// [`math::render_fitted`]. Two different answers here and there would size a
 /// box from one em and draw a formula at another.
 pub(crate) fn math_baseline_px(cell_px: (u32, u32)) -> u32 {
-    usable_cell_px(cell_px).1
+    let cell_h = f64::from(usable_cell_px(cell_px).1);
+    ((cell_h * MATH_EM_PER_CELL).round() as u32).max(1)
+}
+
+/// Rows a formula of em height `em_h` reserves: `ceil(em_h * MATH_EM_PER_CELL)`,
+/// computed from the em and nothing else.
+///
+/// **Not** `math_baseline_px(cell) * em_h` divided back by the cell height,
+/// which is what this did when it went through [`px_to_cells`]. That round
+/// trip truncates to whole pixels before dividing, so the real threshold was
+/// `em_h < 1 + 1/cell_h` — still terminal-dependent, just subtly. `f'(x)=2x`
+/// (1.0519 em) came out as 2 rows at a 24x48, 12x28 or 10x21 cell and 1 row at
+/// 9x19: the same formula, in the same document, breaking the sentence for one
+/// reader and flowing for another. Deriving rows from the em skips the pixel
+/// round trip and with it the whole class of boundary.
+fn math_rows(em_h: f64) -> u64 {
+    let rows = (em_h.max(0.0) * MATH_EM_PER_CELL).ceil();
+    if rows.is_finite() {
+        (rows as u64).max(1)
+    } else {
+        u64::from(MAX_RESERVED_ROWS)
+    }
 }
 
 /// Upper bound on a single reserved box's cell extent, independent of the
@@ -156,10 +196,17 @@ impl ImageSizer {
 
     fn size_math(&self, tex: &str) -> Option<CellSize> {
         if let Some((em_w, em_h)) = math::intrinsic_em_size(tex) {
-            let baseline = f64::from(math_baseline_px(self.cell_px));
+            // Rows from the em, columns from pixels. The asymmetry is the
+            // point: a formula's row count decides whether it rides the text
+            // baseline, so it must be the same everywhere and is computed from
+            // the em alone. Its column count is a horizontal fit against this
+            // terminal's cell width and is *supposed* to vary — an em-square
+            // covers twice the columns in a 12x28 cell as in a 24x48 one.
+            let cell_px = usable_cell_px(self.cell_px);
+            let baseline = f64::from(math_baseline_px(cell_px));
             let px_w = (em_w * baseline).max(0.0) as u32;
-            let px_h = (em_h * baseline).max(0.0) as u32;
-            return Some(px_to_cells(px_w.max(1), px_h.max(1), self.cell_px));
+            let cols = u64::from(px_w.max(1).div_ceil(cell_px.0));
+            return Some(cap_cells(cols, math_rows(em_h)));
         }
         // RaTeX rung failed to parse: try the txm rung before giving up —
         // this is what makes a txm-rendered formula also get a real
@@ -219,14 +266,30 @@ fn resolve_path(base_dir: &Path, dest: &str) -> PathBuf {
 /// visible result is a band of dead transparent rows under the picture; a
 /// vertical stretch, before letterboxing existed.
 fn px_to_cells(px_w: u32, px_h: u32, cell_px: (u32, u32)) -> CellSize {
+    let cell_px = usable_cell_px(cell_px);
+    cap_cells(
+        u64::from(px_w.div_ceil(cell_px.0)).max(1),
+        u64::from(px_h.div_ceil(cell_px.1)).max(1),
+    )
+}
+
+/// Applies the [`MAX_RESERVED_COLS`]/[`MAX_RESERVED_ROWS`] caps to a cell
+/// count and narrows it to `u16`.
+///
+/// Split out of [`px_to_cells`] because math does not reach its cell count the
+/// same way an image does: an image only knows pixels, but a formula knows its
+/// own extent in *em*, and rounding that through a pixel count throws away the
+/// precision that makes its row count terminal-independent. Both still need
+/// the same caps and the same saturating narrow, and one copy of that is
+/// enough.
+fn cap_cells(mut cols: u64, mut rows: u64) -> CellSize {
     // u64 throughout: the proportional rescale multiplies a cell count by a
     // cap before dividing, and a cell count derived from an unbounded u32
     // pixel dimension would overflow that product in u32.
     let max_cols = u64::from(MAX_RESERVED_COLS);
     let max_rows = u64::from(MAX_RESERVED_ROWS);
-    let cell_px = usable_cell_px(cell_px);
-    let mut cols = u64::from(px_w.div_ceil(cell_px.0)).max(1);
-    let mut rows = u64::from(px_h.div_ceil(cell_px.1)).max(1);
+    cols = cols.max(1);
+    rows = rows.max(1);
     if cols > max_cols {
         rows = (rows * max_cols).div_ceil(cols).max(1);
         cols = max_cols;
@@ -511,8 +574,22 @@ mod tests {
     /// em-square covers more columns in a narrow cell); rows must not.
     #[test]
     fn test_a_formulas_row_count_does_not_move_with_the_terminals_cell_size() {
+        // The real corpus, not a hand-picked handful. The first version of
+        // this test used four formulas whose em heights (0.78, 0.58, 1.79,
+        // 2.33) all sat far from a rounding boundary, so it passed while
+        // `f'(x)=2x` at 1.0519 em measured 2 rows on three of those cells and
+        // 1 row on the fourth. A boundary bug is only visible to a fixture
+        // with something near the boundary in it.
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .and_then(|p| p.parent())
+                .expect("the crate lives two levels under the repo root")
+                .join("testdocs/02-math.md"),
+        )
+        .expect("the math fixture must exist");
         let dir = scratch_dir("math-cell-invariance");
-        let doc = Document::parse("$a+b=c$ $x_1$ $\\frac{a}{b}$ $\\int_0^\\infty$\n");
+        let doc = Document::parse(&src);
         let nodes: Vec<_> = doc
             .nodes()
             .filter(
@@ -520,25 +597,83 @@ mod tests {
             )
             .map(|n| n.id())
             .collect();
-        assert_eq!(nodes.len(), 4, "the fixture must parse as four math spans");
+        assert!(
+            nodes.len() > 20,
+            "the fixture contributed only {} math spans — it went missing or \
+             stopped parsing, and every assertion below would pass vacuously",
+            nodes.len()
+        );
 
+        // Fallback, retina Ghostty, small non-retina, and three more spread
+        // across the range `terminal::query_cell_px` calls plausible.
+        const CELLS: [(u32, u32); 6] = [(24, 48), (12, 28), (9, 19), (10, 21), (7, 15), (16, 36)];
         for node in nodes {
-            let rows: Vec<u16> = [(24, 48), (12, 28), (9, 19), (10, 21)]
+            let rows: Vec<u16> = CELLS
                 .into_iter()
-                .map(|cell| {
-                    ImageSizer::new(&dir)
-                        .with_cell_px(cell)
-                        .size(node, &doc)
-                        .expect("every formula in the fixture sizes")
-                        .rows
+                .filter_map(|cell| {
+                    Some(
+                        ImageSizer::new(&dir)
+                            .with_cell_px(cell)
+                            .size(node, &doc)?
+                            .rows,
+                    )
                 })
                 .collect();
             assert!(
                 rows.windows(2).all(|w| w[0] == w[1]),
-                "row count moved with the cell geometry: {rows:?} — a reader on \
-                 one terminal sees the formula ride the baseline and a reader on \
-                 another sees it break the sentence"
+                "row count moved with the cell geometry: {rows:?} across {CELLS:?} \
+                 — a reader on one terminal sees the formula ride the baseline and \
+                 a reader on another sees it break the sentence"
             );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The paragraph `02-math.md` promises will flow must actually flow.
+    ///
+    /// Its prose says "every formula above measures 1 row and rides the
+    /// baseline — this paragraph should wrap as plain flowing text". Making
+    /// the em a whole cell height put the threshold at exactly 1.0 em, and
+    /// `x^2+y^2=r^2` (1.0585), `f'(x)=2x` (1.0519) and `f(x)=x^2` all sit just
+    /// above it, so the paragraph broke into 13 lines — including at the 48 px
+    /// fallback, where it had flowed before. A prime or a superscript is
+    /// enough to cross a 1.0 em threshold, which is why the threshold is not
+    /// 1.0 em.
+    #[test]
+    fn test_the_flowing_paragraph_in_the_fixture_keeps_every_formula_on_one_row() {
+        let dir = scratch_dir("math-flowing-paragraph");
+        let doc = Document::parse(
+            "the energy $E=mc^2$ relates mass and energy, the quadratic \
+             $x^2+y^2=r^2$ describes a circle, and Euler's identity \
+             $e^{i\\pi}+1=0$ ties five constants together. Further along, the \
+             derivative $f'(x)=2x$ of $f(x)=x^2$ mid-sentence.\n",
+        );
+        let nodes: Vec<_> = doc
+            .nodes()
+            .filter(
+                |n| matches!(n, NodeRef::Inline(i) if matches!(i.kind, InlineKind::Math { .. })),
+            )
+            .map(|n| n.id())
+            .collect();
+        assert_eq!(
+            nodes.len(),
+            5,
+            "the paragraph must parse as five math spans"
+        );
+
+        for cell in [(24, 48), (12, 28), (9, 19)] {
+            for node in &nodes {
+                let size = ImageSizer::new(&dir)
+                    .with_cell_px(cell)
+                    .size(*node, &doc)
+                    .expect("every formula in the paragraph sizes");
+                assert_eq!(
+                    size.rows, 1,
+                    "at cell {cell:?} a formula in the flowing paragraph reserved \
+                     {size:?} — anything past one row leaves the text flow and \
+                     breaks the sentence around it"
+                );
+            }
         }
         std::fs::remove_dir_all(&dir).ok();
     }

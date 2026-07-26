@@ -260,11 +260,27 @@ impl GfxMediaSink {
     /// terminal rescales the raster onto the same cell box), not as
     /// misplacement.
     ///
-    /// What this changes is raster *resolution* and the cache key that goes
-    /// with it; never geometry. The reserved box's cell extent is fixed at
-    /// layout time, and `crop_source` measures against the raster's own
-    /// pixels. A zero on either axis is refused rather than stored — it would
-    /// make every `target_px` zero and every raster a 1×1 pixel.
+    /// For an *image* this changes raster resolution and the cache key that
+    /// goes with it, never geometry: the reserved box's cell extent is fixed
+    /// at layout time and `crop_source` measures against the raster's own
+    /// pixels.
+    ///
+    /// **For math it now also changes the em a formula is drawn at**, since
+    /// [`crate::media::sizer::math_baseline_px`] derives that from the cell
+    /// height. `ImageSizer` has no matching setter and calling this triggers
+    /// no re-layout, so a caller who used this without also rebuilding the
+    /// sizer and re-laying out would leave a box measured at one em holding a
+    /// formula drawn at another. Unreachable today — `main.rs` rebuilds both
+    /// from the same `cell_px` and nothing else calls this — but it is the
+    /// documented forward path for handling a mid-session font-size change,
+    /// and that path has to rebuild the sizer too.
+    ///
+    /// A zero on either axis is refused rather than stored — it would make
+    /// every `target_px` zero and every raster a 1×1 pixel. Note that
+    /// `ImageSizer::with_cell_px` substitutes the fallback per axis instead of
+    /// refusing the pair, so the two disagree on what `(0, 28)` means; both
+    /// are `pub`, and `terminal::query_cell_px` never emits a zero, so the
+    /// divergence is reachable only by a caller constructing one by hand.
     pub fn set_cell_px(&mut self, cell_px: (u32, u32)) {
         if cell_px.0 == 0 || cell_px.1 == 0 {
             return;

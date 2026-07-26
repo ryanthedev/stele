@@ -704,17 +704,23 @@ mod tests {
     /// which is what a test process (no terminal to query) measures against.
     const CELL: (u32, u32) = (24, 48);
 
+    /// Mirrors `stele::media::sizer::MATH_EM_PER_CELL`: how much of a cell's
+    /// height one em occupies. A cell is ascent + descent + line gap, so the
+    /// font's em is about five-sixths of it.
+    const EM_PER_CELL: f64 = 5.0 / 6.0;
+
     /// The em baseline the shipped pipeline renders at, mirroring
-    /// `stele::media::sizer::math_baseline_px`: **the cell height**, so one em
-    /// is one row.
+    /// `stele::media::sizer::math_baseline_px`.
     ///
     /// Derived from [`CELL`] rather than written as a number. This was a
     /// hardcoded 40 in three places in this module, and when the product
     /// stopped rendering at 40 px they kept modelling a pipeline that no
     /// longer existed — the letterbox assertions below would have gone on
     /// passing against boxes no reader ever sees, which is the one failure
-    /// this whole mirror exists to prevent.
-    const PIPELINE_EM_PX: u32 = CELL.1;
+    /// this whole mirror exists to prevent. That it now evaluates back to 40
+    /// at the fallback cell is the point: the old constant had the right ratio
+    /// and the wrong idea of what it was a ratio *of*.
+    const PIPELINE_EM_PX: u32 = (CELL.1 as f64 * EM_PER_CELL) as u32;
 
     /// The cell box the shipped pipeline lands on for a formula of em extent
     /// `(em_w, em_h)` at a `content_cols`-wide content column, mirroring
@@ -736,9 +742,11 @@ mod tests {
     fn pipeline_target_px(em_w: f64, em_h: f64, content_cols: u64) -> (u32, u32) {
         const MAX_RESERVED: u64 = 200;
         let px_w = ((em_w * f64::from(PIPELINE_EM_PX)).max(0.0) as u32).max(1);
-        let px_h = ((em_h * f64::from(PIPELINE_EM_PX)).max(0.0) as u32).max(1);
         let mut cols = u64::from(px_w.div_ceil(CELL.0)).max(1);
-        let mut rows = u64::from(px_h.div_ceil(CELL.1)).max(1);
+        // Rows from the em, not from a pixel height divided back down — the
+        // product does the same, because the pixel round trip truncates and
+        // reintroduces a cell-dependent boundary. See `sizer::math_rows`.
+        let mut rows = ((em_h.max(0.0) * EM_PER_CELL).ceil() as u64).max(1);
         if cols > MAX_RESERVED {
             rows = (rows * MAX_RESERVED).div_ceil(cols).max(1);
             cols = MAX_RESERVED;

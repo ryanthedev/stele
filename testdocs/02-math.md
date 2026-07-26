@@ -12,12 +12,22 @@ All sizes quoted below were measured directly against this checkout's
 `stele::media::sizer::ImageSizer` calls), not guessed from the TeX source.
 `rows <= 1` is the baseline-riding condition.
 
-**Rows are quoted; columns are not.** A formula's em baseline is the
-terminal's own cell height (`sizer::math_baseline_px`), so one em is one row
-and a formula's row count is the same on every terminal — that is what makes
+**Rows are quoted; columns are not.** A formula reserves
+`ceil(em_h * 5/6)` rows — five-sixths because a terminal cell is ascent plus
+descent plus line gap, and the font's em is about that fraction of it
+(`sizer::MATH_EM_PER_CELL`). Nothing in that expression is the terminal's,
+so a formula's row count is the same for every reader, which is what makes
 `rows` a fact worth writing down here. Its *column* count is not: an em-square
-covers twice as many columns in a 12x28 cell as in a 24x48 one, so any number
-this file quoted would be true only for whoever measured it.
+covers twice as many columns in a 12x28 cell as in a 24x48 one. The few
+sections below whose subject is the width path do quote columns, and those
+numbers are the 24x48 fallback's — true for a test process, indicative rather
+than exact for your terminal.
+
+The threshold that matters is therefore **1.2 em**, not 1.0. That is not a
+round number chosen for looks: a prime or a superscript pushes an otherwise
+one-line formula just past 1.0 em (`f'(x)=2x` is 1.0519, `x^2+y^2=r^2` is
+1.0585), so a 1.0 em threshold breaks the flowing paragraph below, while a
+fraction at 1.79 em genuinely does need two rows.
 
 This file previously quoted both, from the 24x48 fallback geometry that every
 test in the workspace uses and no reader's terminal reports. The numbers were
@@ -54,8 +64,8 @@ choice in `wrap()` never checks position — only size.*
 
 ## The boundary itself: near-1-row vs taller-than-1-row
 
-Simple formulas that measure **exactly 1 row** (verified: `a+b=c` → 0.778 em
-tall → 1 row; `x_1` → 0.581 em → 1 row; on every cell geometry):
+Simple formulas that measure **exactly 1 row** (verified: `a+b=c` → 0.7778 em
+→ 1 row; `x_1` → 0.5806 em → 1 row; on every cell geometry):
 
 Simple sum $a+b=c$ and subscript $x_1$ sitting in a sentence.
 
@@ -63,9 +73,9 @@ Simple sum $a+b=c$ and subscript $x_1$ sitting in a sentence.
 bug we just fixed. This sentence must stay ONE line (or wrap only at normal
 word boundaries), never break into three lines around the formulas.*
 
-Formulas that measure **taller than 1 row** (verified: `\frac{a}{b}` → 1.794
-em → 2 rows; `\sum_{i=0}^{n}` → 3.089 em → 4 rows; `\int_0^\infty` → 2.326 em
-→ 3 rows; on every cell geometry):
+Formulas that measure **taller than 1 row** (verified: `\frac{a}{b}` → 1.7936
+em → 2 rows; `\sum_{i=0}^{n}` → 3.0891 em → 3 rows; `\int_0^\infty` → 2.3262
+em → 2 rows; on every cell geometry):
 
 A fraction $\frac{a}{b}$, a limited sum $\sum_{i=0}^{n}$, and a limited
 integral $\int_0^\infty$ all appear here mid-paragraph.
@@ -79,7 +89,7 @@ baseline, even though they're written as ordinary inline `$…$` math.*
 
 $e^{i\pi}$ and the doubly-stacked $x^{y^{z}}$ appear here.
 
-*expect: both measured 1 row tall (cols 2 and cols 3 respectively) despite
+*expect: both measure 1 row tall despite
 the stacked exponents — RaTeX keeps the raised superscript within the same
 cell row at this size, so both ride the baseline. This is a genuinely
 counter-intuitive result worth checking with your own eyes: "stacked"
@@ -148,7 +158,7 @@ Simple display math:
 
 $$E = mc^2$$
 
-*expect: this measured cols 7, rows 1 — SAME as an inline formula of the
+*expect: this measures 1 row — SAME as an inline formula of the
 same shape. The `display: true` flag only affects markdown semantics (it
 came from `$$…$$` instead of `$…$`); the `wrap()` boundary never inspects
 that flag, only the measured `CellSize`. So this one-row display formula
