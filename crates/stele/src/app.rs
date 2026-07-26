@@ -10,7 +10,8 @@ use std::ops::Range;
 use ast::{Document, NodeId};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use layout::{
-    FoldState, IntrinsicSizer, LayoutConfig, LayoutTree, Line, LineItem, Outline, layout_with_folds,
+    FoldState, IntrinsicSizer, LayoutConfig, LayoutTree, Line, LineItem, Outline, layout,
+    layout_with_folds,
 };
 use width::WidthEngine;
 
@@ -161,6 +162,19 @@ pub struct SearchState {
     /// Index into `matches`. Meaningless — and never read — when `matches`
     /// is empty; [`AppState::search_overlay`] is what enforces that.
     pub current: usize,
+    /// How many additional matches of `query` exist in the fully-expanded
+    /// document but are currently invisible because they fall inside a
+    /// folded section — the count [`AppState::report_no_matches`] needs to
+    /// tell "no matches anywhere" apart from "matches, all folded away"
+    /// (Phase 5's edge case: `n` must not report a query has no matches when
+    /// it does). Kept only as fresh as the last [`AppState::recompute_matches`]
+    /// call, which is every relayout — including the one a fold or unfold
+    /// itself triggers — so it is exactly the source of the bug it exists to
+    /// prevent. Left at `0` by [`AppState::refresh_incremental`] (typing has
+    /// no [`LayoutContext`] to recompute it with — see that method's doc) and
+    /// by `Default`, so a fresh or mid-typing query never claims a count it
+    /// cannot back.
+    pub hidden_by_folds: usize,
 }
 
 impl SearchState {
@@ -281,6 +295,14 @@ pub struct TocRow {
 /// work with. One constant, because a document with no headings must answer
 /// the same way whichever key asked (DW-3.1, and the overlay's edge case).
 const NO_HEADINGS: &str = "no headings in this document";
+
+/// `z`'s answer when the document *has* headings but the cursor is above all
+/// of them (`Outline::index_at_or_before` returns `None` for that reason
+/// too, not only for an empty outline — see [`AppState::toggle_fold`]).
+/// Distinct from [`NO_HEADINGS`] on purpose: that message is false here —
+/// the document is not headingless, there is simply no section covering the
+/// preamble the reader is currently on.
+const NO_SECTION_HERE: &str = "no section to fold here";
 
 /// A key press the event loop must act on with resources [`AppState`] does
 /// not own: `+`/`-` need a [`LayoutContext`] to relay out against, and `T`
@@ -627,27 +649,53 @@ impl AppState {
     /// would have given. Leaving it up would show a list of headings that are
     /// not in the document behind it, and `Enter` on one of them would jump to
     /// wherever that index now happens to land.
-    pub fn reload_document(&mut self, ctx: &LayoutContext, file_info: FileInfo) {
+    ///
+    /// `old_doc` is the document `self.tree` was built from *before* this
+    /// call — the same `Rc<Document>` the caller is about to replace, still
+    /// alive because the caller has not dropped its last reference yet.
+    /// `None` when the caller has no such reference to offer (chiefly test
+    /// helpers that never fold); a live fold is then dropped rather than
+    /// guessed at — see [`AppState::reseat_folds`].
+    pub fn reload_document(
+        &mut self,
+        ctx: &LayoutContext,
+        file_info: FileInfo,
+        old_doc: Option<&Document>,
+    ) {
         self.file_info = file_info;
         self.clear_status();
         self.document_changed = true;
-        let old_outline = self.tree.outline().clone();
         // Captured before clearing: `self.folds.collapsed` is about to be
         // emptied, and this is the only record of which ids to re-key.
         let old_collapsed = self.folds.collapsed.clone();
+        let had_folds = !old_collapsed.is_empty();
+        // A complete (fold-free) outline of the *old* document — see
+        // `reseat_folds` for why `self.tree.outline()` cannot serve this
+        // purpose when any fold was active. Built once, before anything
+        // about `self` changes, and only when there is actually something to
+        // re-key: an extra full layout pass is not free, so it is not paid
+        // for on the (overwhelmingly common) reload with nothing folded.
+        let old_outline = if had_folds {
+            old_doc.map(|doc| {
+                layout(doc, self.tree.width(), ctx.config, ctx.engine, ctx.sizer)
+                    .outline()
+                    .clone()
+            })
+        } else {
+            None
+        };
         // A `NodeId` from the old document cannot be trusted against the new
         // one at all — see `reseat_folds` — and worse than merely stale, a
         // coincidentally-equal id in the fresh parse would make `fold_range`
         // (`layout::block::Ctx`) collapse a section that was never folded.
         // Clearing first means the very first relayout below is guaranteed
         // fold-free, so `reseat_folds` has a clean, fully-expanded `Outline`
-        // to re-key the old ids against.
-        let had_folds = !old_collapsed.is_empty();
+        // on the *new* side too, matching `old_outline`'s.
         if had_folds {
             self.folds.collapsed.clear();
         }
         self.relayout_preserving_anchor(ctx, *ctx.config);
-        if had_folds {
+        if let Some(old_outline) = old_outline {
             self.reseat_folds(&old_outline, &old_collapsed);
             if !self.folds.collapsed.is_empty() {
                 // A second pass to actually apply the re-keyed folds. Costs
@@ -668,19 +716,26 @@ impl AppState {
     ///
     /// Re-keyed by content plus occurrence, the same principle
     /// [`AppState::line_of_reloaded`] uses for the scroll anchor, but over
-    /// `old_outline`'s flattened heading text rather than painted lines: a
-    /// folded heading's own line paints its *marker*, not its title, so
-    /// hashing what is currently on screen would compare a summary against a
-    /// title (or a title against a summary) and could never match. An
-    /// outline entry's `text` (`layout::block::heading_text`) is computed
-    /// from the same AST children whether the heading renders in full or
-    /// collapses to a marker, so it means the same thing on both sides of the
-    /// reload regardless of either document's fold state.
+    /// flattened heading text rather than painted lines: a folded heading's
+    /// own line paints its *marker*, not its title, so hashing what is
+    /// currently on screen would compare a summary against a title (or a
+    /// title against a summary) and could never match.
     ///
-    /// Must be called after a relayout has installed the *new*, still
-    /// fold-free tree (`reload_document` clears `folds` before its first
-    /// relayout for exactly this reason) — `self.tree.outline()` here is
-    /// that fresh outline, never the one folds were captured against.
+    /// **Both `old_outline` and `self.tree.outline()` (the "new" side, read
+    /// below) must be complete — every heading, none of them abbreviated by
+    /// a fold.** This is the fix for a real defect: an occurrence index is
+    /// only comparable between two lists that agree on what they are
+    /// counting *among*. `walk_blocks` never visits a heading nested inside
+    /// a folded ancestor's range, so `self.tree.outline()` *while a fold is
+    /// active* silently omits it — and if `old_outline` had been taken from
+    /// that abbreviated list, "the 1st visible `Notes`" on the old side and
+    /// "the 1st `Notes` overall" on the new side can name two different
+    /// headings, or the omitted one can vanish from `collapsed` entirely
+    /// (both reproduced and now regression-tested). `reload_document` pays
+    /// for `old_outline`'s completeness with an extra fold-free layout pass
+    /// of the old document; `self.tree.outline()` here is already fold-free
+    /// too, because `reload_document` clears every fold before the relayout
+    /// that installs `self.tree`.
     fn reseat_folds(&mut self, old_outline: &Outline, old_collapsed: &HashSet<NodeId>) {
         let wanted: Vec<(u8, &str, usize)> = old_collapsed
             .iter()
@@ -885,7 +940,16 @@ impl AppState {
     pub fn toggle_fold(&mut self) {
         let outline = self.tree.outline();
         let Some(index) = outline.index_at_or_before(self.scroll) else {
-            self.set_status(StatusMessage::new(NO_HEADINGS));
+            // `None` here means either there is no heading in the document
+            // at all, or there is one but it is below the cursor — a
+            // document with headings the reader just has not reached yet.
+            // `NO_HEADINGS` would be false for the second case.
+            let message = if outline.is_empty() {
+                NO_HEADINGS
+            } else {
+                NO_SECTION_HERE
+            };
+            self.set_status(StatusMessage::new(message));
             return;
         };
         let target = outline.entries[index].block;
@@ -909,14 +973,23 @@ impl AppState {
     /// [`FoldState::collapsed`] just means that if the reader later opens the
     /// outer one, the inner heading is still folded rather than snapping
     /// wide open underneath it.
+    ///
+    /// **Unions into `collapsed` rather than replacing it — load-bearing,
+    /// not stylistic.** `self.tree.outline()` is abbreviated while any fold
+    /// is already active (a heading nested inside a folded range is never
+    /// visited — see [`AppState::reseat_folds`]'s doc for the same fact
+    /// biting a reload). A `collapsed = outline_ids` assignment would then
+    /// silently drop every id the *current* abbreviated outline cannot see,
+    /// which is exactly the ids this method's own doc promises stay folded:
+    /// pressing `M` a second time, after the first already hid some nested
+    /// heading, replaced the whole set with only what was still visible and
+    /// lost it. `extend` only ever adds, so a heading already in `collapsed`
+    /// — visible in the current outline or not — is never removed by a
+    /// later collapse-all.
     pub fn collapse_all(&mut self) {
-        self.folds.collapsed = self
-            .tree
-            .outline()
-            .entries
-            .iter()
-            .map(|entry| entry.block)
-            .collect();
+        self.folds
+            .collapsed
+            .extend(self.tree.outline().entries.iter().map(|entry| entry.block));
     }
 
     /// The current (pre-fold) line range of the section the `index`-th
@@ -1110,6 +1183,21 @@ impl AppState {
     /// scroll position (DW-4.5): the viewport stays where the last matching
     /// prefix left it, so typing one character too many does not throw the
     /// reader somewhere else on its way to being deleted again.
+    ///
+    /// **Cannot recompute [`SearchState::hidden_by_folds`].** Doing so needs
+    /// a fold-free relayout of the document (see
+    /// [`AppState::recompute_matches`]), which needs a [`LayoutContext`] —
+    /// and this runs from [`AppState::handle_search_key`], on every
+    /// keystroke of the query, which by design has no `LayoutContext`
+    /// (chrome — the keys that need one — is routed and handled entirely
+    /// outside `AppState`; see [`AppState::chrome_action`]'s doc). So this
+    /// resets the count to `0` rather than carry over a number computed for
+    /// a *different* query: a stale "3 hidden by folds" surviving into a
+    /// query it was never measured against would be exactly the kind of
+    /// confidently wrong status row this field exists to prevent. The count
+    /// becomes accurate again on the next relayout — which folding itself
+    /// always causes, and folding while a query is being typed is
+    /// impossible anyway ([`Mode::Search`] captures every key).
     fn refresh_incremental(&mut self) {
         let origin = match self.mode {
             Mode::Search { origin } => origin,
@@ -1121,6 +1209,7 @@ impl AppState {
         };
         self.search.matches = find_matches(&self.tree, &self.search);
         self.search.current = first_match_at_or_after(&self.search.matches, origin);
+        self.search.hidden_by_folds = 0;
         if self.search.matches.is_empty() {
             return;
         }
@@ -1160,12 +1249,27 @@ impl AppState {
     /// DW-4.5's status-row half. Silent on an empty query — pressing `n`
     /// before ever searching has nothing to report, and "no matches" would
     /// be a lie about a query that was never made.
+    ///
+    /// **The listed search-in-fold edge case's status-row half.** A visible
+    /// match count of zero means two different things, and this is what
+    /// tells them apart: `query` really has no match anywhere
+    /// (`hidden_by_folds == 0`), or every match that exists is currently
+    /// folded away (`hidden_by_folds > 0`). Reporting the first message for
+    /// the second situation is not merely uninformative, it is false — the
+    /// reproduction that found this was `/needle` over a document that
+    /// contains it, folding the section holding it, then `n` answering "no
+    /// matches: needle".
     fn report_no_matches(&mut self) {
         if self.search.query.is_empty() {
             return;
         }
         let query = self.search.query.clone();
-        self.set_status(StatusMessage::new(format!("no matches: {query}")));
+        let message = match self.search.hidden_by_folds {
+            0 => format!("no matches: {query}"),
+            1 => format!("no matches: {query} (1 hidden by a fold — R to expand)"),
+            hidden => format!("no matches: {query} ({hidden} hidden by folds — R to expand)"),
+        };
+        self.set_status(StatusMessage::new(message));
     }
 
     /// The Control-chord bindings. `Some(quit)` when the chord is one of
@@ -1309,7 +1413,7 @@ impl AppState {
             .unwrap_or(target);
         self.set_scroll(target);
         self.reseat_search(reflowed);
-        self.recompute_matches();
+        self.recompute_matches(ctx);
     }
 
     /// Puts an open search prompt's `origin` back on a line that exists in
@@ -1371,7 +1475,14 @@ impl AppState {
     /// recomputed set rather than merely skipped over. That is *skip*, not
     /// *expand*: `n`/`N` step past it as if it did not match, and it
     /// reappears the moment the section is unfolded and this runs again.
-    fn recompute_matches(&mut self) {
+    ///
+    /// The choice to skip is only defensible if the reader can tell it
+    /// happened, which is what `ctx` is for here: it also recomputes
+    /// [`SearchState::hidden_by_folds`], the count [`AppState::report_no_matches`]
+    /// needs to say "3 hidden by folds" instead of the flatly false "no
+    /// matches" a query that matched — just not anywhere currently visible —
+    /// would otherwise get.
+    fn recompute_matches(&mut self, ctx: &LayoutContext) {
         if self.search.query.is_empty() {
             return;
         }
@@ -1380,6 +1491,35 @@ impl AppState {
             .search
             .current
             .min(self.search.matches.len().saturating_sub(1));
+        self.search.hidden_by_folds = self.matches_hidden_by_folds(ctx);
+    }
+
+    /// How many matches of the active query exist in the document but not in
+    /// `self.tree` because a fold currently hides them — `0` when nothing is
+    /// folded, without paying for the extra layout pass below at all, which
+    /// is the overwhelmingly common case (every relayout that is not
+    /// fold-related still calls [`AppState::recompute_matches`]).
+    ///
+    /// Answered by laying the *same* document out fold-free at the *same*
+    /// width and taking the difference in match count. This is the only way
+    /// to answer it: the folded-away text is not in `self.tree` — that is
+    /// the entire premise of folding — so nothing already in `AppState` can
+    /// see it. The extra pass costs one more `layout()` on the relayout path
+    /// (never per keystroke — see [`AppState::refresh_incremental`]'s doc for
+    /// why it cannot run there), and only when a fold is actually active.
+    fn matches_hidden_by_folds(&self, ctx: &LayoutContext) -> usize {
+        if self.folds.collapsed.is_empty() {
+            return 0;
+        }
+        let unfolded = layout(
+            ctx.doc,
+            self.content_width,
+            ctx.config,
+            ctx.engine,
+            ctx.sizer,
+        );
+        let total = find_matches(&unfolded, &self.search).len();
+        total.saturating_sub(self.search.matches.len())
     }
 
     /// The reader's current position as an [`Anchor`], or `None` when the top
@@ -1800,7 +1940,7 @@ pub(crate) fn line_text_len(tree: &LayoutTree, index: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use ast::Document;
-    use layout::{NullSizer, layout};
+    use layout::NullSizer;
     use width::WidthConfig;
 
     use super::*;
@@ -3982,6 +4122,10 @@ mod tests {
 
     /// Lays out `source` into `state` as a `--watch` reload would, at the same
     /// width the tree already has.
+    /// The pre-Phase-5 reload helper every earlier test uses, none of which
+    /// fold anything — `old_doc: None` is correct for all of them (see
+    /// `AppState::reload_document`'s doc). `reload_with_old_doc` below is the
+    /// fold-aware sibling.
     fn reload(state: &mut AppState, source: &str, config: &LayoutConfig, engine: &WidthEngine) {
         let doc = Document::parse(source);
         let ctx = LayoutContext {
@@ -3997,6 +4141,34 @@ mod tests {
                 byte_size: source.len() as u64,
                 line_count: source.lines().count(),
             },
+            None,
+        );
+    }
+
+    /// Like [`reload`], but threading `old_doc` through so a fold recorded
+    /// against it can actually be re-keyed (DW-5.2).
+    fn reload_with_old_doc(
+        state: &mut AppState,
+        old_doc: &Document,
+        source: &str,
+        config: &LayoutConfig,
+        engine: &WidthEngine,
+    ) {
+        let doc = Document::parse(source);
+        let ctx = LayoutContext {
+            doc: &doc,
+            config,
+            engine,
+            sizer: &NullSizer,
+        };
+        state.reload_document(
+            &ctx,
+            FileInfo {
+                name: "test.md".to_string(),
+                byte_size: source.len() as u64,
+                line_count: source.lines().count(),
+            },
+            Some(old_doc),
         );
     }
 
@@ -4539,7 +4711,7 @@ mod tests {
         // only passes if the fold is re-keyed by content, not carried across
         // as the same (now wrong) id.
         let edited = format!("# Intro\n\nintro text.\n\n{}", fold_fixture(3));
-        reload(&mut state, &edited, &config, &engine);
+        reload_with_old_doc(&mut state, &doc, &edited, &config, &engine);
 
         assert_eq!(
             state.folds().collapsed.len(),
@@ -4574,6 +4746,127 @@ mod tests {
         assert!(
             !state.folds().is_folded(untouched.block),
             "only the heading that was folded before the reload may be folded after it"
+        );
+    }
+
+    /// Regression for the review's trace 5.2-a: a heading nested inside a
+    /// folded ancestor's range has no entry of its own in the *abbreviated*
+    /// outline, so re-keying folds against that outline (rather than a
+    /// complete, fold-free one) silently dropped it across a reload.
+    #[test]
+    fn test_dw_5_2_a_nested_fold_survives_a_watch_reload() {
+        let source = "# A\n\nx body.\n\n## B\n\ny body.\n\n# C\n\nz body.\n";
+        let (doc, config, engine, mut state) = build(source, 40, 5);
+        let ctx = ctx_for(&doc, &config, &engine);
+
+        state.collapse_all();
+        state.relayout_preserving_anchor(&ctx, config);
+        assert_eq!(
+            state.folds().collapsed.len(),
+            3,
+            "test setup: A, B (nested under A), and C must all be folded"
+        );
+
+        reload_with_old_doc(&mut state, &doc, source, &config, &engine);
+
+        assert_eq!(
+            state.folds().collapsed.len(),
+            3,
+            "every fold, including B's — nested inside A's collapsed range and absent \
+             from the abbreviated outline — must survive a byte-identical reload"
+        );
+
+        // Unfold A: B must reappear already folded, not wide open underneath it.
+        let a = state
+            .outline()
+            .entries
+            .iter()
+            .find(|e| e.text == "A")
+            .unwrap()
+            .block;
+        state.jump_to_block(a);
+        toggle_fold(&mut state, &ctx);
+        let all: String = (0..state.tree().line_count())
+            .map(|i| line_text(&state, i))
+            .collect();
+        assert!(
+            all.contains('B') && all.contains("hidden"),
+            "B must come back already folded: {all:?}"
+        );
+        assert!(
+            !all.contains("y body"),
+            "B's own body must still be hidden: {all:?}"
+        );
+    }
+
+    /// Regression for the review's trace 5.2-b: with two `## Notes` headings
+    /// sharing a title (one nested under a folded `A`, one under an open
+    /// `B`), re-keying the fold on the *visible* `Notes` against an
+    /// abbreviated old outline computed its occurrence among only the
+    /// visible copies (0), then applied that index to the new, fully
+    /// expanded outline — landing on `A`'s `Notes` instead of `B`'s.
+    #[test]
+    fn test_dw_5_2_a_fold_on_a_duplicate_titled_heading_reseats_onto_the_same_heading() {
+        let source = "# A\n\naaa.\n\n## Notes\n\nfirst notes.\n\n\
+                       # B\n\nbbb.\n\n## Notes\n\nsecond notes.\n";
+        // Height 1: `jump_to_block` moves the reader via `set_scroll`, which
+        // clamps to `max_scroll` — a viewport any taller relative to this
+        // small fixture silently caps the jump before it reaches the second
+        // "Notes" heading, folding whatever line the clamp landed on instead.
+        let (doc, config, engine, mut state) = build(source, 40, 1);
+        let ctx = ctx_for(&doc, &config, &engine);
+
+        let a = state.outline().entries[0].block;
+        state.jump_to_block(a);
+        toggle_fold(&mut state, &ctx); // folds A; A's own "Notes" vanishes from the outline
+
+        let second_notes = state
+            .outline()
+            .entries
+            .iter()
+            .find(|e| e.text == "Notes")
+            .expect("test setup: B's Notes is the only one left visible")
+            .block;
+        state.jump_to_block(second_notes);
+        toggle_fold(&mut state, &ctx); // folds the *visible* (B's) Notes
+
+        assert_eq!(
+            state.folds().collapsed.len(),
+            2,
+            "test setup: two folds active"
+        );
+
+        reload_with_old_doc(&mut state, &doc, source, &config, &engine);
+
+        assert_eq!(
+            state.folds().collapsed.len(),
+            2,
+            "both folds must survive the reload"
+        );
+        assert!(
+            state.folds().is_folded(a),
+            "\"A\" must still be folded after the reload"
+        );
+
+        let all: Vec<String> = (0..state.tree().line_count())
+            .map(|i| line_text(&state, i))
+            .collect();
+        let b_line = all
+            .iter()
+            .position(|t| t == "B")
+            .expect("B must be open and its own heading line visible");
+        let notes_after_b = all[b_line..]
+            .iter()
+            .find(|t| t.contains("Notes"))
+            .expect("B's own Notes heading must still be on screen");
+        assert!(
+            notes_after_b.contains("hidden"),
+            "B's own Notes must still be folded — not re-seated onto A's — after \
+             the reload: {all:?}"
+        );
+        assert!(
+            !all.iter().any(|t| t.contains("second notes")),
+            "B's Notes body must stay hidden: {all:?}"
         );
     }
 
@@ -4780,6 +5073,163 @@ mod tests {
             state.search().matches.len(),
             2,
             "unfolding must restore the match that was inside the folded range"
+        );
+    }
+
+    /// The listed edge case's status-row half, reproducing the review's exact
+    /// trace: a single match, folded away, then `n`. Before this fix the
+    /// status row answered `"no matches: needle"` — false, since the
+    /// document does contain it, just not currently visible.
+    #[test]
+    fn test_n_after_folding_the_only_match_reports_it_as_hidden_not_absent() {
+        let source = "# One\n\nneedle here.\n\n# Two\n\nplain text.\n";
+        let (doc, config, engine, mut state) = build(source, 40, 20);
+        let ctx = ctx_for(&doc, &config, &engine);
+        let matches = search_for(&mut state, "needle");
+        assert_eq!(matches.len(), 1, "test setup: exactly one match");
+
+        let one = state.outline().entries[0].block;
+        state.jump_to_block(one);
+        toggle_fold(&mut state, &ctx);
+        assert_eq!(
+            state.search().matches.len(),
+            0,
+            "test setup: the fold hid the only match"
+        );
+        assert_eq!(
+            state.search().hidden_by_folds,
+            1,
+            "the count of matches hidden by folds must be tracked, not just the visible \
+             drop to zero"
+        );
+
+        state.handle_key_event(plain(KeyCode::Char('n')));
+        let message = state.status().message;
+        assert_eq!(
+            message.as_deref(),
+            Some("no matches: needle (1 hidden by a fold — R to expand)"),
+            "the reader must be told the match is hidden, not that the document has \
+             none — got {message:?}"
+        );
+    }
+
+    /// The other half of the same claim: a query that genuinely matches
+    /// nothing, anywhere, must not start claiming folds are hiding something
+    /// that was never there.
+    #[test]
+    fn test_n_with_genuinely_no_matches_does_not_claim_any_are_hidden_by_folds() {
+        let source = "# One\n\nplain text.\n\n# Two\n\nmore text.\n";
+        let (doc, config, engine, mut state) = build(source, 40, 20);
+        let ctx = ctx_for(&doc, &config, &engine);
+        search_for(&mut state, "needle");
+
+        let one = state.outline().entries[0].block;
+        state.jump_to_block(one);
+        toggle_fold(&mut state, &ctx);
+
+        state.handle_key_event(plain(KeyCode::Char('n')));
+        let message = state.status().message;
+        assert_eq!(
+            message.as_deref(),
+            Some("no matches: needle"),
+            "a query with genuinely no matches anywhere must not claim any are hidden \
+             by folds — got {message:?}"
+        );
+    }
+
+    /// Unfolding must not just restore the match — it must clear the hidden
+    /// count too, or a stale "1 hidden" could linger after there is nothing
+    /// left hidden.
+    #[test]
+    fn test_unfolding_the_only_match_clears_the_hidden_by_folds_count() {
+        let source = "# One\n\nneedle here.\n\n# Two\n\nplain text.\n";
+        let (doc, config, engine, mut state) = build(source, 40, 20);
+        let ctx = ctx_for(&doc, &config, &engine);
+        search_for(&mut state, "needle");
+        let one = state.outline().entries[0].block;
+        state.jump_to_block(one);
+        toggle_fold(&mut state, &ctx);
+        assert_eq!(state.search().hidden_by_folds, 1);
+
+        toggle_fold(&mut state, &ctx); // unfold
+        assert_eq!(state.search().matches.len(), 1);
+        assert_eq!(
+            state.search().hidden_by_folds,
+            0,
+            "once the match is visible again, nothing should still be reported hidden"
+        );
+    }
+
+    /// Mid-severity note: `collapse_all` must union into the collapsed set,
+    /// not replace it — replacing reads the *current*, possibly-abbreviated
+    /// outline (a heading nested inside an already-folded range has no entry
+    /// in it), so a second `M` silently dropped every such fold. Same root
+    /// cause as DW-5.2's reload defect, caught here at the collapse-all path
+    /// instead.
+    #[test]
+    fn test_collapse_all_pressed_twice_does_not_drop_a_fold_nested_inside_the_first_pass() {
+        let source = "# A\n\nx body.\n\n## B\n\ny body.\n\n# C\n\nz body.\n";
+        let (doc, config, engine, mut state) = build(source, 40, 5);
+        let ctx = ctx_for(&doc, &config, &engine);
+
+        state.collapse_all();
+        state.relayout_preserving_anchor(&ctx, config);
+        assert_eq!(
+            state.folds().collapsed.len(),
+            3,
+            "test setup: A, B, and C folded"
+        );
+
+        // The current outline is now abbreviated (B has no entry, nested
+        // inside A's collapsed range) — exactly the condition that used to
+        // make a second collapse-all lose it.
+        state.collapse_all();
+        state.relayout_preserving_anchor(&ctx, config);
+        assert_eq!(
+            state.folds().collapsed.len(),
+            3,
+            "a second collapse-all must not drop a fold the current outline cannot see"
+        );
+
+        let a = state
+            .outline()
+            .entries
+            .iter()
+            .find(|e| e.text == "A")
+            .unwrap()
+            .block;
+        state.jump_to_block(a);
+        toggle_fold(&mut state, &ctx); // unfold A
+        let all: String = (0..state.tree().line_count())
+            .map(|i| line_text(&state, i))
+            .collect();
+        assert!(
+            all.contains('B') && all.contains("hidden") && !all.contains("y body"),
+            "B must still be folded underneath the now-open A: {all:?}"
+        );
+    }
+
+    /// Mid-severity note: `z` above the first heading of a document that
+    /// *has* headings must not claim it has none — `NO_HEADINGS` is false
+    /// there, and the reader has no way to tell "no headings exist" apart
+    /// from "none of them are above you yet".
+    #[test]
+    fn test_z_above_the_first_heading_reports_no_section_here_not_no_headings() {
+        let source = format!("preamble text.\n\n{}", fold_fixture(2));
+        let (doc, config, engine, mut state) = build(&source, 40, 20);
+        let ctx = ctx_for(&doc, &config, &engine);
+        assert_eq!(state.scroll(), 0);
+        assert!(
+            state.outline().index_at_or_before(0).is_none(),
+            "test setup: the cursor must start above every heading"
+        );
+
+        toggle_fold(&mut state, &ctx);
+
+        assert_eq!(
+            state.status().message.as_deref(),
+            Some(NO_SECTION_HERE),
+            "a document that has headings must not claim it has none"
         );
     }
 }

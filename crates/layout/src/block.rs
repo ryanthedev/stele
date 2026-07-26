@@ -153,7 +153,7 @@ impl<'a> Ctx<'a> {
         };
         let (level, title) = (*level, heading_text(children));
         let hidden = self.count_lines(&blocks[index..end]).saturating_sub(1);
-        let text = fold_marker_text(&title, hidden);
+        let text = fold_marker_text(self.engine, &title, hidden, self.content_width());
         let width = inline::cells(self.engine, &text);
         let run = Run {
             text,
@@ -529,9 +529,55 @@ fn alert_label(kind: AlertKind) -> (&'static str, AlertTone) {
 /// reaches the painter as the run's `Semantic::Heading(level)` style, which
 /// is where a level belongs; restating it in the text would be a second,
 /// driftable source of the same fact.
-fn fold_marker_text(title: &str, hidden: usize) -> String {
+///
+/// **Budgeted so the count survives being narrow, not the title.** Building
+/// `"{glyph} {title} ({count})"` and clipping the assembled string
+/// right-to-left (the naive approach, and the one this replaced) sacrifices
+/// whichever text is last — which for that order is always the count, the
+/// one piece of information a fold marker adds over the heading's own text.
+/// Measured against a real heading title, that lost the count at three of
+/// four ordinary layout widths (20/40/60 of `LayoutConfig::default()`'s
+/// 24-100 range), and at width 60 it truncated to the actively misleading
+/// `(6 h…` — a count that *looks* rendered with its unit eaten. So the
+/// suffix (glyph + count) is measured first and the title gets whatever
+/// width is left over, itself clipped with the usual `…` indicator via
+/// [`clipped_text`] — never the assembled whole.
+fn fold_marker_text(engine: &WidthEngine, title: &str, hidden: usize, width: u16) -> String {
+    const GLYPH: &str = "\u{25b8} "; // "▸ "
     let noun = if hidden == 1 { "line" } else { "lines" };
-    format!("\u{25b8} {title} ({hidden} hidden {noun})") // "▸ Title (N hidden lines)"
+    let suffix = format!(" ({hidden} hidden {noun})");
+    let glyph_w = inline::cells(engine, GLYPH);
+    let suffix_w = inline::cells(engine, &suffix);
+    // Room left for the title once the glyph and the count are paid for.
+    // Saturates to 0 at a width so narrow that even "glyph + count" alone
+    // does not fit; `emit_fold_marker`'s own `clip_runs` pass over the
+    // assembled result is the safety net for that pathological case
+    // (DW-5.6 still holds either way — it is only the count's survival that
+    // this function exists to protect).
+    let title_budget = width.saturating_sub(glyph_w).saturating_sub(suffix_w);
+    let clipped_title = clipped_text(engine, title, title_budget);
+    format!("{GLYPH}{clipped_title}{suffix}")
+}
+
+/// `text` clipped to `width` cells with the usual `…` overflow indicator
+/// when it does not fit whole — reusing [`inline::clip_runs`] rather than a
+/// second truncation loop, so grapheme-boundary correctness stays in one
+/// place. `width == 0` returns empty without asking `clip_runs` to do
+/// nothing the hard way.
+fn clipped_text(engine: &WidthEngine, text: &str, width: u16) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let run = Run {
+        text: text.to_string(),
+        style_id: StyleId::Semantic(Semantic::Text),
+        width: inline::cells(engine, text),
+        aux: None,
+    };
+    inline::clip_runs(vec![run], width, true, engine)
+        .into_iter()
+        .map(|r| r.text)
+        .collect()
 }
 
 /// A heading's text for the outline: its inline children flattened to plain

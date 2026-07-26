@@ -369,11 +369,15 @@ impl Session {
         let attempted_at = Instant::now();
         match self.source.load_with(self.options) {
             Ok(loaded) => {
+                // Kept alive one statement past the reassignment below: it is
+                // `AppState::reload_document`'s only way to see what fold
+                // state was keyed against (DW-5.2).
+                let old_doc = Rc::clone(&self.doc);
                 self.doc = Rc::clone(&loaded.doc);
                 self.loaded_at = attempted_at;
                 self.last_failure = None;
                 painter.reload_media(loaded.doc, out);
-                state.reload_document(&self.ctx(), loaded.info);
+                state.reload_document(&self.ctx(), loaded.info, Some(&old_doc));
                 true
             }
             Err(err) => {

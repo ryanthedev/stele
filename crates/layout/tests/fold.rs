@@ -263,3 +263,67 @@ fn test_dw_5_6_no_folded_or_unfolded_line_exceeds_the_layout_width() {
         }
     }
 }
+
+/// DW-5.1 regression: the hidden-line count must survive being narrowed, not
+/// be the first thing a right-to-left clip discards. Reproduces the review's
+/// own trace — `"Installing and configuring the development toolchain"` at
+/// widths 20/40/60/80 — where the count previously survived only 2 of 4, and
+/// at width 60 truncated to the actively misleading `"(6 h…"`.
+///
+/// A custom, wide-open `LayoutConfig` (rather than `LayoutConfig::default`,
+/// whose 24-cell floor would silently clamp the width-20 case up to 24) is
+/// what lets each width below actually apply.
+#[test]
+fn test_dw_5_1_the_hidden_count_survives_widths_that_previously_clipped_it() {
+    let title = "Installing and configuring the development toolchain";
+    let doc = Document::parse(&format!(
+        "# {title}\n\nOne paragraph.\n\nAnother paragraph.\n\nA third one.\n\n\
+         Yet a fourth.\n\nAnd a fifth.\n\nFinally a sixth.\n"
+    ));
+    let config = layout::LayoutConfig {
+        min_width: 1,
+        max_width: 200,
+    };
+    let eng = engine();
+    for width in [20u16, 24, 40, 60, 80] {
+        let baseline = layout(&doc, width, &config, &eng, &NullSizer);
+        let one_id = baseline.outline().entries[0].block;
+        let tree = layout_with_folds(&doc, width, &config, &eng, &NullSizer, &one_folded(one_id));
+        let marker = line_text(tree.lines(0..1).next().unwrap());
+
+        assert!(
+            marker.contains("hidden line)") || marker.contains("hidden lines)"),
+            "at width {width}: the count must be shown whole, not truncated mid-unit \
+             (the review found `\"(6 h…\"` at width 60): {marker:?}"
+        );
+        let measured = eng.display_width(&marker);
+        assert!(
+            measured <= tree.width() as usize,
+            "at width {width}: marker {marker:?} measures {measured} cells, wider than \
+             the {}-cell layout width",
+            tree.width()
+        );
+    }
+}
+
+/// The same regression, but for a title short enough to fit *and* the count
+/// — the "nothing to trade off" case, which must still show both in full.
+#[test]
+fn test_dw_5_1_a_short_title_shows_the_full_count_unclipped() {
+    let doc = Document::parse("# Getting started\n\nBody one.\n\nBody two.\n");
+    let width = 40;
+    let baseline = layout(
+        &doc,
+        width,
+        &layout::LayoutConfig::default(),
+        &engine(),
+        &NullSizer,
+    );
+    let one_id = baseline.outline().entries[0].block;
+    let tree = folded(&doc, width, &one_folded(one_id));
+    let marker = line_text(tree.lines(0..1).next().unwrap());
+    assert!(
+        marker.contains("Getting started") && marker.contains("hidden line"),
+        "a title that already fits must not lose the count either: {marker:?}"
+    );
+}
