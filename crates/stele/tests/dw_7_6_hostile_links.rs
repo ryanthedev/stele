@@ -69,3 +69,67 @@ fn test_dw_7_6_only_the_allowed_schemes_survive_a_mixed_batch() {
         "exactly the 4 allowlisted schemes must survive"
     );
 }
+
+/// DW-6.5, the *activation* half of the same corpus.
+///
+/// `highlight`'s barricade governs painting an OSC 8 hyperlink and allows
+/// four schemes; following a link spawns a process and allows two. So every
+/// hostile destination in the fixture must be refused by
+/// `stele::link::LinkTarget`, and — the part that matters — refused *before*
+/// anything is spawned, which is why the classification is checked directly
+/// rather than through a `Navigator` with a live opener behind it.
+#[test]
+fn test_dw_6_5_every_hostile_fixture_destination_is_refused_activation_without_a_process() {
+    use stele::link::{LinkError, LinkTarget};
+
+    let doc = Document::parse(FIXTURE);
+    let dests = link_destinations(&doc);
+    assert_eq!(dests.len(), 4, "fixture must carry exactly 4 links");
+
+    for dest in &dests {
+        let classified = LinkTarget::classify(dest);
+        if dest.starts_with("https://") {
+            assert!(
+                matches!(classified, Ok(LinkTarget::Url(_))),
+                "the safe link must still be followable: {dest:?}"
+            );
+            continue;
+        }
+        let err = classified.expect_err("a hostile scheme must not classify as followable");
+        assert!(
+            matches!(err, LinkError::UnsupportedScheme(_)),
+            "{dest:?} produced {err:?}"
+        );
+        assert!(
+            err.to_string().contains("http/https only"),
+            "the refusal must say why: {err}"
+        );
+    }
+}
+
+/// The two barricades are deliberately different widths, and that is easy to
+/// "tidy" into one. `file:` and `mailto:` may be *painted* as hyperlinks —
+/// the terminal decides what to do with a click on one — but stele must never
+/// hand either to a process itself.
+#[test]
+fn test_dw_6_3_the_activation_allowlist_is_tighter_than_the_display_allowlist() {
+    use stele::link::{LinkError, LinkTarget};
+
+    for url in ["file:///etc/passwd", "mailto:a@example.com"] {
+        assert!(
+            highlight::hyperlink_open(url).is_some(),
+            "{url} is still paintable as an OSC 8 hyperlink"
+        );
+        assert!(
+            matches!(
+                LinkTarget::classify(url),
+                Err(LinkError::UnsupportedScheme(_))
+            ),
+            "{url} must never be handed to the OS opener"
+        );
+    }
+    for url in ["http://example.com/x", "https://example.com/x"] {
+        assert!(highlight::hyperlink_open(url).is_some());
+        assert!(matches!(LinkTarget::classify(url), Ok(LinkTarget::Url(_))));
+    }
+}

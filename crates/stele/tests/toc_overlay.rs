@@ -95,6 +95,22 @@ impl Harness {
                     .frame_overlay(&rows, size, &status, &mut buf)
                     .expect("paint")
             }
+            // A document frame plus the link-selection indicator — the same
+            // branch `main.rs::paint` takes, kept here so this harness stays
+            // a faithful stand-in for the event loop.
+            Mode::LinkSelect { .. } => {
+                let selected = self.state.selection_spans();
+                self.painter
+                    .frame_with_selection(
+                        self.state.tree(),
+                        self.state.scroll(),
+                        size,
+                        &status,
+                        &selected,
+                        &mut buf,
+                    )
+                    .expect("paint")
+            }
         }
         self.term.apply(&buf)
     }

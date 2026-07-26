@@ -17,13 +17,16 @@ use crossterm::event::{self, Event, KeyEvent, KeyEventKind};
 use layout::{IntrinsicSizer, LayoutConfig, layout};
 use width::{WidthConfig, WidthEngine};
 
-use stele::app::{AppState, ChromeAction, LayoutContext, Mode, StatusMessage};
+use stele::app::{AppState, ChromeAction, LayoutContext, Mode, PendingAction, StatusMessage};
 use stele::cli::Cli;
 use stele::decor::themed::ThemedDecor;
+use stele::link::{Followed, Navigator, SystemOpener};
 use stele::loader::{DocumentSource, LoadOptions};
 use stele::media::{GfxMediaSink, ImageSizer, NoopMediaSink};
-use stele::painter::{Painter, Size};
-use stele::terminal::{CellQuery, PanicGuardedWriter, TerminalGuard, install_panic_hook};
+use stele::painter::{FrameOverlays, Painter, Size};
+use stele::terminal::{
+    CellQuery, PanicGuardedWriter, TerminalGuard, install_panic_hook, osc52_copy,
+};
 
 /// How long a resize burst is drained for before committing to one
 /// relayout — long enough to coalesce a storm of SIGWINCH-driven `Resize`
@@ -141,7 +144,7 @@ fn main() -> ExitCode {
     } else {
         CellQuery::Ask
     };
-    let guard = match TerminalGuard::enter(cell_query) {
+    let mut guard = match TerminalGuard::enter(cell_query) {
         Ok(guard) => guard,
         Err(err) => {
             eprintln!("stele: could not enter raw mode: {err}");
@@ -174,6 +177,9 @@ fn main() -> ExitCode {
         sizer,
         last_failure: None,
         last_tick: Instant::now(),
+        nav: Navigator::new(Box::new(SystemOpener), options),
+        graphics_disabled,
+        cell_px: geometry.cell_px,
     };
     let tree = {
         let ctx = session.ctx();
@@ -229,6 +235,7 @@ fn main() -> ExitCode {
         &mut state,
         &mut painter,
         &mut theme,
+        &mut guard,
         out.as_mut(),
     );
 
@@ -283,6 +290,16 @@ struct Session {
     /// When the watch tick last ran, on the monotonic clock. This is what
     /// makes DW-2.2's bound a bound — see [`Session::watch_tick_due`].
     last_tick: Instant,
+    /// Link activation and the `Backspace` history (Phase 6). It owns the
+    /// document stack and the OS opener; this loop owns installing whatever
+    /// comes back.
+    nav: Navigator,
+    /// Kept so a document opened by following a link can rebuild its sizer and
+    /// media sink at the *new* document's directory: both resolve relative
+    /// image paths, and a linked document in another folder would otherwise
+    /// look for its images beside the file the reader started from.
+    graphics_disabled: bool,
+    cell_px: (u32, u32),
 }
 
 impl Session {
@@ -366,6 +383,15 @@ impl Session {
         if !self.source.changed_since(self.loaded_at) {
             return false;
         }
+        // The type check before the open, for the reason
+        // `link::refuse_unless_regular_file` documents: this runs inside the
+        // event loop with the terminal in raw mode, where Ctrl-C is a
+        // keystroke rather than a signal, so a `File::open` that blocks on a
+        // FIFO leaves a viewer with no way out at all. A watched file
+        // replaced by one is all it takes.
+        if let Err(err) = stele::link::refuse_unless_regular_file(&self.source) {
+            return self.report_reload_failure(state, &err.to_string());
+        }
         let attempted_at = Instant::now();
         match self.source.load_with(self.options) {
             Ok(loaded) => {
@@ -380,15 +406,142 @@ impl Session {
                 state.reload_document(&self.ctx(), loaded.info, Some(&old_doc));
                 true
             }
-            Err(err) => {
-                let message = format!("reload failed: {err}");
-                if self.last_failure.as_deref() == Some(message.as_str()) {
-                    return false;
+            Err(err) => self.report_reload_failure(state, &err.to_string()),
+        }
+    }
+
+    /// Puts a reload failure on the status row, once. Returns whether the
+    /// caller must repaint.
+    ///
+    /// The de-duplication is the whole of it: a file that stays missing is
+    /// reported once rather than repainting the same sentence four times a
+    /// second. Factored out so the type-check refusal above and the load's
+    /// own error take the identical path — a second copy of this would be a
+    /// second place for that rule to drift.
+    fn report_reload_failure(&mut self, state: &mut AppState, reason: &str) -> bool {
+        let message = format!("reload failed: {reason}");
+        if self.last_failure.as_deref() == Some(message.as_str()) {
+            return false;
+        }
+        state.set_status(StatusMessage::new(message.clone()));
+        self.last_failure = Some(message);
+        true
+    }
+
+    /// Swaps a **different** document in: a link followed, or a `Backspace`
+    /// back to one. `scroll` is where to land — 0 for a new document, the
+    /// remembered offset on the way back (DW-6.2).
+    ///
+    /// Three things have to move together, and the order matters:
+    ///
+    /// 1. `reload_media` on the *old* sink first, so every raster the terminal
+    ///    is still holding for the old document is deleted while the sink that
+    ///    knows their ids is still the registered one.
+    /// 2. A fresh sizer and sink at the new document's own directory, because
+    ///    both resolve relative image paths and the reader may have hopped
+    ///    into another folder entirely.
+    /// 3. Only then the state swap, which lays out against the new sizer.
+    fn install_document(
+        &mut self,
+        state: &mut AppState,
+        painter: &mut Painter,
+        source: DocumentSource,
+        loaded: stele::loader::LoadedDocument,
+        scroll: usize,
+        out: &mut dyn Write,
+    ) {
+        painter.reload_media(Rc::clone(&loaded.doc), out);
+        let base_dir = source.base_dir();
+        if self.graphics_disabled {
+            self.sizer = Box::new(ImageSizer::disabled(&base_dir));
+            painter.register_media(Box::new(NoopMediaSink));
+        } else {
+            self.sizer = Box::new(ImageSizer::new(&base_dir).with_cell_px(self.cell_px));
+            painter.register_media(Box::new(
+                GfxMediaSink::new(Rc::clone(&loaded.doc), &base_dir).with_cell_px(self.cell_px),
+            ));
+        }
+        self.source = source;
+        self.doc = Rc::clone(&loaded.doc);
+        self.loaded_at = Instant::now();
+        self.last_failure = None;
+        state.open_document(&self.ctx(), loaded.info, scroll);
+    }
+}
+
+/// Carries out the one thing `AppState` decided but deliberately cannot do
+/// itself — touch the filesystem, spawn the OS opener, or write to the
+/// terminal outside a frame. Returns whether the screen must be repainted.
+///
+/// This is the whole of the interaction layer's contact with the OS, in one
+/// function, which is what makes the rest of it testable without one.
+fn perform_action(
+    action: PendingAction,
+    session: &mut Session,
+    state: &mut AppState,
+    painter: &mut Painter,
+    guard: &mut TerminalGuard,
+    out: &mut dyn Write,
+) -> bool {
+    match action {
+        PendingAction::OpenLink(href) => {
+            let current = session.source.clone();
+            match session.nav.follow(&href, &current, state.scroll()) {
+                Ok(Followed::Opened { source, loaded }) => {
+                    session.install_document(state, painter, source, loaded, 0, out);
                 }
-                state.set_status(StatusMessage::new(message.clone()));
-                self.last_failure = Some(message);
+                Ok(Followed::Handed) => {
+                    // The opener is a detached child; there is nothing to wait
+                    // for and no window to observe. Saying so is the only
+                    // feedback the reader gets that the keystroke landed.
+                    state.set_status(StatusMessage::new(format!("opened {href} externally")));
+                }
+                Err(err) => state.set_status(StatusMessage::new(err.to_string())),
+            }
+            true
+        }
+        PendingAction::Back => match session.nav.back() {
+            Ok((source, loaded, scroll)) => {
+                session.install_document(state, painter, source, loaded, scroll, out);
                 true
             }
+            Err(err) => {
+                state.set_status(StatusMessage::new(err.to_string()));
+                true
+            }
+        },
+        PendingAction::CopyCodeBlock => {
+            let doc = Rc::clone(&session.doc);
+            let Some(text) = state.code_block_in_view(&doc) else {
+                // `code_block_in_view` has already put the reason on the row.
+                return true;
+            };
+            let bytes = text.len();
+            match osc52_copy(&text) {
+                Some(sequence) => {
+                    // Written straight through the frame writer, inside no
+                    // frame: OSC 52 paints nothing, and holding it until the
+                    // next synchronized-update block would tie the clipboard
+                    // to a repaint that may not come.
+                    let wrote = out
+                        .write_all(sequence.as_bytes())
+                        .and_then(|()| out.flush());
+                    state.set_status(StatusMessage::new(match wrote {
+                        Ok(()) => format!("copied {bytes} bytes to the clipboard"),
+                        Err(err) => format!("clipboard write failed: {err}"),
+                    }));
+                }
+                None => state.set_status(StatusMessage::new(
+                    "code block is too large for an OSC 52 clipboard write",
+                )),
+            }
+            true
+        }
+        PendingAction::SetMouseCapture(on) => {
+            if let Err(err) = guard.set_mouse_capture(on) {
+                state.set_status(StatusMessage::new(format!("mouse capture failed: {err}")));
+            }
+            true
         }
     }
 }
@@ -401,6 +554,7 @@ fn run_session(
     state: &mut AppState,
     painter: &mut Painter,
     theme: &mut ThemeState,
+    guard: &mut TerminalGuard,
     out: &mut dyn Write,
 ) -> io::Result<()> {
     paint(state, painter, out)?;
@@ -484,12 +638,27 @@ fn run_session(
                     }
                     repaint = true;
                 }
-                // Anything else (focus, mouse, paste) changes nothing on
-                // screen, so it does not earn a frame — but it must still fall
-                // through to the watch tick below rather than `continue`, or a
-                // stream of them would starve the reload just as keys did.
+                // Mouse reports (DW-6.6): the wheel scrolls, a left click
+                // activates the link under it, and everything else is inert.
+                // `handle_mouse_event` says whether anything changed, so a
+                // click on empty text does not cost a repaint.
+                Event::Mouse(mouse) => {
+                    repaint = state.handle_mouse_event(mouse, &session.engine);
+                }
+                // Anything else (focus, paste) changes nothing on screen, so
+                // it does not earn a frame — but it must still fall through to
+                // the watch tick below rather than `continue`, or a stream of
+                // them would starve the reload just as keys did.
                 _ => {}
             }
+        }
+
+        // Whatever the event decided, it may have left one thing for the OS.
+        // Drained here — once, after the event branch and before the watch
+        // tick — so a link that swaps the document does so between frames
+        // rather than underneath one.
+        if let Some(action) = state.take_action() {
+            repaint |= perform_action(action, session, state, painter, guard, out);
         }
 
         // Independent of what the event branch did, and of whether it ran at
@@ -520,17 +689,35 @@ fn run_session(
 fn paint(state: &mut AppState, painter: &mut Painter, out: &mut dyn Write) -> io::Result<()> {
     let status = state.status();
     match state.mode() {
-        Mode::Normal | Mode::Search { .. } => painter.frame_with_search(
-            state.tree(),
-            state.scroll(),
-            state.size(),
-            &status,
-            state.search_overlay(),
-            out,
-        ),
+        // The TOC is the one mode that paints something other than the
+        // document: a full-screen list, over the whole content viewport.
         Mode::Toc { .. } => {
             let rows = state.toc_rows(state.size().height);
             painter.frame_overlay(&rows, state.size(), &status, out)
+        }
+        // Every other mode is the document with zero, one, or both overlays
+        // on it, so all three go through **one** call rather than a wrapper
+        // each. That matters and is not tidiness: search state outlives
+        // `Mode::Search` on purpose (`n`/`N` traverse from normal mode), so a
+        // reader who searches and then presses `Tab` is in `LinkSelect` *with
+        // matches to highlight*. A per-mode wrapper would have silently
+        // dropped one overlay or the other depending on which mode won the
+        // match — and the mode that wins is the one the reader is not
+        // thinking about.
+        Mode::Normal | Mode::Search { .. } | Mode::LinkSelect { .. } => {
+            let selected = state.selection_spans();
+            let overlays = FrameOverlays {
+                search: state.search_overlay(),
+                selected: &selected,
+            };
+            painter.frame_with_overlays(
+                state.tree(),
+                state.scroll(),
+                state.size(),
+                &status,
+                overlays,
+                out,
+            )
         }
     }
 }

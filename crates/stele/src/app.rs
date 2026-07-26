@@ -7,15 +7,15 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
 
-use ast::{Document, NodeId};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ast::{BlockKind, Document, NodeId, NodeRef};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use layout::{
-    FoldState, IntrinsicSizer, LayoutConfig, LayoutTree, Line, LineItem, Outline, layout,
-    layout_with_folds,
+    FoldState, IntrinsicSizer, LayoutConfig, LayoutTree, Line, LineItem, Outline, Run, Semantic,
+    StyleId, layout, layout_with_folds,
 };
 use width::WidthEngine;
 
-use crate::painter::{SearchOverlay, Size};
+use crate::painter::{SearchOverlay, Size, item_columns};
 
 /// Mixed into [`AppState::fingerprint`] between lines so two blocks whose runs
 /// concatenate to the same bytes but break differently cannot hash alike.
@@ -233,6 +233,16 @@ pub enum Mode {
     /// It rides on the variant rather than on [`AppState`] so the datum
     /// cannot outlive the mode that gives it meaning.
     Search { origin: usize },
+    /// Cycling the links visible in the viewport (DW-6.1), with `index`
+    /// indexing [`AppState::visible_links`].
+    ///
+    /// The index is deliberately *not* accompanied by a cached link list.
+    /// Links are recomputed from `(tree, scroll)` every time they are asked
+    /// for, so neither a `--watch` reload nor a resize can leave this mode
+    /// addressing a link in a tree that no longer exists — the worst either
+    /// can do is index past the end, which [`AppState::reseat_link_select`]
+    /// clamps on the same relayout hook [`AppState::reseat_search`] uses.
+    LinkSelect { index: usize },
 }
 
 impl Mode {
@@ -275,8 +285,67 @@ impl Mode {
             // Every printable key is a character of the query (DW-4.1); the
             // rest edit it or end it.
             Mode::Search { .. } => true,
+            // `Tab`/`Shift-Tab`/`Enter`/`Esc` are the mode's own, and the
+            // rest are deliberately ignored (DW-6.1). `+`/`-`/`T` are inert
+            // for a reason narrower than the TOC's: a relayout rewraps every
+            // line, which is what `Mode::LinkSelect { index }` indexes into.
+            // The reader would see the indicator jump to a different link on
+            // a keystroke that was never about links.
+            Mode::LinkSelect { .. } => true,
         }
     }
+}
+
+/// One contiguous range of runs, on one line, that paints part of a link.
+///
+/// A link is several runs whenever its text carries a style change or crosses
+/// a wrap boundary, so a span is a *range* of item indices and a link is a
+/// list of spans. The painter needs exactly this to draw the selection
+/// indicator, and the mouse hit-test needs exactly this to answer "is there a
+/// link under this cell".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinkSpan {
+    /// Absolute line index in the layout tree, not a viewport row.
+    pub line: usize,
+    /// Index of the first [`LineItem`] of this span on that line.
+    pub first_item: usize,
+    /// Index of the last, inclusive.
+    pub last_item: usize,
+}
+
+/// One link the reader can currently see and select.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VisibleLink {
+    /// The raw destination as written in the document — untrusted, and not
+    /// validated here. `crate::link` is the barricade; this is enumeration.
+    pub target: String,
+    /// The link's visible text, for the status row.
+    pub text: String,
+    /// Every run range this link paints into, in viewport order.
+    pub spans: Vec<LinkSpan>,
+}
+
+/// Something the key/mouse tables decided to do that needs resources
+/// [`AppState`] deliberately does not have: the filesystem, a child process,
+/// or the terminal.
+///
+/// The event loop drains exactly one of these after every event via
+/// [`AppState::take_action`]. It is the same "return the decision as a value"
+/// shape [`ChromeAction`] uses, and for the same reason Phase 4 gives there:
+/// a decision that lives in `main.rs` lives in the one file no test can
+/// reach. Here it additionally keeps `std::process` and `std::fs` out of this
+/// module entirely, so the whole interaction layer is drivable from a unit
+/// test with no terminal, no document on disk, and no browser opening.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingAction {
+    /// Follow this raw, unvalidated destination (DW-6.1, DW-6.6).
+    OpenLink(String),
+    /// `Backspace`: return to the previous document (DW-6.2).
+    Back,
+    /// `y`: copy the code block in view to the clipboard (DW-6.7).
+    CopyCodeBlock,
+    /// `m`: turn mouse capture on or off (DW-6.6).
+    SetMouseCapture(bool),
 }
 /// One row of the rendered TOC overlay: the text to paint and whether it is
 /// the selected entry.
@@ -337,6 +406,18 @@ pub enum ChromeAction {
     CollapseAllFolds,
 }
 
+/// What the status row says when `Tab` has nothing to select, or when a
+/// reload leaves an open selection with nothing under it (DW-6.1).
+const NO_LINKS: &str = "no links in view";
+
+/// What `y` says when the viewport holds no code block (DW-6.7).
+const NO_CODE_BLOCK: &str = "no code block in view";
+
+/// Lines one wheel notch scrolls (DW-6.6). Three is the conventional
+/// terminal/pager step: one line is imperceptible against the effort of
+/// turning the wheel, a full page overshoots what the reader was tracking.
+const WHEEL_LINES: isize = 3;
+
 /// The viewer's mutable state: the current layout tree, scroll offset, and
 /// viewport size. Navigation and resize are pure state transitions, driven
 /// directly from tests without a real terminal or timers.
@@ -380,6 +461,14 @@ pub struct AppState {
     /// a resize, an unfold, `expand_all`, `collapse_all`), all of which are
     /// well served by the ordinary anchor.
     pending_fold_snap: Option<NodeId>,
+    /// The one action the event loop still owes the OS, drained by
+    /// [`AppState::take_action`]. At most one is outstanding: every producer
+    /// is a single key or click, and the loop drains after each.
+    action: Option<PendingAction>,
+    /// Whether mouse reporting is on (DW-6.6). Mirrored rather than owned —
+    /// the terminal holds the real state — so `m` can report which way it
+    /// went without the event loop having to tell this type back.
+    mouse_capture: bool,
 }
 
 impl AppState {
@@ -405,6 +494,8 @@ impl AppState {
             search: SearchState::default(),
             folds: FoldState::default(),
             pending_fold_snap: None,
+            action: None,
+            mouse_capture: true,
         }
     }
 
@@ -426,6 +517,16 @@ impl AppState {
     }
 
     /// Which sections are currently folded (Phase 5).
+    /// Test-only: fold one named section directly. The shipped API offers
+    /// `toggle_fold` (which picks the heading at or above the cursor),
+    /// `expand_all` and `collapse_all`; a test that needs *this* heading
+    /// folded and no other would otherwise have to drive the cursor there
+    /// first, which is a different thing to be testing.
+    #[cfg(test)]
+    fn folds_mut_for_test(&mut self) -> &mut FoldState {
+        &mut self.folds
+    }
+
     pub fn folds(&self) -> &FoldState {
         &self.folds
     }
@@ -570,8 +671,13 @@ impl AppState {
             // The TOC paints this same row (see `main.rs::paint`), and a
             // transient message has to keep ageing while the overlay is up or
             // a `Ctrl-G` set just before `t` would hang on screen for as long
-            // as the reader browsed.
-            Mode::Normal | Mode::Toc { .. } => self.take_transient_message(),
+            // as the reader browsed. Link selection is the same channel by
+            // design: `announce_selection` sets an ordinary transient message
+            // naming the destination, so it ages, and a reader who leaves the
+            // indicator up while reading is not stuck looking at a URL.
+            Mode::Normal | Mode::Toc { .. } | Mode::LinkSelect { .. } => {
+                self.take_transient_message()
+            }
         };
         StatusLine {
             position_pct: self.position_pct(),
@@ -1012,6 +1118,414 @@ impl AppState {
         start..end
     }
 
+    /// Every link the reader can currently see, in viewport order (DW-6.1).
+    ///
+    /// Recomputed from `(tree, scroll)` on every call rather than cached. That
+    /// costs a walk of at most one viewport's worth of lines — the same walk
+    /// the painter does every frame — and buys the property that no stored
+    /// index can ever address a link in a document that has been replaced
+    /// underneath it by a `--watch` reload.
+    ///
+    /// **Consecutive runs are one link.** A link whose text carries a style
+    /// change (`[**bold** rest](x)`) becomes several runs sharing one `aux`,
+    /// and a link that crosses a wrap boundary continues on the next line. Both
+    /// are merged here, so `Tab` counts links as a reader counts them rather
+    /// than counting runs. The continuation rule is "same destination, on the
+    /// immediately following line"; two *different* links to the same URL on
+    /// adjacent lines therefore merge into one entry, which is a cosmetic
+    /// mis-count and never a mis-navigation — both halves open the same place.
+    pub fn visible_links(&self) -> Vec<VisibleLink> {
+        let height = usize::from(self.size.height);
+        let last = self
+            .scroll
+            .saturating_add(height)
+            .min(self.tree.line_count());
+        let mut links: Vec<VisibleLink> = Vec::new();
+        for line_index in self.scroll..last {
+            let Some(Line::Items(items)) = self.tree.lines(line_index..line_index + 1).next()
+            else {
+                continue;
+            };
+            for (target, text, span) in link_groups(items, line_index) {
+                let continues = links.last().is_some_and(|link| {
+                    link.target == target
+                        && link
+                            .spans
+                            .last()
+                            .is_some_and(|last| last.line + 1 == span.line)
+                });
+                match links.last_mut() {
+                    Some(link) if continues => {
+                        // The wrap point ate a space; put one back so the
+                        // status row reads as one label rather than as two
+                        // words jammed together.
+                        link.text.push(' ');
+                        link.text.push_str(&text);
+                        link.spans.push(span);
+                    }
+                    Some(_) | None => links.push(VisibleLink {
+                        target,
+                        text,
+                        spans: vec![span],
+                    }),
+                }
+            }
+        }
+        links
+    }
+
+    /// The link [`Mode::LinkSelect`] is currently on, or `None` in any other
+    /// mode (and when the index no longer addresses a link, which a reload can
+    /// cause between a keystroke and the frame that follows it).
+    pub fn selected_link(&self) -> Option<VisibleLink> {
+        let Mode::LinkSelect { index } = self.mode else {
+            return None;
+        };
+        self.visible_links().into_iter().nth(index)
+    }
+
+    /// The run ranges the painter must show as selected — empty in every mode
+    /// but [`Mode::LinkSelect`].
+    pub fn selection_spans(&self) -> Vec<LinkSpan> {
+        self.selected_link()
+            .map_or_else(Vec::new, |link| link.spans)
+    }
+
+    /// `Tab` / `Shift-Tab` from [`Mode::Normal`] (DW-6.1): enter link
+    /// selection on the first (or last) visible link, or report that there is
+    /// none rather than entering a mode with nothing in it.
+    fn enter_link_select(&mut self, forward: bool) {
+        let count = self.visible_links().len();
+        if count == 0 {
+            self.set_status(StatusMessage::new(NO_LINKS));
+            return;
+        }
+        self.mode = Mode::LinkSelect {
+            index: if forward { 0 } else { count - 1 },
+        };
+        self.announce_selection();
+    }
+
+    /// `Tab` / `Shift-Tab` inside [`Mode::LinkSelect`]: the next or previous
+    /// link, wrapping at both ends.
+    ///
+    /// Wrapping, unlike `]]`/`[[`'s clamp, because the set being cycled is
+    /// what is *on the screen right now*: a reader tabbing past the last link
+    /// has not asked to keep going in a direction, they have asked for the
+    /// next one of a handful they can see.
+    fn cycle_link(&mut self, index: usize, forward: bool) {
+        let count = self.visible_links().len();
+        if count == 0 {
+            self.mode = Mode::Normal;
+            self.set_status(StatusMessage::new(NO_LINKS));
+            return;
+        }
+        let index = index.min(count - 1);
+        let next = if forward {
+            (index + 1) % count
+        } else {
+            (index + count - 1) % count
+        };
+        self.mode = Mode::LinkSelect { index: next };
+        self.announce_selection();
+    }
+
+    /// Puts the selected link's destination on the status row. The reverse
+    /// video indicator says *which* link is selected; this says where it goes,
+    /// which is the part a reader wants before pressing `Enter` on a document
+    /// they did not write.
+    fn announce_selection(&mut self) {
+        if let Some(link) = self.selected_link() {
+            let (index, count) = match self.mode {
+                Mode::LinkSelect { index } => (index + 1, self.visible_links().len()),
+                // Unreachable — `selected_link` already returned `None` in
+                // every other mode. Named rather than wildcarded so a new
+                // mode has to be considered here too.
+                Mode::Normal | Mode::Toc { .. } | Mode::Search { .. } => return,
+            };
+            self.set_status(StatusMessage::new(format!(
+                "link {index}/{count}: {}",
+                link.target
+            )));
+        }
+    }
+
+    /// `Enter` in [`Mode::LinkSelect`] (DW-6.1): hand the selected
+    /// destination to the event loop and drop back to reading.
+    ///
+    /// The mode is left *before* the action is queued, so however the follow
+    /// turns out — a new document, a browser, or a refusal on the status row —
+    /// the reader is looking at a document rather than at a selection whose
+    /// index may no longer mean anything.
+    fn activate_selection(&mut self) {
+        let selected = self.selected_link();
+        self.mode = Mode::Normal;
+        match selected {
+            Some(link) => self.action = Some(PendingAction::OpenLink(link.target)),
+            None => self.set_status(StatusMessage::new(NO_LINKS)),
+        }
+    }
+
+    /// Takes the one action the event loop still owes the OS, if any.
+    pub fn take_action(&mut self) -> Option<PendingAction> {
+        self.action.take()
+    }
+
+    /// Whether mouse reporting is currently on (DW-6.6).
+    pub fn mouse_capture(&self) -> bool {
+        self.mouse_capture
+    }
+
+    /// `m` (DW-6.6): flips mouse capture and says which way it went.
+    ///
+    /// The message is not decoration. Turning capture off gives the terminal
+    /// its own click-drag text selection back, and turning it on takes it
+    /// away — an effect with no visible sign until the reader tries to select
+    /// something and it does the other thing.
+    fn toggle_mouse_capture(&mut self) {
+        self.mouse_capture = !self.mouse_capture;
+        self.action = Some(PendingAction::SetMouseCapture(self.mouse_capture));
+        self.set_status(StatusMessage::new(if self.mouse_capture {
+            "mouse capture on — terminal text selection is disabled"
+        } else {
+            "mouse capture off — terminal text selection is back"
+        }));
+    }
+
+    /// Applies one mouse report (DW-6.6). Returns whether the frame changed.
+    ///
+    /// `engine` is needed because a click is answered in *columns*, and a
+    /// column is a measurement: the painter clips each run through the width
+    /// engine, so a hit-test that summed laid-out run widths instead would
+    /// disagree with the screen the moment a run was clipped or carried a
+    /// double-width cluster.
+    pub fn handle_mouse_event(&mut self, event: MouseEvent, engine: &WidthEngine) -> bool {
+        match event.kind {
+            MouseEventKind::ScrollDown => {
+                self.leave_link_select();
+                self.scroll_by(WHEEL_LINES);
+                true
+            }
+            MouseEventKind::ScrollUp => {
+                self.leave_link_select();
+                self.scroll_by(-WHEEL_LINES);
+                true
+            }
+            MouseEventKind::Down(MouseButton::Left) => self.click(event.column, event.row, engine),
+            // Everything else — right/middle buttons, drags, releases,
+            // horizontal scroll, bare motion — is not a binding. Enumerated
+            // rather than wildcarded so a crossterm that grows a variant is a
+            // compile error here instead of a silently ignored gesture.
+            MouseEventKind::Down(MouseButton::Right | MouseButton::Middle)
+            | MouseEventKind::Up(_)
+            | MouseEventKind::Drag(_)
+            | MouseEventKind::Moved
+            | MouseEventKind::ScrollLeft
+            | MouseEventKind::ScrollRight => false,
+        }
+    }
+
+    /// A left click at a 0-indexed `(column, row)` of the *content* viewport:
+    /// activate the link under it, or do nothing at all (DW-6.6).
+    fn click(&mut self, column: u16, row: u16, engine: &WidthEngine) -> bool {
+        if row >= self.size.height {
+            // The reserved status row. Nothing there is clickable.
+            return false;
+        }
+        let line = self.scroll.saturating_add(usize::from(row));
+        let Some(target) = self.link_at(line, column, engine) else {
+            return false;
+        };
+        self.mode = Mode::Normal;
+        self.action = Some(PendingAction::OpenLink(target));
+        true
+    }
+
+    /// The destination of the link painted at `(line, column)`, if any.
+    fn link_at(&self, line: usize, column: u16, engine: &WidthEngine) -> Option<String> {
+        if line >= self.tree.line_count() {
+            return None;
+        }
+        let Some(Line::Items(items)) = self.tree.lines(line..line + 1).next() else {
+            return None;
+        };
+        let columns = item_columns(items, engine, self.size.width);
+        self.visible_links().into_iter().find_map(|link| {
+            let hit = link
+                .spans
+                .iter()
+                .filter(|span| span.line == line)
+                .any(|span| {
+                    (span.first_item..=span.last_item)
+                        .filter_map(|item| columns.get(item))
+                        .any(|&(start, end)| column >= start && column < end)
+                });
+            hit.then_some(link.target)
+        })
+    }
+
+    /// Drops out of [`Mode::LinkSelect`] without activating anything — used by
+    /// the wheel, whose scroll changes which links are visible and therefore
+    /// what any stored index would mean.
+    fn leave_link_select(&mut self) {
+        if matches!(self.mode, Mode::LinkSelect { .. }) {
+            self.mode = Mode::Normal;
+        }
+    }
+
+    /// `y` (DW-6.7): the text of the code block the reader is looking at, for
+    /// the event loop to put on the clipboard.
+    ///
+    /// "The block in view" is the first code block any viewport line belongs
+    /// to. The text is the AST's own `literal`, **not** the painted lines:
+    /// layout clips a long code line and marks the clip with `…`, so copying
+    /// what is on screen would put a truncated command on the clipboard that
+    /// looks complete.
+    ///
+    /// The search descends into the top-level block, so a fence inside a list
+    /// item or a blockquote is found too — `line_blocks` only ever names the
+    /// top-level block a line belongs to.
+    pub fn code_block_in_view(&mut self, doc: &Document) -> Option<String> {
+        let height = usize::from(self.size.height);
+        let last = self
+            .scroll
+            .saturating_add(height)
+            .min(self.tree.line_count());
+        let found = (self.scroll..last)
+            .filter_map(|line| self.tree.block_at(line))
+            .filter_map(|block| doc.node(block))
+            .find_map(first_code_literal);
+        if found.is_none() {
+            self.set_status(StatusMessage::new(NO_CODE_BLOCK));
+        }
+        found
+    }
+
+    /// Installs a **different** document — a link followed, or a `Backspace`
+    /// back to one — at `scroll`.
+    ///
+    /// Not [`AppState::reload_document`]: that one re-anchors the reader by
+    /// content because the new tree is a new version of the *same* document.
+    /// Here it is a different document entirely, so there is no place to
+    /// preserve; the caller says where to land (0 for a link followed, the
+    /// remembered offset for a `Backspace`). The reader's chosen
+    /// [`AppState::content_width`] is carried across, because it is a
+    /// preference about the terminal rather than a fact about the document.
+    pub fn open_document(&mut self, ctx: &LayoutContext, file_info: FileInfo, scroll: usize) {
+        let width = self
+            .content_width
+            .clamp(ctx.config.min_width, ctx.config.max_width);
+        // Folds are dropped **before** the layout that installs the new tree,
+        // and this ordering is the whole of it (Phase 5 × DW-6.2).
+        //
+        // `FoldState::collapsed` is a set of `NodeId`s, and a `NodeId` is a
+        // dense positional index into *one* document — `ast::Document::node`
+        // says so, and `reseat_folds` exists because a reload invalidates
+        // them. Following a link replaces the document outright, so every id
+        // in the set is not merely stale but *silently valid*: `NodeId(7)`
+        // names some block in the new document too, and `layout_with_folds`
+        // would collapse whatever section that turned out to head. The reader
+        // would open a document they have never folded and find a section of
+        // it already collapsed, keyed to a heading in a different file.
+        //
+        // So fold state is **per-document and does not travel the stack**:
+        // it is cleared on the way in and, because `Backspace` comes back
+        // through this same method, cleared on the way back too. Preserving
+        // it across the stack would mean stashing a `FoldState` per
+        // `StackedDocument` and re-keying it by content the way
+        // `reseat_folds` does for a reload — a real feature with real
+        // machinery, not a line of this one. The cost is stated rather than
+        // hidden: fold a section, follow a link, come back, and the section
+        // is open again.
+        self.folds = FoldState::default();
+        // Armed by `toggle_fold` for the *next* relayout of the tree it was
+        // computed against. That tree is being replaced right here, so the
+        // snap would land on a `NodeId` in a document that never armed it.
+        self.pending_fold_snap = None;
+        self.tree = layout_with_folds(
+            ctx.doc,
+            width,
+            ctx.config,
+            ctx.engine,
+            ctx.sizer,
+            &self.folds,
+        );
+        self.content_width = self.tree.width();
+        self.file_info = file_info;
+        self.mode = Mode::Normal;
+        self.pending = None;
+        self.clear_status();
+        self.document_changed = false;
+        self.set_scroll(scroll);
+        self.toc_return_scroll = self.scroll;
+        // The search belongs to the document it was typed against, and this
+        // is a different document — so it is dropped, not carried across.
+        //
+        // Not a preference. `SearchState::matches` addresses text by tree
+        // line index and by a byte range into that line's laid-out text
+        // (Phase 4's `Match`), and `open_document` has just replaced the
+        // tree wholesale. Carrying the vector over would have the painter
+        // highlight whatever bytes now sit at those coordinates and `n`/`N`
+        // jump to lines that mean something else — the same staleness
+        // `reseat_search` and `recompute_matches` exist to prevent on the
+        // reload path, arriving through a door they do not cover, because
+        // following a link does not go through `relayout` at all.
+        //
+        // Recomputing against the new tree instead would be safe too, and is
+        // rejected on behaviour rather than on safety: a reader who follows a
+        // link would land on a document they have never searched, already
+        // covered in highlights for a query they typed somewhere else. `n`
+        // would then traverse matches they never asked for. Dropping it is
+        // what a browser's find-in-page does on navigation, and it is what
+        // leaves nothing addressing a tree that no longer exists.
+        //
+        // Assigning the whole `SearchState` rather than clearing its fields
+        // is deliberate: Phase 5's fix-forward added `hidden_by_folds`, a
+        // count derived from a fold-free relayout of the *previous* document,
+        // and a field-by-field clear is exactly where a new field gets
+        // forgotten. `Default` cannot forget one.
+        self.search = SearchState::default();
+    }
+
+    /// Puts [`Mode::LinkSelect`] back on a link that exists in the tree
+    /// installed now.
+    ///
+    /// Called from [`AppState::relayout`] beside [`AppState::reseat_search`],
+    /// which is the one place every tree replacement passes through: a
+    /// `--watch` reload, a resize that rewraps the lines the index was
+    /// computed from, and — since Phase 5 — a fold that removes whole
+    /// sections of them. A tree with no visible links dismisses the mode
+    /// rather than leaving an indicator on a link that is not there.
+    ///
+    /// **Unconditional, unlike [`AppState::reseat_search`], and that
+    /// difference is the point.** `reseat_search` guards on `reflowed`
+    /// because it *overwrites* `Mode::Search { origin }` with the current
+    /// scroll, so running it when nothing changed would throw away a good
+    /// answer. There is nothing here to throw away: the link list is
+    /// recomputed from `(tree, scroll)` on every call and never cached, so
+    /// this is a pure clamp of an index against freshly computed truth — a
+    /// no-op precisely when the tree did not change.
+    ///
+    /// Guarding on `reflowed` would also have been *wrong* after Phase 5.
+    /// `reflowed` means "the width changed or the document was replaced", and
+    /// a fold is neither: it relays out at the same width on the same
+    /// document and removes lines. The guard would have skipped exactly the
+    /// case that changes which links exist.
+    fn reseat_link_select(&mut self) {
+        let Mode::LinkSelect { index } = self.mode else {
+            return;
+        };
+        let count = self.visible_links().len();
+        if count == 0 {
+            self.mode = Mode::Normal;
+            self.set_status(StatusMessage::new(NO_LINKS));
+            return;
+        }
+        self.mode = Mode::LinkSelect {
+            index: index.min(count - 1),
+        };
+    }
+
     /// Applies one key press *with its modifiers*. Returns `true` when the
     /// key requests quit. This is the event loop's entry point.
     ///
@@ -1022,8 +1536,37 @@ impl AppState {
         match self.mode {
             Mode::Toc { selected } => self.handle_toc_key(key, selected),
             Mode::Search { .. } => self.handle_search_key(key),
+            Mode::LinkSelect { index } => self.handle_link_select_key(key, index),
             Mode::Normal => self.handle_normal_key(key),
         }
+    }
+
+    /// The link-selection key table (DW-6.1). `index` is the mode's own field,
+    /// passed in for the reason [`AppState::handle_toc_key`]'s `selected` is.
+    ///
+    /// The two quit keys are repeated here for the reason the TOC repeats
+    /// them: a mode that swallows `q` and Ctrl-C leaves a reader with no way
+    /// out they would think to try.
+    fn handle_link_select_key(&mut self, key: KeyEvent, index: usize) -> bool {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        match key.code {
+            KeyCode::Char('q') => return true,
+            KeyCode::Char('c') if ctrl => return true,
+            KeyCode::Esc => {
+                self.mode = Mode::Normal;
+                self.clear_status();
+            }
+            // `BackTab` is what crossterm reports for Shift-Tab on the
+            // terminals that send CSI Z; the `Tab`-with-SHIFT form covers the
+            // ones that report the modifier instead.
+            KeyCode::BackTab => self.cycle_link(index, false),
+            KeyCode::Tab if shift => self.cycle_link(index, false),
+            KeyCode::Tab => self.cycle_link(index, true),
+            KeyCode::Enter => self.activate_selection(),
+            _ => {}
+        }
+        false
     }
 
     /// The document-reading key table.
@@ -1051,6 +1594,30 @@ impl AppState {
                 }
                 KeyCode::Char('t') => {
                     self.open_toc();
+                    return false;
+                }
+                // Phase 6's Normal-mode bindings. Inside the
+                // `!CONTROL` guard with `t` and the brackets, so `Ctrl-y`
+                // and `Ctrl-m` (which a terminal reports as `Enter`) cannot
+                // reach them by the chord table's fallthrough.
+                KeyCode::Tab => {
+                    self.enter_link_select(true);
+                    return false;
+                }
+                KeyCode::BackTab => {
+                    self.enter_link_select(false);
+                    return false;
+                }
+                KeyCode::Backspace => {
+                    self.action = Some(PendingAction::Back);
+                    return false;
+                }
+                KeyCode::Char('y') => {
+                    self.action = Some(PendingAction::CopyCodeBlock);
+                    return false;
+                }
+                KeyCode::Char('m') => {
+                    self.toggle_mouse_capture();
                     return false;
                 }
                 _ => {}
@@ -1205,7 +1772,7 @@ impl AppState {
             // compiler's price for the exhaustiveness that makes a new mode a
             // compile error everywhere. "Wherever the reader is" is the
             // honest answer for a caller that arrived without an origin.
-            Mode::Normal | Mode::Toc { .. } => self.scroll,
+            Mode::Normal | Mode::Toc { .. } | Mode::LinkSelect { .. } => self.scroll,
         };
         self.search.matches = find_matches(&self.tree, &self.search);
         self.search.current = first_match_at_or_after(&self.search.matches, origin);
@@ -1413,6 +1980,7 @@ impl AppState {
             .unwrap_or(target);
         self.set_scroll(target);
         self.reseat_search(reflowed);
+        self.reseat_link_select();
         self.recompute_matches(ctx);
     }
 
@@ -1935,6 +2503,114 @@ pub(crate) fn line_text_len(tree: &LayoutTree, index: usize) -> usize {
             LineItem::Box(_) => None,
         })
         .sum()
+}
+
+/// The destination a run paints part of, if it paints part of a link.
+///
+/// `Run.aux` is a channel whose meaning is fixed by `style_id` — layout's own
+/// doc says so: a link destination for a `Semantic::Link` run, a code-fence
+/// info string for a `Semantic::CodeBlock` one.
+///
+/// Keying on `Semantic::Link` alone would still be wrong, and measurably so.
+/// Inside a link, layout styles inline markup by *its* role and keeps the
+/// destination on the run anyway: `[**bold** text](x)` emits a
+/// `Semantic::Strong` run carrying `x`. A link whose text is entirely bold
+/// would then be invisible to `Tab` and unclickable, while looking exactly
+/// like every other link on the screen.
+///
+/// So the rule is "carries an aux, and is not the one role that means
+/// something else by it", written as a match rather than a `!=` so a third
+/// consumer of `aux` has to be considered here.
+fn link_dest(run: &Run) -> Option<&str> {
+    let dest = run.aux.as_deref()?;
+    match run.style_id {
+        StyleId::Semantic(Semantic::CodeBlock) => None,
+        StyleId::Semantic(_) | StyleId::Capture(_) => Some(dest),
+    }
+}
+
+/// Whether everything strictly between items `from` and `to` is blank text.
+///
+/// Load-bearing for grouping: layout emits each *word* of a link as its own
+/// run with a separate, aux-less space run between them, so "consecutive
+/// indices" would count a three-word link as three links. A blank run bridges;
+/// a media box or any run with visible glyphs does not.
+fn only_blank_between(items: &[LineItem], from: usize, to: usize) -> bool {
+    items
+        .get(from + 1..to)
+        .is_some_and(|between| between.iter().all(is_blank_run))
+}
+
+fn is_blank_run(item: &LineItem) -> bool {
+    match item {
+        LineItem::Run(run) => run.text.trim().is_empty(),
+        LineItem::Box(_) => false,
+    }
+}
+
+/// The link run-groups on one line, left to right: `(destination, text,
+/// span)` per maximal group of same-destination link runs, bridged across the
+/// blank runs layout puts between a link's words.
+///
+/// A media box, or any visible non-link text, between two link runs breaks the
+/// group — they really are two links that happen to share a destination.
+fn link_groups(items: &[LineItem], line: usize) -> Vec<(String, String, LinkSpan)> {
+    let mut groups: Vec<(String, String, LinkSpan)> = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        let LineItem::Run(run) = item else {
+            continue;
+        };
+        let Some(dest) = link_dest(run) else {
+            continue;
+        };
+        let extends = groups.last().is_some_and(|(target, _, span)| {
+            target == dest && only_blank_between(items, span.last_item, index)
+        });
+        match groups.last_mut() {
+            Some((_, existing, span)) if extends => {
+                // The bridged blanks are part of the link's text as the reader
+                // reads it, so they come along rather than being elided.
+                for bridged in &items[span.last_item + 1..index] {
+                    if let LineItem::Run(blank) = bridged {
+                        existing.push_str(&blank.text);
+                    }
+                }
+                existing.push_str(&run.text);
+                span.last_item = index;
+            }
+            Some(_) | None => groups.push((
+                dest.to_string(),
+                run.text.clone(),
+                LinkSpan {
+                    line,
+                    first_item: index,
+                    last_item: index,
+                },
+            )),
+        }
+    }
+    groups
+}
+
+/// The first code fence in `node`'s subtree, in document order, as its
+/// literal source text.
+///
+/// Iterative rather than recursive for the reason [`Document::nodes`] is: a
+/// pathologically nested document must not put a viewer's stack at risk on a
+/// keystroke.
+fn first_code_literal(node: NodeRef<'_>) -> Option<String> {
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        if let NodeRef::Block(block) = node
+            && let BlockKind::CodeBlock { literal, .. } = &block.kind
+        {
+            return Some(literal.clone());
+        }
+        let mut children: Vec<NodeRef<'_>> = node.children().collect();
+        children.reverse();
+        stack.extend(children);
+    }
+    None
 }
 
 #[cfg(test)]
@@ -3893,6 +4569,12 @@ mod tests {
         // The origin is irrelevant to the answer — it is the *mode* that
         // owns the keyboard, not a particular scroll position.
         assert!(Mode::Search { origin: 99 }.captures_all_keys());
+        // Phase 6's answer, for the same reason with a narrower cause: a
+        // relayout rewraps the lines `index` was computed from, so `+`/`-`/`T`
+        // would move the indicator to a different link.
+        assert!(Mode::LinkSelect { index: 0 }.captures_all_keys());
+        assert!(Mode::LinkSelect { index: 7 }.captures_all_keys());
+        assert!(Mode::Toc { selected: 0 }.captures_all_keys());
     }
 
     // ---- Search meets the modes and features that landed beside it -------
@@ -3932,22 +4614,42 @@ mod tests {
     #[test]
     fn test_a_mode_that_captures_the_keyboard_is_refused_by_the_chrome_table() {
         let (_doc, _config, _engine, mut state) = build(&numbered_paragraphs(20), 40, 10);
+        // **Derived, not listed.** This array used to be `['+', '-', 'T']`,
+        // written out by hand — and Phase 5 added `z`, `R` and `M` to the
+        // chrome table without it growing, so the three newest keys went
+        // untested here. A wildcard-free `match` makes a new *mode* a compile
+        // error; nothing makes a new *key* one. Asking `Mode::Normal` what it
+        // accepts closes that: whatever chrome is, every capturing mode must
+        // refuse exactly it.
+        state.mode = Mode::Normal;
+        let chrome_keys: Vec<char> = (' '..='~')
+            .filter(|&c| state.chrome_action(plain(KeyCode::Char(c))).is_some())
+            .collect();
+        assert!(
+            chrome_keys.len() >= 6,
+            "the chrome table should hold at least +/-/T/z/R/M, found {chrome_keys:?}"
+        );
         for mode in [
             Mode::Normal,
             Mode::Toc { selected: 0 },
             Mode::Search { origin: 0 },
+            Mode::LinkSelect { index: 0 },
         ] {
             state.mode = mode;
-            let claimed = ['+', '-', 'T']
+            let claimed: Vec<char> = chrome_keys
                 .iter()
-                .filter(|&&c| state.chrome_action(plain(KeyCode::Char(c))).is_some())
-                .count();
+                .copied()
+                .filter(|&c| state.chrome_action(plain(KeyCode::Char(c))).is_some())
+                .collect();
             if mode.captures_all_keys() {
-                assert_eq!(claimed, 0, "{mode:?} captures the keyboard but leaked keys");
+                assert!(
+                    claimed.is_empty(),
+                    "{mode:?} captures the keyboard but leaked {claimed:?}"
+                );
             } else {
                 assert_eq!(
-                    claimed, 3,
-                    "{mode:?} does not capture, so chrome still works"
+                    claimed, chrome_keys,
+                    "{mode:?} does not capture, so every chrome key must still work"
                 );
             }
         }
@@ -5231,5 +5933,1044 @@ mod tests {
             Some(NO_SECTION_HERE),
             "a document that has headings must not claim it has none"
         );
+    }
+    // ------------------------------------------------------------- Phase 6
+
+    /// A document whose viewport holds three links with distinct destinations,
+    /// plus prose around them so a hit-test has non-link cells to miss on.
+    fn linked_source() -> String {
+        String::from(
+            "Intro prose with [alpha](alpha.md) inside it.\n\n\
+             A second paragraph pointing at [beta](https://example.com/beta) here.\n\n\
+             And a third naming [gamma](notes/gamma.txt) at the end.\n\n\
+             Trailing prose with no destination at all.\n",
+        )
+    }
+
+    fn targets(state: &AppState) -> Vec<String> {
+        state
+            .visible_links()
+            .into_iter()
+            .map(|link| link.target)
+            .collect()
+    }
+
+    fn selected_index(state: &AppState) -> Option<usize> {
+        match state.mode() {
+            Mode::LinkSelect { index } => Some(index),
+            Mode::Normal | Mode::Toc { .. } | Mode::Search { .. } => None,
+        }
+    }
+
+    #[test]
+    fn test_dw_6_1_tab_and_shift_tab_cycle_the_links_in_the_viewport_and_wrap() {
+        let (_doc, _config, _engine, mut state) = build(&linked_source(), 80, 20);
+        assert_eq!(
+            targets(&state),
+            vec!["alpha.md", "https://example.com/beta", "notes/gamma.txt"],
+            "the fixture must offer three distinct links, in document order"
+        );
+
+        assert!(!state.handle_key_event(plain(KeyCode::Tab)));
+        assert_eq!(selected_index(&state), Some(0), "Tab enters on the first");
+        state.handle_key_event(plain(KeyCode::Tab));
+        assert_eq!(selected_index(&state), Some(1));
+        state.handle_key_event(plain(KeyCode::Tab));
+        assert_eq!(selected_index(&state), Some(2));
+        state.handle_key_event(plain(KeyCode::Tab));
+        assert_eq!(selected_index(&state), Some(0), "and wraps at the end");
+
+        state.handle_key_event(plain(KeyCode::BackTab));
+        assert_eq!(selected_index(&state), Some(2), "Shift-Tab wraps backward");
+        state.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT));
+        assert_eq!(
+            selected_index(&state),
+            Some(1),
+            "a terminal that reports Shift-Tab as Tab+SHIFT must cycle backward too"
+        );
+    }
+
+    #[test]
+    fn test_dw_6_1_the_status_row_names_the_destination_of_the_selected_link() {
+        let (_doc, _config, _engine, mut state) = build(&linked_source(), 80, 20);
+        state.handle_key_event(plain(KeyCode::Tab));
+        let status = state.status();
+        assert_eq!(
+            status.message.as_deref(),
+            Some("link 1/3: alpha.md"),
+            "the reader must be told where Enter would take them"
+        );
+        state.handle_key_event(plain(KeyCode::Tab));
+        assert_eq!(
+            state.status().message.as_deref(),
+            Some("link 2/3: https://example.com/beta")
+        );
+    }
+
+    #[test]
+    fn test_dw_6_1_only_links_inside_the_viewport_are_offered() {
+        // Two rows of viewport: the first link is on screen and the later ones
+        // are not, so `Tab` must have exactly one thing to select.
+        let (_doc, _config, _engine, mut state) = build(&linked_source(), 80, 2);
+        assert_eq!(targets(&state), vec!["alpha.md"]);
+        state.handle_key_event(plain(KeyCode::Tab));
+        state.handle_key_event(plain(KeyCode::Tab));
+        assert_eq!(
+            selected_index(&state),
+            Some(0),
+            "cycling one link stays on it rather than indexing off the end"
+        );
+
+        // Scroll past it and the offer changes with the screen.
+        state.set_scroll(state.max_scroll());
+        assert!(
+            !targets(&state).contains(&"alpha.md".to_string()),
+            "a link scrolled off the top must not stay selectable: {:?}",
+            targets(&state)
+        );
+    }
+
+    #[test]
+    fn test_dw_6_1_tab_with_no_links_in_view_reports_instead_of_entering_the_mode() {
+        let (_doc, _config, _engine, mut state) = build(&non_reflowing_source(20), 40, 10);
+        assert!(!state.handle_key_event(plain(KeyCode::Tab)));
+        assert_eq!(state.mode(), Mode::Normal, "no mode with nothing in it");
+        assert_eq!(state.status().message.as_deref(), Some("no links in view"));
+    }
+
+    #[test]
+    fn test_dw_6_1_enter_activates_the_selected_link_and_leaves_the_mode() {
+        let (_doc, _config, _engine, mut state) = build(&linked_source(), 80, 20);
+        state.handle_key_event(plain(KeyCode::Tab));
+        state.handle_key_event(plain(KeyCode::Tab));
+        assert!(!state.handle_key_event(plain(KeyCode::Enter)));
+        assert_eq!(
+            state.take_action(),
+            Some(PendingAction::OpenLink(
+                "https://example.com/beta".to_string()
+            )),
+            "Enter must queue the *selected* destination, not the first one"
+        );
+        assert_eq!(
+            state.mode(),
+            Mode::Normal,
+            "activation returns the reader to the document"
+        );
+        assert_eq!(
+            state.take_action(),
+            None,
+            "and the action drains exactly once"
+        );
+    }
+
+    #[test]
+    fn test_dw_6_1_esc_leaves_link_selection_without_activating_anything() {
+        let (_doc, _config, _engine, mut state) = build(&linked_source(), 80, 20);
+        state.handle_key_event(plain(KeyCode::Tab));
+        state.handle_key_event(plain(KeyCode::Esc));
+        assert_eq!(state.mode(), Mode::Normal);
+        assert_eq!(state.take_action(), None);
+    }
+
+    #[test]
+    fn test_q_and_ctrl_c_still_quit_from_inside_link_selection() {
+        for key in [plain(KeyCode::Char('q')), ctrl('c')] {
+            let (_doc, _config, _engine, mut state) = build(&linked_source(), 80, 20);
+            state.handle_key_event(plain(KeyCode::Tab));
+            assert!(
+                state.handle_key_event(key),
+                "a mode that swallows the quit keys strands the reader"
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_link_whose_text_spans_several_runs_counts_once() {
+        // The emphasis splits the link into two runs sharing one destination;
+        // a reader sees one link and `Tab` must agree with them.
+        let (_doc, _config, _engine, state) =
+            build("Prose [**bold** and plain](one.md) more prose.\n", 80, 10);
+        let links = state.visible_links();
+        assert_eq!(links.len(), 1, "one link, several runs: {links:?}");
+        assert_eq!(links[0].target, "one.md");
+        assert!(
+            links[0].spans.len() == 1 && links[0].spans[0].first_item < links[0].spans[0].last_item,
+            "the span must cover more than one run: {:?}",
+            links[0].spans
+        );
+        assert!(
+            links[0].text.contains("bold") && links[0].text.contains("plain"),
+            "the merged text must be the whole link: {:?}",
+            links[0].text
+        );
+    }
+
+    #[test]
+    fn test_a_link_wrapped_across_two_lines_counts_once_and_carries_both_spans() {
+        // 24 cells forces the long link text to wrap mid-link.
+        let (_doc, _config, _engine, state) = build(
+            "[a very long link label that must wrap somewhere](wrapped.md)\n",
+            24,
+            10,
+        );
+        let links = state.visible_links();
+        assert_eq!(
+            links.len(),
+            1,
+            "a wrapped link is still one link: {links:?}"
+        );
+        assert!(
+            links[0].spans.len() >= 2,
+            "it must carry a span per line it paints on: {:?}",
+            links[0].spans
+        );
+        let lines: Vec<usize> = links[0].spans.iter().map(|span| span.line).collect();
+        assert!(
+            lines.windows(2).all(|pair| pair[0] + 1 == pair[1]),
+            "the spans must be consecutive lines: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn test_two_different_links_on_one_line_stay_two_links() {
+        let (_doc, _config, _engine, state) =
+            build("See [one](one.md) and [two](two.md).\n", 80, 10);
+        assert_eq!(targets(&state), vec!["one.md", "two.md"]);
+    }
+
+    // ---------------------------------------------------------------- DW-6.6
+
+    fn wheel(kind: MouseEventKind) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn click_at(column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn test_dw_6_6_a_wheel_scroll_moves_the_viewport_and_clamps_at_both_ends() {
+        let engine = WidthEngine::new(WidthConfig::default());
+        let (_doc, _config, _engine, mut state) = build(&non_reflowing_source(200), 40, 10);
+
+        assert!(state.handle_mouse_event(wheel(MouseEventKind::ScrollDown), &engine));
+        assert_eq!(state.scroll(), 3, "one notch is three lines");
+        assert!(state.handle_mouse_event(wheel(MouseEventKind::ScrollUp), &engine));
+        assert_eq!(state.scroll(), 0);
+        // Up at the top clamps rather than underflowing.
+        state.handle_mouse_event(wheel(MouseEventKind::ScrollUp), &engine);
+        assert_eq!(state.scroll(), 0);
+
+        for _ in 0..500 {
+            state.handle_mouse_event(wheel(MouseEventKind::ScrollDown), &engine);
+        }
+        assert_eq!(state.scroll(), state.max_scroll(), "and clamps at the tail");
+    }
+
+    #[test]
+    fn test_dw_6_6_a_click_on_a_link_cell_activates_that_link() {
+        let engine = WidthEngine::new(WidthConfig::default());
+        let (_doc, _config, _engine, mut state) = build(&linked_source(), 80, 20);
+
+        // Find where the first link actually paints, through the same
+        // measurement the painter uses, rather than guessing a column.
+        let link = state.visible_links().into_iter().next().expect("a link");
+        let span = link.spans[0];
+        let Some(Line::Items(items)) = state.tree().lines(span.line..span.line + 1).next() else {
+            panic!("the link's line must be a text line");
+        };
+        let columns = item_columns(items, &engine, 80);
+        let (start, end) = columns[span.first_item];
+        assert!(start < end, "the link must occupy real cells");
+
+        assert!(state.handle_mouse_event(click_at(start, span.line as u16), &engine));
+        assert_eq!(
+            state.take_action(),
+            Some(PendingAction::OpenLink("alpha.md".to_string()))
+        );
+
+        // ...and one cell short of it is not the link.
+        if start > 0 {
+            let (_d, _c, _e, mut fresh) = build(&linked_source(), 80, 20);
+            assert!(!fresh.handle_mouse_event(click_at(start - 1, span.line as u16), &engine));
+            assert_eq!(fresh.take_action(), None);
+        }
+    }
+
+    #[test]
+    fn test_dw_6_6_a_click_on_a_cell_with_no_link_changes_nothing() {
+        let engine = WidthEngine::new(WidthConfig::default());
+        let (_doc, _config, _engine, mut state) = build(&linked_source(), 80, 20);
+        let before = state.scroll();
+        // Column 0 of row 0 is the first word of the prose, and the far right
+        // of the row is past every glyph on it.
+        for column in [0u16, 79] {
+            assert!(
+                !state.handle_mouse_event(click_at(column, 0), &engine),
+                "a click at column {column} must not earn a frame"
+            );
+            assert_eq!(state.take_action(), None);
+        }
+        assert_eq!(state.scroll(), before);
+        assert_eq!(state.mode(), Mode::Normal);
+    }
+
+    #[test]
+    fn test_dw_6_6_a_click_past_the_end_of_the_document_changes_nothing() {
+        let engine = WidthEngine::new(WidthConfig::default());
+        let (_doc, _config, _engine, mut state) = build("# tiny\n", 40, 20);
+        assert!(!state.handle_mouse_event(click_at(0, 19), &engine));
+        // The status row is one below the content viewport and is not clickable.
+        assert!(!state.handle_mouse_event(click_at(0, 20), &engine));
+        assert_eq!(state.take_action(), None);
+    }
+
+    #[test]
+    fn test_dw_6_6_m_toggles_mouse_capture_and_reports_which_way() {
+        let (_doc, _config, _engine, mut state) = build("# doc\n", 40, 10);
+        assert!(state.mouse_capture(), "capture starts on");
+
+        assert!(!state.handle_key_event(plain(KeyCode::Char('m'))));
+        assert!(!state.mouse_capture());
+        assert_eq!(
+            state.take_action(),
+            Some(PendingAction::SetMouseCapture(false))
+        );
+        assert!(
+            state.status().message.is_some_and(|m| m.contains("off")),
+            "the effect is invisible until the reader tries to drag, so it must be said"
+        );
+
+        state.handle_key_event(plain(KeyCode::Char('m')));
+        assert!(state.mouse_capture());
+        assert_eq!(
+            state.take_action(),
+            Some(PendingAction::SetMouseCapture(true))
+        );
+    }
+
+    #[test]
+    fn test_a_wheel_scroll_leaves_link_selection_rather_than_keeping_a_stale_index() {
+        let engine = WidthEngine::new(WidthConfig::default());
+        let (_doc, _config, _engine, mut state) = build(&linked_source(), 80, 4);
+        state.handle_key_event(plain(KeyCode::Tab));
+        assert!(matches!(state.mode(), Mode::LinkSelect { .. }));
+        state.handle_mouse_event(wheel(MouseEventKind::ScrollDown), &engine);
+        assert_eq!(
+            state.mode(),
+            Mode::Normal,
+            "scrolling changes which links are visible, so the index must not survive"
+        );
+    }
+
+    #[test]
+    fn test_a_gesture_with_no_binding_neither_scrolls_nor_activates() {
+        let engine = WidthEngine::new(WidthConfig::default());
+        let (_doc, _config, _engine, mut state) = build(&linked_source(), 80, 20);
+        for kind in [
+            MouseEventKind::Moved,
+            MouseEventKind::Up(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Down(MouseButton::Right),
+            MouseEventKind::Down(MouseButton::Middle),
+            MouseEventKind::ScrollLeft,
+            MouseEventKind::ScrollRight,
+        ] {
+            assert!(
+                !state.handle_mouse_event(wheel(kind), &engine),
+                "{kind:?} must be inert"
+            );
+            assert_eq!(state.take_action(), None);
+            assert_eq!(state.scroll(), 0);
+        }
+    }
+
+    // ---------------------------------------------------------------- DW-6.7
+
+    #[test]
+    fn test_dw_6_7_y_yanks_the_code_block_the_reader_is_looking_at() {
+        let source = "# Title\n\n```sh\ncurl https://example.com | sh\necho done\n```\n";
+        let (doc, _config, _engine, mut state) = build(source, 60, 20);
+
+        assert!(!state.handle_key_event(plain(KeyCode::Char('y'))));
+        assert_eq!(state.take_action(), Some(PendingAction::CopyCodeBlock));
+        assert_eq!(
+            state.code_block_in_view(&doc).as_deref(),
+            Some("curl https://example.com | sh\necho done\n"),
+            "the AST literal, not the painted (and possibly clipped) lines"
+        );
+    }
+
+    #[test]
+    fn test_dw_6_7_the_yanked_text_is_the_source_not_the_clipped_paint() {
+        // A code line far wider than the viewport: layout clips it and marks
+        // the clip, so copying the screen would put a truncated command on the
+        // clipboard that looks complete.
+        let long = "echo ".to_string() + &"x".repeat(300);
+        let source = format!("```sh\n{long}\n```\n");
+        let (doc, _config, _engine, mut state) = build(&source, 40, 20);
+
+        let yanked = state.code_block_in_view(&doc).expect("a code block");
+        assert_eq!(yanked, format!("{long}\n"));
+        assert!(
+            !yanked.contains('\u{2026}'),
+            "the clip indicator must never reach the clipboard: {yanked:?}"
+        );
+    }
+
+    #[test]
+    fn test_dw_6_7_y_finds_a_fence_nested_in_a_list_item() {
+        // `line_blocks` only ever names the *top-level* block, so a fence
+        // inside a list needs the subtree walk.
+        let source = "- step one\n\n  ```sh\n  make test\n  ```\n";
+        let (doc, _config, _engine, mut state) = build(source, 60, 20);
+        assert_eq!(
+            state.code_block_in_view(&doc).as_deref(),
+            Some("make test\n")
+        );
+    }
+
+    #[test]
+    fn test_dw_6_7_y_with_no_code_block_in_view_reports_instead() {
+        let (doc, _config, _engine, mut state) = build("# Just prose\n\nand more.\n", 60, 20);
+        assert_eq!(state.code_block_in_view(&doc), None);
+        assert_eq!(
+            state.status().message.as_deref(),
+            Some("no code block in view")
+        );
+    }
+
+    #[test]
+    fn test_dw_6_7_a_code_block_scrolled_out_of_view_is_not_the_one_yanked() {
+        let source = format!(
+            "```sh\nfirst\n```\n\n{}\n```sh\nsecond\n```\n",
+            non_reflowing_source(30)
+        );
+        let (doc, _config, _engine, mut state) = build(&source, 60, 6);
+        assert_eq!(state.code_block_in_view(&doc).as_deref(), Some("first\n"));
+        state.set_scroll(state.max_scroll());
+        assert_eq!(
+            state.code_block_in_view(&doc).as_deref(),
+            Some("second\n"),
+            "\"in view\" must follow the viewport, not the document"
+        );
+    }
+
+    // ------------------------------------------------- reload / resize seams
+
+    #[test]
+    fn test_a_reload_that_removes_the_selected_link_dismisses_link_selection() {
+        let (_doc, config, engine, mut state) = build(&linked_source(), 80, 20);
+        state.handle_key_event(plain(KeyCode::Tab));
+        state.handle_key_event(plain(KeyCode::Tab));
+        assert_eq!(selected_index(&state), Some(1));
+
+        reload(
+            &mut state,
+            "# no links at all\n\njust prose\n",
+            &config,
+            &engine,
+        );
+        assert_eq!(
+            state.mode(),
+            Mode::Normal,
+            "a selection addressing a document that no longer exists must be dropped"
+        );
+        assert_eq!(state.status().message.as_deref(), Some("no links in view"));
+    }
+
+    #[test]
+    fn test_a_reload_to_fewer_links_clamps_the_selection_into_range() {
+        let (_doc, config, engine, mut state) = build(&linked_source(), 80, 20);
+        for _ in 0..3 {
+            state.handle_key_event(plain(KeyCode::Tab));
+        }
+        assert_eq!(selected_index(&state), Some(2));
+
+        reload(&mut state, "Only [one](one.md) left.\n", &config, &engine);
+        assert_eq!(
+            selected_index(&state),
+            Some(0),
+            "the index must be clamped, not left pointing past the end"
+        );
+        assert_eq!(
+            state.selected_link().map(|link| link.target),
+            Some("one.md".to_string()),
+            "and it must resolve against the new document"
+        );
+    }
+
+    #[test]
+    fn test_a_resize_reseats_an_open_link_selection() {
+        let (doc, config, engine, mut state) = build(&linked_source(), 80, 20);
+        for _ in 0..3 {
+            state.handle_key_event(plain(KeyCode::Tab));
+        }
+        assert_eq!(selected_index(&state), Some(2));
+
+        let ctx = LayoutContext {
+            doc: &doc,
+            config: &config,
+            engine: &engine,
+            sizer: &NullSizer,
+        };
+        // Narrow and short: reflow moves every wrap point and the viewport now
+        // holds fewer links than the index names.
+        state.apply_resize_burst(
+            &ctx,
+            &[Size {
+                width: 30,
+                height: 3,
+            }],
+        );
+        match state.mode() {
+            Mode::LinkSelect { index } => assert!(
+                index < state.visible_links().len(),
+                "the reseated index must address a link that exists"
+            ),
+            Mode::Normal => assert!(
+                state.visible_links().is_empty(),
+                "dropping to Normal is only right when nothing is selectable"
+            ),
+            Mode::Toc { .. } | Mode::Search { .. } => {
+                panic!("a resize cannot open an overlay or a query prompt")
+            }
+        }
+    }
+
+    #[test]
+    fn test_open_document_lands_at_the_requested_scroll_and_clears_the_mode() {
+        let (_doc, config, engine, mut state) = build(&linked_source(), 80, 20);
+        state.handle_key_event(plain(KeyCode::Tab));
+
+        let next = Document::parse(&non_reflowing_source(100));
+        let ctx = LayoutContext {
+            doc: &next,
+            config: &config,
+            engine: &engine,
+            sizer: &NullSizer,
+        };
+        state.open_document(
+            &ctx,
+            FileInfo {
+                name: "next.md".to_string(),
+                byte_size: 1,
+                line_count: 1,
+            },
+            17,
+        );
+        assert_eq!(state.scroll(), 17, "DW-6.2: the caller says where to land");
+        assert_eq!(state.mode(), Mode::Normal);
+        assert_eq!(state.status().name, "next.md");
+    }
+
+    #[test]
+    fn test_open_document_clamps_a_scroll_past_the_new_documents_end() {
+        let (_doc, config, engine, mut state) = build(&non_reflowing_source(200), 80, 20);
+        let next = Document::parse("# tiny\n");
+        let ctx = LayoutContext {
+            doc: &next,
+            config: &config,
+            engine: &engine,
+            sizer: &NullSizer,
+        };
+        state.open_document(&ctx, FileInfo::default(), 5_000);
+        assert_eq!(state.scroll(), state.max_scroll());
+    }
+
+    #[test]
+    fn test_backspace_and_y_queue_exactly_one_action_each() {
+        let (_doc, _config, _engine, mut state) = build("# doc\n", 40, 10);
+        assert!(!state.handle_key_event(plain(KeyCode::Backspace)));
+        assert_eq!(state.take_action(), Some(PendingAction::Back));
+        assert_eq!(state.take_action(), None);
+    }
+
+    /// The chord table's documented fallthrough must not turn `Ctrl-y` into a
+    /// clipboard write or `Ctrl-m` into a capture toggle: both new bindings sit
+    /// inside the `!CONTROL` guard, exactly like `t`.
+    #[test]
+    fn test_the_new_bindings_are_not_reachable_through_a_control_chord() {
+        let (_doc, _config, _engine, mut state) = build("# doc\n", 40, 10);
+        let capture_before = state.mouse_capture();
+        for key in [ctrl('y'), ctrl('m')] {
+            state.handle_key_event(key);
+            assert_eq!(state.take_action(), None, "{key:?} must queue nothing");
+        }
+        assert_eq!(state.mouse_capture(), capture_before);
+    }
+
+    /// The `aux` channel carries a code fence's *language* as well as a link
+    /// destination, and both are strings. A viewport showing a fence must
+    /// therefore offer no links at all — otherwise `Tab` would select `rust`
+    /// and `Enter` would go looking for a file called `rust`.
+    #[test]
+    fn test_a_code_fences_language_is_never_mistaken_for_a_link_destination() {
+        let (_doc, _config, _engine, state) = build("```rust\nfn main() {}\n```\n", 60, 20);
+        assert!(
+            state.visible_links().is_empty(),
+            "a fence's info string is not a link: {:?}",
+            state.visible_links()
+        );
+    }
+
+    /// The other half of the same rule: a link whose text is entirely bold is
+    /// styled `Semantic::Strong` by layout, and must still be selectable.
+    #[test]
+    fn test_a_link_whose_text_is_entirely_bold_is_still_selectable() {
+        let (_doc, _config, _engine, mut state) =
+            build("Prose [**all bold**](bold.md) prose.\n", 80, 10);
+        assert_eq!(targets(&state), vec!["bold.md"]);
+        state.handle_key_event(plain(KeyCode::Tab));
+        state.handle_key_event(plain(KeyCode::Enter));
+        assert_eq!(
+            state.take_action(),
+            Some(PendingAction::OpenLink("bold.md".to_string()))
+        );
+    }
+
+    // ------------------------- link selection meets incremental search ----
+
+    /// Search state outlives `Mode::Search` on purpose — `n`/`N` traverse the
+    /// matches from normal mode — so a reader can accept a query and *then*
+    /// press `Tab`. Both overlays are then live at once, and the frame has to
+    /// carry both: a per-mode paint wrapper would drop whichever one the mode
+    /// match did not name.
+    #[test]
+    fn test_a_link_selection_opened_over_an_accepted_search_keeps_both_overlays() {
+        let (_doc, _config, _engine, mut state) = build(&linked_source(), 80, 20);
+
+        // `/paragraph` + Enter: matches survive into normal mode.
+        state.handle_key_event(plain(KeyCode::Char('/')));
+        for c in "paragraph".chars() {
+            state.handle_key_event(plain(KeyCode::Char(c)));
+        }
+        state.handle_key_event(plain(KeyCode::Enter));
+        assert_eq!(state.mode(), Mode::Normal);
+        let matched = state.search_overlay().matches.len();
+        assert!(
+            matched > 0,
+            "the fixture must match, or this proves nothing"
+        );
+
+        // Now select a link. The matches must still be there to paint.
+        state.handle_key_event(plain(KeyCode::Tab));
+        assert!(matches!(state.mode(), Mode::LinkSelect { .. }));
+        assert_eq!(
+            state.search_overlay().matches.len(),
+            matched,
+            "entering link selection must not disturb the accepted search"
+        );
+        assert!(
+            !state.selection_spans().is_empty(),
+            "…and the selection must have something to paint"
+        );
+    }
+
+    /// The mirror: `Esc` out of link selection leaves the search exactly as
+    /// it was, so `n` still works.
+    #[test]
+    fn test_leaving_link_selection_leaves_an_accepted_search_intact() {
+        let (_doc, _config, _engine, mut state) = build(&linked_source(), 80, 20);
+        state.handle_key_event(plain(KeyCode::Char('/')));
+        for c in "paragraph".chars() {
+            state.handle_key_event(plain(KeyCode::Char(c)));
+        }
+        state.handle_key_event(plain(KeyCode::Enter));
+        let before = state.search().matches.len();
+
+        state.handle_key_event(plain(KeyCode::Tab));
+        state.handle_key_event(plain(KeyCode::Esc));
+        assert_eq!(state.mode(), Mode::Normal);
+        assert_eq!(state.search().matches.len(), before);
+        assert_eq!(state.search().query, "paragraph");
+    }
+
+    /// **The interaction nobody had run.** `SearchState::matches` addresses
+    /// text by tree line index and byte range; following a link replaces the
+    /// tree without going through `relayout`, so neither `reseat_search` nor
+    /// `recompute_matches` fires. Carrying the vector across would leave the
+    /// painter highlighting whatever bytes now sit at those coordinates.
+    #[test]
+    fn test_opening_a_document_drops_the_search_that_addressed_the_old_one() {
+        let (_doc, config, engine, mut state) = build(&linked_source(), 80, 20);
+        state.handle_key_event(plain(KeyCode::Char('/')));
+        for c in "paragraph".chars() {
+            state.handle_key_event(plain(KeyCode::Char(c)));
+        }
+        state.handle_key_event(plain(KeyCode::Enter));
+        assert!(!state.search().matches.is_empty());
+
+        // A different document, with different text at every line index.
+        let next = Document::parse("# Next\n\nnothing here matches that word.\n");
+        let ctx = LayoutContext {
+            doc: &next,
+            config: &config,
+            engine: &engine,
+            sizer: &NullSizer,
+        };
+        state.open_document(&ctx, FileInfo::default(), 0);
+
+        assert!(
+            state.search().matches.is_empty(),
+            "a match addressing the previous tree must not survive the swap"
+        );
+        assert!(state.search().query.is_empty());
+        assert!(
+            state.search_overlay().current.is_none(),
+            "and nothing may be painted as the current match"
+        );
+    }
+
+    /// Phase 5's fix-forward added `SearchState::hidden_by_folds`, a count
+    /// derived from a fold-free relayout of the document that is about to be
+    /// replaced. It is exactly as document-bound as `matches` is, so the drop
+    /// on a document swap has to take it too — a leftover count would have
+    /// `n` reporting "N matches are folded away" about folds in a file the
+    /// reader has left.
+    #[test]
+    fn test_opening_a_document_also_drops_the_folded_match_count() {
+        let source = "# One\n\nneedle here.\n\n# Two\n\nplain text.\n";
+        let (doc, config, engine, mut state) = build(source, 40, 20);
+        let ctx = ctx_for(&doc, &config, &engine);
+        search_for(&mut state, "needle");
+        let one = state.outline().entries[0].block;
+        state.jump_to_block(one);
+        toggle_fold(&mut state, &ctx);
+        assert_eq!(
+            state.search().hidden_by_folds,
+            1,
+            "the fixture must really have a match hidden behind a fold"
+        );
+
+        let next = Document::parse("# Next\n\nnothing here matches that word.\n");
+        let next_ctx = ctx_for(&next, &config, &engine);
+        state.open_document(&next_ctx, FileInfo::default(), 0);
+
+        assert_eq!(
+            state.search().hidden_by_folds,
+            0,
+            "a count about the previous document's folds must not survive the swap"
+        );
+        assert!(state.search().matches.is_empty());
+        assert!(state.search().query.is_empty());
+    }
+
+    /// The same drop on the way *back*, and the DW-6.2 promise beside it: the
+    /// caller's scroll offset is honoured whatever the search was doing.
+    #[test]
+    fn test_dw_6_2_going_back_restores_the_scroll_and_leaves_no_stale_search() {
+        let (_doc, config, engine, mut state) = build(&non_reflowing_source(200), 80, 10);
+        state.handle_key_event(plain(KeyCode::Char('/')));
+        for c in "line 1".chars() {
+            state.handle_key_event(plain(KeyCode::Char(c)));
+        }
+        state.handle_key_event(plain(KeyCode::Enter));
+        assert!(!state.search().matches.is_empty());
+
+        // `Backspace`'s install: the same document, at the remembered offset.
+        let same = Document::parse(&non_reflowing_source(200));
+        let ctx = LayoutContext {
+            doc: &same,
+            config: &config,
+            engine: &engine,
+            sizer: &NullSizer,
+        };
+        state.open_document(&ctx, FileInfo::default(), 42);
+
+        assert_eq!(state.scroll(), 42, "DW-6.2: the previous scroll position");
+        assert_eq!(state.mode(), Mode::Normal);
+        assert!(
+            state.search().matches.is_empty(),
+            "even returning to a document that would match again, the vector \
+             that addressed the *other* tree must not be reused"
+        );
+    }
+
+    /// A `/` prompt open when a link is clicked: the click is a pointing
+    /// gesture, not a key, so it is not governed by `captures_all_keys`. What
+    /// must hold is that the state it leaves behind is coherent — normal
+    /// mode, one queued action, and no half-typed query still owning the row.
+    #[test]
+    fn test_a_click_while_a_query_prompt_is_open_leaves_coherent_state() {
+        let engine = WidthEngine::new(WidthConfig::default());
+        let (_doc, _config, _engine, mut state) = build(&linked_source(), 80, 20);
+        state.handle_key_event(plain(KeyCode::Char('/')));
+        state.handle_key_event(plain(KeyCode::Char('a')));
+        assert!(matches!(state.mode(), Mode::Search { .. }));
+
+        let link = state.visible_links().into_iter().next().expect("a link");
+        let span = link.spans[0];
+        let Some(Line::Items(items)) = state.tree().lines(span.line..span.line + 1).next() else {
+            panic!("text line");
+        };
+        let (start, _) = item_columns(items, &engine, 80)[span.first_item];
+
+        assert!(state.handle_mouse_event(click_at(start, span.line as u16), &engine));
+        assert_eq!(
+            state.take_action(),
+            Some(PendingAction::OpenLink("alpha.md".to_string()))
+        );
+        assert_eq!(
+            state.mode(),
+            Mode::Normal,
+            "the prompt must not still own the status row after a click that \
+             is about to replace the document"
+        );
+    }
+
+    // ----------------------------- link selection meets section folding ---
+
+    /// A fold is a relayout at the **same width** on the **same document**,
+    /// so Phase 4's `reflowed` flag is false for it. `reseat_link_select` is
+    /// therefore unconditional — guarding it on `reflowed` would have skipped
+    /// exactly the case that changes which links exist.
+    ///
+    /// Folding cannot actually be reached from `Mode::LinkSelect` (`z` is
+    /// chrome, and `captures_all_keys` refuses it — pinned separately). This
+    /// drives the state transition directly anyway: the reseat must hold on
+    /// its own, not only because a key table happens to forbid the path.
+    #[test]
+    fn test_a_fold_that_swallows_the_selected_link_leaves_the_mode_coherent() {
+        let source = "# One\n\nSee [alpha](alpha.md) here.\n\n# Two\n\nSee [beta](beta.md) here.\n";
+        let (doc, config, engine, mut state) = build(source, 60, 20);
+        let ctx = ctx_for(&doc, &config, &engine);
+        assert_eq!(targets(&state), vec!["alpha.md", "beta.md"]);
+
+        // Select the second link, then collapse everything under it.
+        state.handle_key_event(plain(KeyCode::Tab));
+        state.handle_key_event(plain(KeyCode::Tab));
+        assert_eq!(
+            state.selected_link().map(|link| link.target),
+            Some("beta.md".to_string())
+        );
+
+        state.collapse_all();
+        state.relayout_preserving_anchor(&ctx, *ctx.config);
+
+        assert!(
+            state.visible_links().is_empty(),
+            "collapsing every section must take both links off the screen: {:?}",
+            state.visible_links()
+        );
+        assert_eq!(
+            state.mode(),
+            Mode::Normal,
+            "a selection with nothing left to select must be dismissed, not \
+             left indexing a link that is no longer painted"
+        );
+        assert!(state.selection_spans().is_empty());
+        assert_eq!(state.status().message.as_deref(), Some("no links in view"));
+    }
+
+    /// The clamp half: a fold that removes *some* links must leave the index
+    /// addressing one that still exists rather than pointing past the end.
+    #[test]
+    fn test_a_fold_that_removes_some_links_clamps_the_selection_into_range() {
+        let source = "# One\n\nSee [alpha](alpha.md) here.\n\n# Two\n\nSee [beta](beta.md) here.\n";
+        let (doc, config, engine, mut state) = build(source, 60, 20);
+        let ctx = ctx_for(&doc, &config, &engine);
+
+        state.handle_key_event(plain(KeyCode::Tab));
+        state.handle_key_event(plain(KeyCode::Tab));
+        assert_eq!(selected_index(&state), Some(1));
+
+        // Fold only the second section, so exactly one link survives.
+        let second = state.tree().outline().entries[1].block;
+        state.folds_mut_for_test().collapsed.insert(second);
+        state.relayout_preserving_anchor(&ctx, *ctx.config);
+        assert_eq!(targets(&state), vec!["alpha.md"]);
+
+        assert_eq!(
+            selected_index(&state),
+            Some(0),
+            "the index must be clamped onto a link that still exists"
+        );
+        assert_eq!(
+            state.selected_link().map(|link| link.target),
+            Some("alpha.md".to_string())
+        );
+        assert!(
+            !state.selection_spans().is_empty(),
+            "…and the indicator must have somewhere real to paint"
+        );
+    }
+
+    /// The other direction: unfolding brings links back and the selection is
+    /// still usable.
+    #[test]
+    fn test_unfolding_restores_the_links_a_fold_took_away() {
+        let source = "# One\n\nSee [alpha](alpha.md) here.\n\n# Two\n\nSee [beta](beta.md) here.\n";
+        let (doc, config, engine, mut state) = build(source, 60, 20);
+        let ctx = ctx_for(&doc, &config, &engine);
+
+        state.collapse_all();
+        state.relayout_preserving_anchor(&ctx, *ctx.config);
+        assert!(state.visible_links().is_empty());
+
+        state.expand_all();
+        state.relayout_preserving_anchor(&ctx, *ctx.config);
+        assert_eq!(targets(&state), vec!["alpha.md", "beta.md"]);
+        state.handle_key_event(plain(KeyCode::Tab));
+        state.handle_key_event(plain(KeyCode::Enter));
+        assert_eq!(
+            state.take_action(),
+            Some(PendingAction::OpenLink("alpha.md".to_string()))
+        );
+    }
+
+    /// Phase 5's three chrome keys arrived after `Mode::LinkSelect` was
+    /// written. They must be inert while a link is selected for the same
+    /// reason `+`/`-`/`T` are — a relayout rewraps the lines the index was
+    /// computed from — and the mode's own keys must not be swallowed on the
+    /// way.
+    #[test]
+    fn test_dw_6_1_the_fold_keys_are_inert_while_a_link_is_selected() {
+        let (_doc, _config, _engine, mut state) = build(&linked_source(), 80, 20);
+        state.handle_key_event(plain(KeyCode::Tab));
+        assert!(matches!(state.mode(), Mode::LinkSelect { .. }));
+
+        for key in ['z', 'R', 'M'] {
+            assert_eq!(
+                state.chrome_action(plain(KeyCode::Char(key))),
+                None,
+                "`{key}` must not reach the fold path while a link is selected"
+            );
+        }
+        // ...and the mode still answers its own keys, which is the opposite
+        // failure: a gate that swallowed navigation too.
+        state.handle_key_event(plain(KeyCode::Tab));
+        assert_eq!(selected_index(&state), Some(1));
+        state.handle_key_event(plain(KeyCode::Enter));
+        assert_eq!(
+            state.take_action(),
+            Some(PendingAction::OpenLink(
+                "https://example.com/beta".to_string()
+            ))
+        );
+    }
+
+    /// **Fold state is per-document and does not travel the document stack.**
+    ///
+    /// `FoldState::collapsed` holds `NodeId`s, which are dense positional
+    /// indices into *one* document — so a fold carried into a linked document
+    /// would not be stale, it would be silently *valid* and collapse whatever
+    /// section now sits at that index. `open_document` clears the set before
+    /// laying out, which is the only ordering that works.
+    #[test]
+    fn test_dw_6_2_folds_do_not_leak_across_the_document_stack() {
+        let source = "# One\n\nbody one.\n\n# Two\n\nbody two.\n";
+        let (doc, config, engine, mut state) = build(source, 60, 20);
+        let ctx = ctx_for(&doc, &config, &engine);
+        state.collapse_all();
+        state.relayout_preserving_anchor(&ctx, *ctx.config);
+        assert!(
+            !state.folds().collapsed.is_empty(),
+            "the fixture must really be folded before the hop"
+        );
+        let folded_lines = state.tree().line_count();
+
+        // Follow a link into a *different* document with headings of its own.
+        let next = Document::parse("# Alpha\n\nalpha body.\n\n# Beta\n\nbeta body.\n");
+        let next_ctx = ctx_for(&next, &config, &engine);
+        state.open_document(&next_ctx, FileInfo::default(), 0);
+
+        assert!(
+            state.folds().collapsed.is_empty(),
+            "an id from the previous document must not survive into this one"
+        );
+        let unfolded = layout(&next, 60, &config, &engine, &NullSizer);
+        assert_eq!(
+            state.tree().line_count(),
+            unfolded.line_count(),
+            "the linked document must open fully expanded, not with whichever \
+             section the old ids happened to name"
+        );
+        assert!(
+            state.tree().line_count() > folded_lines,
+            "…and that is genuinely more content than the folded original"
+        );
+
+        // And back: `Backspace` returns through the same method, so the
+        // original document also comes back expanded. Stated, not hidden.
+        state.open_document(&ctx, FileInfo::default(), 0);
+        assert!(state.folds().collapsed.is_empty());
+        assert_eq!(
+            state.tree().line_count(),
+            layout(&doc, 60, &config, &engine, &NullSizer).line_count(),
+            "fold state does not travel the stack in either direction"
+        );
+    }
+
+    /// The same seam once more with the arming flag: `pending_fold_snap`
+    /// holds a `NodeId` for the *next* relayout of the tree it was computed
+    /// against. A document swap replaces that tree, so the flag must not
+    /// survive to snap the new document to an unrelated block.
+    #[test]
+    fn test_a_pending_fold_snap_does_not_survive_a_document_swap() {
+        let source = "# One\n\nbody one.\n\n# Two\n\nbody two.\n";
+        let (_doc, config, engine, mut state) = build(source, 60, 3);
+        // Scroll inside the first section, then arm the snap by folding it.
+        // No relayout here on purpose: the flag must still be *pending* when
+        // the document is swapped, which is the state under test.
+        state.set_scroll(1);
+        state.toggle_fold();
+        assert!(
+            state.pending_fold_snap.is_some(),
+            "folding the section the reader is inside must arm the snap"
+        );
+
+        let next = Document::parse(&non_reflowing_source(60));
+        let next_ctx = ctx_for(&next, &config, &engine);
+        state.open_document(&next_ctx, FileInfo::default(), 20);
+
+        assert!(state.pending_fold_snap.is_none());
+        assert_eq!(
+            state.scroll(),
+            20,
+            "the caller's scroll must stand — a stale snap would have moved it"
+        );
+    }
+
+    /// Chrome runs *before* the normal key table, so a chrome key that
+    /// collided with one of Phase 6's bindings would shadow it silently — no
+    /// compile error, no failing mode test, just a key that stopped working.
+    /// Phase 5 added `z`/`R`/`M` after these bindings existed; `M` and `m`
+    /// differ only in case.
+    #[test]
+    fn test_no_chrome_key_shadows_a_phase_6_normal_mode_binding() {
+        let (_doc, _config, _engine, state) = build(&linked_source(), 80, 20);
+        for code in [
+            KeyCode::Tab,
+            KeyCode::BackTab,
+            KeyCode::Backspace,
+            KeyCode::Enter,
+            KeyCode::Char('y'),
+            KeyCode::Char('m'),
+        ] {
+            assert_eq!(
+                state.chrome_action(plain(code)),
+                None,
+                "{code:?} is claimed by the chrome table, which runs first — \
+                 the Phase 6 binding for it would never fire"
+            );
+        }
+    }
+
+    #[test]
+    fn test_captures_all_keys_answers_for_every_mode() {
+        assert!(!Mode::Normal.captures_all_keys());
+        assert!(Mode::Toc { selected: 0 }.captures_all_keys());
+        assert!(Mode::LinkSelect { index: 0 }.captures_all_keys());
     }
 }

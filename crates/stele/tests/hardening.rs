@@ -198,3 +198,93 @@ fn test_dw_2_5_the_load_path_never_calls_document_parse_directly() {
         "the mermaid preprocessor parses, so it must parse through the counter"
     );
 }
+
+/// DW-6.3 / DW-6.5, structurally: nothing shipped in this crate may hand a
+/// link destination to a shell.
+///
+/// The runtime tests in `src/link.rs` prove the argv that `opener_argv` builds
+/// today. This one proves the *absence* of the other path — that no source
+/// file anywhere under `src/**` reaches for a shell — because a future edit
+/// that "just needs to expand `~`" would pass every one of those tests while
+/// reintroducing the exact hole the phase's constraints exist to close.
+///
+/// Scoped to the **shipped** half of `src/**`: each file is scanned only down
+/// to its `#[cfg(test)]` module, because a unit test that asserts the opener
+/// is not `sh` has to name `sh` to do it, and `src/link.rs`'s FIFO fixture
+/// legitimately runs `mkfifo` (as a program, not through a shell). Everything
+/// above that line is what ends up in the binary.
+#[test]
+fn test_dw_6_3_no_source_file_spawns_a_shell() {
+    // Each needle is a way to get a string parsed by a command interpreter.
+    // `-c` is included because it is the flag every one of them takes.
+    const SHELL_NEEDLES: [&str; 9] = [
+        "\"sh\"",
+        "\"bash\"",
+        "\"zsh\"",
+        "\"/bin/sh\"",
+        "\"cmd\"",
+        "\"cmd.exe\"",
+        "\"powershell\"",
+        "arg(\"-c\")",
+        "sh -c",
+    ];
+
+    let src = src_dir();
+    let mut sources = Vec::new();
+    rust_sources(&src, &mut sources);
+    sources.sort();
+    assert!(
+        sources.len() >= 5,
+        "the walk found only {} source files — it is not seeing src/**",
+        sources.len()
+    );
+
+    let mut offenders = Vec::new();
+    let mut scanned_lines = 0usize;
+    for path in &sources {
+        let text = std::fs::read_to_string(path).expect("source file readable");
+        let shipped: Vec<&str> = text
+            .lines()
+            .take_while(|line| !line.trim_start().starts_with("#[cfg(test)]"))
+            .collect();
+        scanned_lines += shipped.len();
+        for (i, line) in shipped.iter().enumerate() {
+            let code = line.trim_start();
+            if code.starts_with("//") {
+                continue;
+            }
+            for needle in SHELL_NEEDLES {
+                if line.contains(needle) {
+                    let rel = path.strip_prefix(&src).unwrap_or(path);
+                    offenders.push(format!("{}:{}: {}", rel.display(), i + 1, code));
+                }
+            }
+        }
+    }
+    assert!(
+        scanned_lines > 2_000,
+        "the scan covered only {scanned_lines} lines of shipped code — the \
+         `#[cfg(test)]` truncation has eaten the thing under test"
+    );
+
+    assert!(
+        offenders.is_empty(),
+        "a link destination must never reach a shell: with argv there is no \
+         parser to escape from, and with `sh -c` every metacharacter in an \
+         untrusted document becomes live. Found: {offenders:#?}"
+    );
+
+    // The guard means nothing unless the opener it protects still exists and
+    // still names a real program — an absence-only assertion passes just as
+    // well after someone deletes the feature.
+    let link = std::fs::read_to_string(src.join("link.rs")).expect("link.rs readable");
+    assert!(
+        link.contains("fn opener_argv"),
+        "link.rs must still build the opener's argv in one place"
+    );
+    assert!(
+        stele::link::OPENER_PROGRAM == "open" || stele::link::OPENER_PROGRAM == "xdg-open",
+        "the opener must be the platform URL handler, got {:?}",
+        stele::link::OPENER_PROGRAM
+    );
+}

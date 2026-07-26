@@ -31,8 +31,15 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// The exact bytes `terminal::RESTORE_SEQUENCE` must put on the wire:
-/// end-synchronized-update, show-cursor, leave-alternate-screen.
-pub const RESTORE: &[u8] = b"\x1b[?2026l\x1b[?25h\x1b[?1049l";
+/// end-synchronized-update, disable mouse reporting (SGR then normal
+/// tracking), show-cursor, leave-alternate-screen.
+///
+/// The mouse pair is inside the restore rather than on a separate exit path
+/// because mouse capture is state on the *terminal* (DW-6.6): a `kill -TERM`
+/// that skipped it would leave a shell whose every click writes escape bytes
+/// into the prompt. `assert_restores_the_terminal` compares the ending's whole
+/// wire against this by **equality**, so this constant is what pins the order.
+pub const RESTORE: &[u8] = b"\x1b[?2026l\x1b[?1006l\x1b[?1000l\x1b[?25h\x1b[?1049l";
 pub const ENTER_ALT: &[u8] = b"\x1b[?1049h";
 pub const HIDE_CURSOR: &[u8] = b"\x1b[?25l";
 
@@ -185,18 +192,59 @@ pub enum ChildStdin<'a> {
     Pipe(&'a [u8]),
 }
 
-/// Spawns the real binary on `pty` with `args`, its stdout and stderr on the
-/// pty slave and its stdin as `stdin` says.
+/// Whether the spawned viewer has the graphics path switched on.
 ///
-/// Environment is fixed rather than inherited: `TERM_PROGRAM` is *removed*, so
-/// graphics stay off and the startup cell-geometry query never runs — these
-/// tests are about what reaches the wire as text.
-pub fn spawn_viewer(pty: &Pty, args: &[&OsStr], stdin: ChildStdin<'_>) -> Child {
+/// stele gates images on `TERM_PROGRAM=ghostty`, so removing that variable
+/// does not merely hide pictures — it makes `ImageSizer`, `GfxMediaSink` and
+/// every path underneath them **unreachable from the test suite**. That is
+/// not a hypothetical cost: a security review found an image-path hang
+/// (`open(2)` on a FIFO named by `![x](pipe.png)`) that four rounds of gates
+/// had missed, because every pty test in this suite ran with graphics off and
+/// the media interface never executed at all.
+///
+/// [`Graphics::Off`] therefore stays the default — it is what keeps the
+/// text-oriented tests asserting on frames that contain no base64 APC
+/// payloads, and it skips the 250 ms startup cell-geometry query the pty
+/// never answers — but [`Graphics::On`] exists so the media path is reachable
+/// and is exercised by at least one test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Graphics {
+    /// `TERM_PROGRAM` removed: no images, no startup geometry query.
+    Off,
+    /// `TERM_PROGRAM=ghostty`: `ImageSizer` and `GfxMediaSink` are live.
+    On,
+}
+
+/// Spawns the real binary on `pty` with `args`, its stdout and stderr on the
+/// pty slave and its stdin as `stdin` says. Graphics off — see
+/// [`spawn_viewer_with`] when the media path is the thing under test.
+pub fn spawn_viewer(pty: &Pty, args: &[&OsStr], stdin: ChildStdin<'_>) -> ViewerProcess {
+    spawn_viewer_with(pty, args, stdin, Graphics::Off)
+}
+
+/// [`spawn_viewer`] with an explicit [`Graphics`] setting.
+///
+/// Environment is fixed rather than inherited so a developer's own exports
+/// cannot silently change what these tests see on the wire.
+pub fn spawn_viewer_with(
+    pty: &Pty,
+    args: &[&OsStr],
+    stdin: ChildStdin<'_>,
+    graphics: Graphics,
+) -> ViewerProcess {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_stele"));
     cmd.args(args)
         .env("TERM", "xterm-256color")
-        .env_remove("TERM_PROGRAM")
-        .env_remove("TMUX")
+        .env_remove("TMUX");
+    match graphics {
+        Graphics::Off => {
+            cmd.env_remove("TERM_PROGRAM");
+        }
+        Graphics::On => {
+            cmd.env("TERM_PROGRAM", "ghostty");
+        }
+    }
+    cmd
         // Truecolor is the default unless `NO_COLOR` is set, and a developer
         // who exports it would otherwise silently change what these tests see
         // on the wire.
@@ -240,7 +288,44 @@ pub fn spawn_viewer(pty: &Pty, args: &[&OsStr], stdin: ChildStdin<'_>) -> Child 
         // rather than fail.
         drop(pipe);
     }
-    child
+    ViewerProcess(child)
+}
+
+/// A spawned viewer that is **killed and reaped when it goes out of scope**.
+///
+/// `std::process::Child` deliberately does not kill on drop, so every one of
+/// these tests that failed an assertion left a live `stele` holding a pty
+/// open — nine orphans were counted on one machine after a few review runs.
+/// A test that panics is exactly when the child is least likely to have been
+/// quit cleanly, so the cleanup has to be on the unwinding path.
+///
+/// Derefs to [`Child`], so `child.wait()` and `&mut child` keep working at
+/// every existing call site.
+pub struct ViewerProcess(Child);
+
+impl std::ops::Deref for ViewerProcess {
+    type Target = Child;
+
+    fn deref(&self) -> &Child {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for ViewerProcess {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.0
+    }
+}
+
+impl Drop for ViewerProcess {
+    fn drop(&mut self) {
+        // Both calls are best-effort and both are needed: `kill` is a no-op
+        // error once the child has exited, and `wait` is what actually reaps
+        // the zombie — including in the ordinary case where the test already
+        // waited, since `Child::wait` caches its answer.
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
 
 /// The bytes that close a frame. Every repaint is wrapped in a mode-2026

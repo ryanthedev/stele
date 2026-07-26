@@ -66,24 +66,51 @@ impl std::error::Error for LoadError {}
 /// tool; the honest failure is a clear message, not a slow death.
 pub const MAX_DOCUMENT_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Reads `reader` to end, refusing anything past [`MAX_DOCUMENT_BYTES`].
+/// Reads `reader` to end, refusing anything past `limit` bytes.
 ///
 /// `take(limit + 1)` is what makes the refusal *bounded*: the read itself
 /// stops one byte past the ceiling, so an oversized source costs one extra
 /// byte of memory rather than all of it. Checking a length after an unbounded
 /// read would report the same error having already paid the cost.
-fn read_bounded<R: Read>(reader: R) -> Result<Vec<u8>, LoadError> {
+///
+/// `limit` is a parameter rather than a hardcoded [`MAX_DOCUMENT_BYTES`]
+/// because the barricade has a second, tighter door: a target opened by
+/// *following a link* is bounded by `link::MAX_LINK_FILE_BYTES`, not by the
+/// ceiling for a file the user named on the command line. One function, two
+/// budgets, so the `take(limit + 1)` discipline cannot drift between them.
+pub(crate) fn read_bounded<R: Read>(reader: R, limit: u64) -> Result<Vec<u8>, LoadError> {
     let mut bytes = Vec::new();
     reader
-        .take(MAX_DOCUMENT_BYTES.saturating_add(1))
+        .take(limit.saturating_add(1))
         .read_to_end(&mut bytes)
         .map_err(LoadError::Io)?;
-    if bytes.len() as u64 > MAX_DOCUMENT_BYTES {
-        return Err(LoadError::TooLarge {
-            limit: MAX_DOCUMENT_BYTES,
-        });
+    if bytes.len() as u64 > limit {
+        return Err(LoadError::TooLarge { limit });
     }
     Ok(bytes)
+}
+
+/// Preprocess and parse already-validated UTF-8 source text into a
+/// [`LoadedDocument`] named `name`.
+///
+/// The single seam between "some bytes we have decided are a document" and a
+/// parsed AST. [`DocumentSource::load_with`] and `crate::link`'s
+/// link-following path both come through here, so the parse-once rule
+/// (DW-2.5) and the frontmatter/mermaid preprocessing order are stated once
+/// rather than reimplemented per entry point. [`FileInfo`] describes the text
+/// **as read** — before preprocessing — for the reason `load_with` documents.
+pub fn document_from_text(text: &str, name: String, options: LoadOptions) -> LoadedDocument {
+    let info = FileInfo {
+        name,
+        byte_size: text.len() as u64,
+        line_count: text.lines().count(),
+    };
+    let prepared = crate::decor::frontmatter::apply(text, options.show_frontmatter);
+    let doc = crate::decor::mermaid::parse(&prepared);
+    LoadedDocument {
+        doc: Rc::new(doc),
+        info,
+    }
 }
 
 /// Source-text preprocessing policy, fixed for a session by the CLI.
@@ -140,25 +167,14 @@ impl DocumentSource {
         // already retries on `ErrorKind::Interrupted` (EINTR), so no retry
         // loop is needed on either.
         let bytes = match self {
-            DocumentSource::Path(path) => {
-                read_bounded(std::fs::File::open(path).map_err(LoadError::Io)?)?
-            }
-            DocumentSource::Stdin => read_bounded(std::io::stdin().lock())?,
+            DocumentSource::Path(path) => read_bounded(
+                std::fs::File::open(path).map_err(LoadError::Io)?,
+                MAX_DOCUMENT_BYTES,
+            )?,
+            DocumentSource::Stdin => read_bounded(std::io::stdin().lock(), MAX_DOCUMENT_BYTES)?,
         };
         let text = String::from_utf8(bytes).map_err(|_| LoadError::InvalidUtf8)?;
-
-        let info = FileInfo {
-            name: self.display_name(),
-            byte_size: text.len() as u64,
-            line_count: text.lines().count(),
-        };
-        let prepared = crate::decor::frontmatter::apply(&text, options.show_frontmatter);
-        let doc = crate::decor::mermaid::parse(&prepared);
-
-        Ok(LoadedDocument {
-            doc: Rc::new(doc),
-            info,
-        })
+        Ok(document_from_text(&text, self.display_name(), options))
     }
 
     /// Whether the source's contents may have changed since `since`.

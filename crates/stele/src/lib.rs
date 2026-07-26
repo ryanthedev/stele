@@ -21,6 +21,7 @@
 pub mod app;
 pub mod cli;
 pub mod decor;
+pub mod link;
 pub mod loader;
 pub mod media;
 pub mod painter;

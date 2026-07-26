@@ -78,7 +78,14 @@ impl Limits {
 pub enum DecodeError {
     Io(std::io::Error),
     Malformed(String),
-    ExceedsLimits { width: u32, height: u32 },
+    ExceedsLimits {
+        width: u32,
+        height: u32,
+    },
+    /// The path exists but is not a regular file — a directory, a FIFO, a
+    /// socket, a character or block device. Settled by `stat`, before
+    /// anything opens it.
+    NotAFile(std::path::PathBuf),
 }
 
 impl std::fmt::Display for DecodeError {
@@ -90,6 +97,9 @@ impl std::fmt::Display for DecodeError {
                 f,
                 "image dimensions {width}x{height} exceed the configured limits"
             ),
+            DecodeError::NotAFile(path) => {
+                write!(f, "not a regular file: {}", path.display())
+            }
         }
     }
 }
@@ -112,10 +122,43 @@ pub struct DecodedImage {
     pub png: Vec<u8>,
 }
 
+/// Opens `path` as an image reader — **after** settling, by `stat`, that it
+/// is a regular file.
+///
+/// The type check lives here rather than in the callers, and that placement
+/// is the whole point. `ImageReader::open` is the only place in this
+/// workspace that turns a document-supplied path into an open file, and a
+/// document-supplied path is untrusted: `![x](pipe.png)` where `pipe.png` is
+/// a FIFO with no writer makes `open(2)` block forever. Both of this
+/// module's entry points reach it, both of `crates/stele`'s media call sites
+/// reach those, and every one of them runs inside the event loop with the
+/// terminal in raw mode — where Ctrl-C is an ordinary keystroke, not a
+/// signal, so a blocked `open` leaves a viewer that cannot be quit from the
+/// keyboard at all. It was reproduced exactly that way: 801 of 801 stack
+/// samples inside `open`, process killed from outside.
+///
+/// The same defect had already been found three times on the *document*
+/// paths (`Navigator::back`, the `--watch` reload, and the link target
+/// itself), each time fixed at a call site. Fixing it at the call sites once
+/// more would leave the next caller of this module exposed — so it is fixed
+/// at the one function that owns "a path becomes pixels", which is what
+/// makes a fifth instance impossible rather than merely fixing the two that
+/// are visible today.
+///
+/// `stat` rather than an opened-descriptor `fstat`, because by the time a
+/// descriptor exists the block has already happened. That leaves the same
+/// narrow race the document barricade documents — a path swapped between the
+/// `stat` and the `open` — and it is bounded the same way: an attacker who
+/// can win it can already write into the document's directory at the instant
+/// of a repaint.
 fn opened(
     path: &Path,
     limits: Limits,
 ) -> Result<ImageReader<std::io::BufReader<std::fs::File>>, DecodeError> {
+    let meta = std::fs::metadata(path).map_err(DecodeError::Io)?;
+    if !meta.is_file() {
+        return Err(DecodeError::NotAFile(path.to_path_buf()));
+    }
     let mut reader = ImageReader::open(path)
         .map_err(DecodeError::Io)?
         .with_guessed_format()
@@ -761,5 +804,113 @@ mod tests {
             "top-left margin pixel must be fully transparent"
         );
         assert_eq!(raster.get_pixel(0, 47).0[3], 0);
+    }
+
+    // ------------------- untrusted paths that must never be opened --------
+
+    /// **The security review's fourth blocker.** A document-supplied image
+    /// path pointing at a FIFO with no writer blocks `open(2)` forever, and
+    /// this runs inside the event loop under raw mode where Ctrl-C is a
+    /// keystroke rather than a signal — a viewer that cannot be quit from the
+    /// keyboard.
+    ///
+    /// Both public entry points are checked, because both reach `opened`, and
+    /// each is behind a watchdog: a regression **hangs**, so a bare call
+    /// would wedge the suite instead of failing it.
+    #[test]
+    #[cfg(unix)]
+    fn test_a_fifo_image_path_is_refused_by_type_and_never_opened() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let path = scratch_path("fifo-image");
+        let _ = std::fs::remove_file(&path);
+        let made = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .expect("run mkfifo");
+        assert!(made.success(), "mkfifo failed: {made:?}");
+
+        for (label, probe) in [("probe_dimensions", 0usize), ("decode_and_scale", 1usize)] {
+            let (tx, rx) = mpsc::channel();
+            let path_for_thread = path.clone();
+            std::thread::spawn(move || {
+                let limits = Limits::default();
+                let answer = if probe == 0 {
+                    probe_dimensions(&path_for_thread, limits).err()
+                } else {
+                    decode_and_scale(&path_for_thread, (16, 16), limits).err()
+                };
+                let _ = tx.send(match answer {
+                    Some(err) => format!("{err:?}"),
+                    None => "opened".to_string(),
+                });
+            });
+            let answer = rx.recv_timeout(Duration::from_secs(5)).unwrap_or_else(|_| {
+                panic!(
+                    "{label} did not return within 5s on a FIFO — this is the \
+                     blocker: `open(2)` blocks and the viewer can no longer be \
+                     quit from the keyboard"
+                )
+            });
+            assert!(
+                answer.starts_with("NotAFile"),
+                "{label} must refuse by type before opening, got {answer}"
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A character device would read forever rather than block; the same
+    /// `stat` settles it.
+    #[test]
+    #[cfg(unix)]
+    fn test_a_character_device_image_path_is_refused_by_type() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let err = probe_dimensions(Path::new("/dev/zero"), Limits::default()).err();
+            let _ = tx.send(match err {
+                Some(err) => format!("{err:?}"),
+                None => "opened".to_string(),
+            });
+        });
+        let answer = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("probing /dev/zero must return promptly, not read forever");
+        assert!(answer.starts_with("NotAFile"), "got {answer}");
+    }
+
+    #[test]
+    fn test_a_directory_image_path_is_refused_by_type() {
+        let dir = scratch_path("dir-image");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let err =
+            probe_dimensions(&dir, Limits::default()).expect_err("a directory is not an image");
+        assert!(matches!(err, DecodeError::NotAFile(_)), "{err:?}");
+        assert!(err.to_string().starts_with("not a regular file:"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The guard must not have narrowed the ordinary cases: a real PNG still
+    /// decodes, and a missing path is still the `Io` error callers already
+    /// degrade on.
+    #[test]
+    fn test_the_type_guard_leaves_real_images_and_missing_paths_alone() {
+        let png = write_file("guard-ok.png", &valid_tiny_png());
+        assert!(probe_dimensions(&png, Limits::default()).is_ok());
+        assert!(decode_and_scale(&png, (8, 8), Limits::default()).is_ok());
+        let _ = std::fs::remove_file(&png);
+
+        let missing = scratch_path("guard-missing.png");
+        let _ = std::fs::remove_file(&missing);
+        let err = probe_dimensions(&missing, Limits::default()).expect_err("no such file");
+        assert!(
+            matches!(err, DecodeError::Io(_)),
+            "a missing file must stay the Io error callers already handle: {err:?}"
+        );
     }
 }

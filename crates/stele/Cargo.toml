@@ -37,6 +37,12 @@ width = { path = "../width" }
 # the guard against someone tidying this line away.
 crossterm = { version = "0.29", features = ["use-dev-tty"] }
 clap = { version = "4", features = ["derive"] }
+# OSC 52 clipboard payloads (DW-6.7), and — in tests — decoding a transmitted
+# raster back off the wire. The same crate `crates/gfx` already uses for kitty
+# transmission, so this adds nothing to the dependency graph. Encoding before
+# interpolation is also what makes the OSC 52 sequence injection-proof: the
+# base64 alphabet contains no ESC, no BEL and no `;`.
+base64 = "0.22"
 
 # Signal handling for terminal restore (DW-5.1): SIGTERM/SIGHUP/SIGINT bypass
 # `Drop`, so the guard alone cannot honour "never leak raw mode / the alternate
@@ -57,9 +63,3 @@ rustix = { version = "1", features = ["event"] }
 [dev-dependencies]
 # Test-only: building synthetic PNG fixtures for media-module tests.
 image = { version = "0.25", default-features = false, features = ["png"] }
-
-# Test-only: decoding a transmitted raster back off the wire. DW-6.5's claim
-# is about the raster's *pixel* size changing while its *cell* box does not,
-# and the only honest place to read the pixel size is the `a=t` payload the
-# terminal would receive.
-base64 = "0.22"

@@ -17,7 +17,7 @@ use highlight::{HYPERLINK_CLOSE, HighlightCache, hyperlink_open};
 use layout::{LayoutTree, Line, LineItem, Reserved, ReservedLine, Run, Semantic, StyleId};
 use width::WidthEngine;
 
-use crate::app::{Match, StatusLine, TocRow, line_text_len};
+use crate::app::{LinkSpan, Match, StatusLine, TocRow, line_text_len};
 use crate::decor::{Decor, StructuralDecor};
 use crate::media::{MediaSink, NoopMediaSink};
 
@@ -90,6 +90,11 @@ const SYNC_END: &[u8] = b"\x1b[?2026l";
 /// from a longer previous one.
 const CLEAR_TO_EOL: &[u8] = b"\x1b[K";
 const SGR_RESET: &[u8] = b"\x1b[0m";
+/// Reverse video — the link-selection indicator (DW-6.1) and the TOC
+/// overlay's selected row use the same attribute, for the same reason: it is
+/// the one thing legible against whatever background either theme variant
+/// happens to be painting on.
+const SGR_REVERSE: &[u8] = b"\x1b[7m";
 
 /// The search matches to highlight in one frame (DW-4.4).
 ///
@@ -115,6 +120,24 @@ impl SearchOverlay<'_> {
     }
 }
 
+/// Both document overlays for one frame: search matches to highlight
+/// (DW-4.4) and the run ranges of the selected link (DW-6.1).
+///
+/// One parameter rather than two because they travel together everywhere —
+/// [`Painter::frame_with_overlays`] takes them, [`RowOverlays`] is their
+/// per-line projection — and because naming the pair is what says they are
+/// *composable features of one frame* rather than alternative frame kinds.
+/// Both default to off, which is what keeps `frame`, `frame_with_status`,
+/// `frame_with_search` and `frame_with_selection` as one-liners over the same
+/// implementation.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FrameOverlays<'a> {
+    pub search: SearchOverlay<'a>,
+    /// Absolute-line-addressed run ranges of the selected link. Empty outside
+    /// [`crate::app::Mode::LinkSelect`].
+    pub selected: &'a [LinkSpan],
+}
+
 /// One restyled stretch of a single tree line: a half-open byte range into
 /// that line's painted text, and the role to paint it in.
 ///
@@ -126,6 +149,35 @@ struct Span {
     start: usize,
     end: usize,
     role: Semantic,
+}
+
+/// Everything one painted row needs beyond the line itself: both overlays,
+/// already resolved for *this* line.
+///
+/// Bundled rather than passed as two more parameters because the paint loop
+/// hands them down three levels — `frame_body` → `paint_line` → `paint_items`
+/// → `paint_run` — and four positional arguments of which two are overlays is
+/// exactly the shape `cc-routine-and-class-design` warns about. It is also
+/// the place to say the thing neither field says alone: **the two overlays
+/// compose.** A search span replaces a run's style role; a selection sets the
+/// reverse attribute on top of whatever role won. A match inside the selected
+/// link reads as both.
+#[derive(Debug, Clone, Copy, Default)]
+struct RowOverlays<'a> {
+    /// Search highlights on this line, addressed in byte offsets into the
+    /// line's painted text (DW-4.4). Empty when no search is active.
+    spans: &'a [Span],
+    /// The inclusive `LineItem` index range of the selected link's run group
+    /// on this line, if the selected link paints here at all (DW-6.1).
+    selected_items: Option<(usize, usize)>,
+}
+
+impl RowOverlays<'_> {
+    /// Whether the item at `index` is part of the selected link.
+    fn selects(&self, index: usize) -> bool {
+        self.selected_items
+            .is_some_and(|(first, last)| index >= first && index <= last)
+    }
 }
 
 /// Whole-viewport immediate painter: no cell-grid differ, one full repaint
@@ -236,19 +288,12 @@ impl Painter {
         status: &StatusLine,
         out: &mut dyn Write,
     ) -> io::Result<()> {
-        self.frame_with_search(tree, scroll, size, status, SearchOverlay::default(), out)
+        self.frame_with_overlays(tree, scroll, size, status, FrameOverlays::default(), out)
     }
 
     /// [`Painter::frame_with_status`] plus search-match highlighting
-    /// (DW-4.4): every match `overlay` places inside the visible rows is
-    /// painted in [`Semantic::SearchMatch`], and `overlay.current` in
-    /// [`Semantic::SearchCurrent`].
-    ///
-    /// This is the real implementation, in the same relationship to
-    /// `frame_with_status` that `frame_with_status` already has to `frame`:
-    /// each outer entry point is its successor with one feature defaulted
-    /// off, so no existing call site changes and every frame goes down one
-    /// code path.
+    /// (DW-4.4). A thin default of [`Painter::frame_with_overlays`] with no
+    /// link selected.
     pub fn frame_with_search(
         &mut self,
         tree: &LayoutTree,
@@ -258,10 +303,64 @@ impl Painter {
         overlay: SearchOverlay<'_>,
         out: &mut dyn Write,
     ) -> io::Result<()> {
-        let spans = visible_spans(tree, scroll, size.height, overlay);
+        let overlays = FrameOverlays {
+            search: overlay,
+            selected: &[],
+        };
+        self.frame_with_overlays(tree, scroll, size, status, overlays, out)
+    }
+
+    /// [`Painter::frame_with_status`] plus the link-selection indicator
+    /// (DW-6.1). A thin default of [`Painter::frame_with_overlays`] with no
+    /// search active.
+    pub fn frame_with_selection(
+        &mut self,
+        tree: &LayoutTree,
+        scroll: usize,
+        size: Size,
+        status: &StatusLine,
+        selected: &[LinkSpan],
+        out: &mut dyn Write,
+    ) -> io::Result<()> {
+        let overlays = FrameOverlays {
+            search: SearchOverlay::default(),
+            selected,
+        };
+        self.frame_with_overlays(tree, scroll, size, status, overlays, out)
+    }
+
+    /// The one document-frame implementation: content rows, both overlays,
+    /// and the reserved status row, inside one synchronized-update block.
+    ///
+    /// **Both overlays, in one call, on purpose.** Search highlighting
+    /// (DW-4.4) and the link-selection indicator (DW-6.1) arrived in
+    /// different phases and each began as its own wrapper around the paint
+    /// path. Two wrappers is two paint paths the moment a reader has a query
+    /// active and then presses `Tab` — whichever wrapper the event loop
+    /// picked would silently drop the other's highlighting. They are not
+    /// alternatives: a search restyles bytes by *role*, a selection sets the
+    /// reverse *attribute* over whatever role won, so they compose rather
+    /// than compete. `frame`, `frame_with_status`, `frame_with_search` and
+    /// `frame_with_selection` are all this call with features defaulted off,
+    /// which keeps every existing call site working and every frame on one
+    /// code path.
+    ///
+    /// Determinism still holds: like `overlay`, `selected` is an argument
+    /// rather than painter state, so identical arguments still produce
+    /// identical bytes.
+    pub fn frame_with_overlays(
+        &mut self,
+        tree: &LayoutTree,
+        scroll: usize,
+        size: Size,
+        status: &StatusLine,
+        overlays: FrameOverlays<'_>,
+        out: &mut dyn Write,
+    ) -> io::Result<()> {
+        let spans = visible_spans(tree, scroll, size.height, overlays.search);
         out.write_all(SYNC_BEGIN)?;
         let painted = self
-            .frame_body(tree, scroll, size, &spans, out)
+            .frame_body(tree, scroll, size, &spans, overlays.selected, out)
             .and_then(|()| self.paint_status_row(status, size, out));
         let closed = out.write_all(SYNC_END).and_then(|()| out.flush());
         painted.and(closed)
@@ -369,6 +468,7 @@ impl Painter {
         scroll: usize,
         size: Size,
         spans: &BTreeMap<usize, Vec<Span>>,
+        selected: &[LinkSpan],
         out: &mut dyn Write,
     ) -> io::Result<()> {
         // Every frame, media or not: the sink needs a reliable boundary to
@@ -395,8 +495,18 @@ impl Painter {
                         _ => line.width().min(size.width),
                     };
                 }
-                let line_spans = spans.get(&idx).map_or(&[][..], Vec::as_slice);
-                self.paint_line(line, row, size, line_spans, out)?;
+                // Both overlays are addressed by *absolute line index*, not
+                // by viewport row, so both are looked up by the line this row
+                // is showing — scrolling must not move either highlight onto
+                // different text.
+                let overlays = RowOverlays {
+                    spans: spans.get(&idx).map_or(&[][..], Vec::as_slice),
+                    selected_items: selected
+                        .iter()
+                        .find(|span| span.line == idx)
+                        .map(|span| (span.first_item, span.last_item)),
+                };
+                self.paint_line(line, row, size, overlays, out)?;
             }
             out.write_all(CLEAR_TO_EOL)?;
         }
@@ -454,13 +564,14 @@ impl Painter {
         line: &Line,
         row: u16,
         size: Size,
-        spans: &[Span],
+        overlays: RowOverlays<'_>,
         out: &mut dyn Write,
     ) -> io::Result<()> {
         match line {
-            Line::Items(items) => self.paint_items(items, row, size.width, spans, out),
-            // A reserved media row carries no searchable text (see
-            // `app::append_line_text`), so no span can ever address it.
+            Line::Items(items) => self.paint_items(items, row, size.width, overlays, out),
+            // A reserved media row carries no text runs: no searchable text
+            // (see `app::append_line_text`) and no link runs, so neither
+            // overlay can address it.
             Line::Reserved(line) => self.paint_reserved(line, row, size, out),
         }
     }
@@ -493,7 +604,7 @@ impl Painter {
             if remaining == 0 {
                 break;
             }
-            let painted = self.paint_run(run, remaining, 0, &[], out)?;
+            let painted = self.paint_run(run, remaining, 0, &[], false, out)?;
             col = col.saturating_add(painted.width);
             painted_any |= painted.wrote_text;
             if painted.line_full {
@@ -538,20 +649,22 @@ impl Painter {
         items: &[LineItem],
         row: u16,
         width: u16,
-        spans: &[Span],
+        overlays: RowOverlays<'_>,
         out: &mut dyn Write,
     ) -> io::Result<()> {
         let mut col: u16 = 0;
         let mut byte = 0usize;
         let mut painted_any = false;
-        for item in items {
+        for (index, item) in items.iter().enumerate() {
             let remaining = width.saturating_sub(col);
             if remaining == 0 {
                 break;
             }
+            let reverse = overlays.selects(index);
             match item {
                 LineItem::Run(run) => {
-                    let painted = self.paint_run(run, remaining, byte, spans, out)?;
+                    let painted =
+                        self.paint_run(run, remaining, byte, overlays.spans, reverse, out)?;
                     byte += run.text.len();
                     col = col.saturating_add(painted.width);
                     painted_any |= painted.wrote_text;
@@ -579,12 +692,22 @@ impl Painter {
     /// `base` is the run's byte offset within its line and `spans` the
     /// line's search highlights, both in the same coordinate system, so a
     /// match that starts mid-run restyles exactly its own bytes.
+    ///
+    /// `reverse` paints this run as the selected link (DW-6.1). The two
+    /// overlays are applied at different levels and therefore compose rather
+    /// than fight: a search span replaces a run's *role* before any SGR is
+    /// written, while `reverse` is an attribute emitted as its own SGR
+    /// *after* [`write_sgr`] — a match inside the selected link still reads
+    /// as a match, and still reads as selected. It has to come after
+    /// `write_sgr` because that opens with an unconditional reset, which
+    /// would wipe a reverse attribute set ahead of it.
     fn paint_run(
         &mut self,
         run: &Run,
         remaining: u16,
         base: usize,
         spans: &[Span],
+        reverse: bool,
         out: &mut dyn Write,
     ) -> io::Result<PaintedRun> {
         let expanded = self.expand(run);
@@ -633,6 +756,9 @@ impl Painter {
             }
             let style = self.decor.resolve(expanded_run.style_id);
             write_sgr(out, &style)?;
+            if reverse {
+                out.write_all(SGR_REVERSE)?;
+            }
             out.write_all(clipped_text.as_bytes())?;
             if link_open.is_some() {
                 out.write_all(HYPERLINK_CLOSE.as_bytes())?;
@@ -925,6 +1051,41 @@ pub(crate) fn clip_to_width(text: &str, engine: &WidthEngine, max_width: u16) ->
         out.push_str(cluster);
     }
     (out, used.min(u16::MAX as usize) as u16)
+}
+
+/// The screen columns each item of a text line occupies, as
+/// `(start, end_exclusive)` pairs indexed exactly as `items` is.
+///
+/// The mouse hit-test's oracle (DW-6.6). It **re-measures** through the same
+/// [`sanitize`] + [`clip_to_width`] pair [`Painter::paint_items`] paints with,
+/// rather than summing `Run.width`: a run that lies about its own width would
+/// otherwise put the clickable region somewhere the glyphs are not, and
+/// `docs/code-standards.md` names trusting `Run.width` as the mistake that
+/// hides exactly this class of bug.
+///
+/// An item that the row ran out of room for gets a zero-width entry at the
+/// clip column, so indices stay aligned with `items` and a click past the clip
+/// matches nothing.
+pub(crate) fn item_columns(
+    items: &[LineItem],
+    engine: &WidthEngine,
+    width: u16,
+) -> Vec<(u16, u16)> {
+    let mut columns = Vec::with_capacity(items.len());
+    let mut col: u16 = 0;
+    for item in items {
+        let remaining = width.saturating_sub(col);
+        let painted = match item {
+            LineItem::Run(run) => {
+                let sanitized = sanitize(&run.text);
+                clip_to_width(&sanitized, engine, remaining).1
+            }
+            LineItem::Box(reserved) => reserved.cols.min(remaining),
+        };
+        columns.push((col, col.saturating_add(painted)));
+        col = col.saturating_add(painted);
+    }
+    columns
 }
 
 /// Writes the SGR sequence for `style`: an unconditional reset (so runs
@@ -2039,5 +2200,441 @@ impl<'a, W: Write + 'a> Iterator for FrameSweep<'a, W> {
         let text = String::from_utf8_lossy(&buf);
         assert!(text.contains("abcdefghij"));
         assert!(!text.contains("abcdefghijk"));
+    }
+
+    // ------------------------------------------------------------- Phase 6
+
+    fn linked_tree(source: &str, width: u16) -> LayoutTree {
+        let doc = Document::parse(source);
+        layout(&doc, width, &LayoutConfig::default(), &engine(), &NullSizer)
+    }
+
+    /// The cells of a painted frame's row `row` (1-indexed) that carry the
+    /// reverse-video attribute, as a `(start, text)` pair per reversed span.
+    ///
+    /// Replays the SGR stream the way a terminal would rather than searching
+    /// for a substring: `\x1b[7m` set somewhere and reset somewhere else is
+    /// not the same claim as "these glyphs are reversed".
+    fn reversed_spans(frame: &str, row: u16) -> Vec<(usize, String)> {
+        let chars: Vec<char> = frame.chars().collect();
+        let mut spans: Vec<(usize, String)> = Vec::new();
+        let mut cur_row: u16 = 1;
+        let mut col = 0usize;
+        let mut reverse = false;
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i] == '\u{1b}' && chars.get(i + 1) == Some(&'[') {
+                let mut j = i + 2;
+                while j < chars.len() && !chars[j].is_ascii_alphabetic() {
+                    j += 1;
+                }
+                let params: String = chars[i + 2..j].iter().collect();
+                match chars.get(j) {
+                    Some('H') => {
+                        let mut it = params.split(';');
+                        cur_row = it.next().and_then(|v| v.parse().ok()).unwrap_or(1);
+                        col = it
+                            .next()
+                            .and_then(|v| v.parse::<usize>().ok())
+                            .unwrap_or(1)
+                            .saturating_sub(1);
+                    }
+                    Some('m') => {
+                        // `write_sgr` opens with a reset, so any `m` sequence
+                        // that is not exactly `7` clears the attribute.
+                        reverse = params == "7";
+                    }
+                    _ => {}
+                }
+                i = j + 1;
+                continue;
+            }
+            if cur_row == row && reverse {
+                match spans.last_mut() {
+                    Some((start, text)) if *start + text.chars().count() == col => {
+                        text.push(chars[i])
+                    }
+                    _ => spans.push((col, chars[i].to_string())),
+                }
+            }
+            col += 1;
+            i += 1;
+        }
+        spans
+    }
+
+    #[test]
+    fn test_dw_6_1_the_selected_link_is_painted_in_reverse_video_and_its_neighbour_is_not() {
+        let tree = linked_tree("See [alpha](a.md) then [beta](b.md) end.\n", 60);
+        let size = Size {
+            width: 60,
+            height: 4,
+        };
+        let mut painter = Painter::new(engine());
+
+        // With no selection nothing on the row is reversed.
+        let mut plain = Vec::new();
+        painter
+            .frame_with_status(&tree, 0, size, &StatusLine::default(), &mut plain)
+            .expect("paint");
+        assert!(
+            reversed_spans(&String::from_utf8_lossy(&plain), 1).is_empty(),
+            "an unselected document must paint no reverse video"
+        );
+
+        // Select the *second* link's run and only its glyphs come back reversed.
+        let Some(Line::Items(items)) = tree.lines(0..1).next() else {
+            panic!("the fixture's first line must be text");
+        };
+        let beta = items
+            .iter()
+            .position(|item| match item {
+                LineItem::Run(run) => run.text == "beta",
+                LineItem::Box(_) => false,
+            })
+            .expect("a run painting `beta`");
+        let mut selected = Vec::new();
+        painter
+            .frame_with_selection(
+                &tree,
+                0,
+                size,
+                &StatusLine::default(),
+                &[LinkSpan {
+                    line: 0,
+                    first_item: beta,
+                    last_item: beta,
+                }],
+                &mut selected,
+            )
+            .expect("paint");
+        let spans = reversed_spans(&String::from_utf8_lossy(&selected), 1);
+        assert_eq!(
+            spans.len(),
+            1,
+            "exactly one span must be reversed, got {spans:?}"
+        );
+        assert_eq!(spans[0].1, "beta", "and it must be the selected link");
+    }
+
+    /// **Both overlays on one frame.** Search highlighting restyles bytes by
+    /// role; the link indicator sets the reverse attribute over whatever role
+    /// won. They are not alternatives, and the one frame call has to carry
+    /// both — a per-mode wrapper would silently drop one.
+    #[test]
+    fn test_a_search_highlight_and_a_link_indicator_paint_on_the_same_frame() {
+        let size = Size {
+            width: 60,
+            height: 4,
+        };
+        // The query matches text *outside* the link, so the two overlays are
+        // independently observable on the same row.
+        let mut state = searched("needle here [alpha](a.md) tail\n", size, "needle");
+        assert_eq!(state.search().matches.len(), 1);
+
+        // Select the link the way the key table does, so the spans come from
+        // the same code the event loop uses.
+        state.handle_key_event(KeyEvent::from(KeyCode::Tab));
+        let selected = state.selection_spans();
+        assert!(!selected.is_empty(), "the link must be selected");
+
+        let mut painter = Painter::new(engine());
+        let status = state.status();
+        let mut buf = Vec::new();
+        painter
+            .frame_with_overlays(
+                state.tree(),
+                state.scroll(),
+                size,
+                &status,
+                FrameOverlays {
+                    search: state.search_overlay(),
+                    selected: &selected,
+                },
+                &mut buf,
+            )
+            .expect("painting to a Vec cannot fail");
+        let wire = String::from_utf8(buf).expect("utf-8");
+
+        let current = sgr_for(painter.decor.as_ref(), Semantic::SearchCurrent);
+        assert_eq!(
+            highlighted_bytes(&wire, &current),
+            "needle".len(),
+            "the match must still be highlighted with a link selected: {wire:?}"
+        );
+        let reversed = reversed_spans(&wire, 1);
+        assert!(
+            reversed.iter().any(|(_, text)| text.contains("alpha")),
+            "…and the link must still be indicated: {reversed:?}"
+        );
+    }
+
+    /// The composition where they overlap: a match *inside* the selected link
+    /// must read as both. The search role wins the colour, the reverse
+    /// attribute rides on top — neither cancels the other.
+    #[test]
+    fn test_a_match_inside_the_selected_link_reads_as_a_match_and_as_selected() {
+        let size = Size {
+            width: 60,
+            height: 4,
+        };
+        let mut state = searched("prose [needle](a.md) tail\n", size, "needle");
+        assert_eq!(state.search().matches.len(), 1);
+        state.handle_key_event(KeyEvent::from(KeyCode::Tab));
+        let selected = state.selection_spans();
+        assert!(!selected.is_empty());
+
+        let mut painter = Painter::new(engine());
+        let status = state.status();
+        let mut buf = Vec::new();
+        painter
+            .frame_with_overlays(
+                state.tree(),
+                state.scroll(),
+                size,
+                &status,
+                FrameOverlays {
+                    search: state.search_overlay(),
+                    selected: &selected,
+                },
+                &mut buf,
+            )
+            .expect("painting to a Vec cannot fail");
+        let wire = String::from_utf8(buf).expect("utf-8");
+
+        let current = sgr_for(painter.decor.as_ref(), Semantic::SearchCurrent);
+        assert!(
+            wire.contains(&format!("{current}\x1b[7mneedle")),
+            "the match role must be written first and the reverse attribute \
+             on top of it, so the text is both: {wire:?}"
+        );
+    }
+
+    #[test]
+    fn test_dw_6_1_a_selection_on_another_line_does_not_reverse_this_one() {
+        let tree = linked_tree("[one](a.md)\n\n[two](b.md)\n", 40);
+        let size = Size {
+            width: 40,
+            height: 6,
+        };
+        let mut painter = Painter::new(engine());
+        let mut buf = Vec::new();
+        // Line 2 is the blank between the two paragraphs; naming it must
+        // reverse nothing at all.
+        painter
+            .frame_with_selection(
+                &tree,
+                0,
+                size,
+                &StatusLine::default(),
+                &[LinkSpan {
+                    line: 1,
+                    first_item: 0,
+                    last_item: 9,
+                }],
+                &mut buf,
+            )
+            .expect("paint");
+        let wire = String::from_utf8_lossy(&buf).into_owned();
+        assert!(reversed_spans(&wire, 1).is_empty());
+        assert!(reversed_spans(&wire, 3).is_empty());
+    }
+
+    /// The indicator is addressed by absolute line index, not by viewport
+    /// row: scrolling must move the reverse video with the text it marks.
+    #[test]
+    fn test_dw_6_1_the_indicator_follows_the_line_it_names_across_a_scroll() {
+        let source = "filler\n\nfiller\n\nSee [target](t.md) here.\n";
+        let tree = linked_tree(source, 60);
+        let line = (0..tree.line_count())
+            .find(|&i| match tree.lines(i..i + 1).next() {
+                Some(Line::Items(items)) => items.iter().any(|item| match item {
+                    LineItem::Run(run) => run.text == "target",
+                    LineItem::Box(_) => false,
+                }),
+                Some(Line::Reserved(_)) | None => false,
+            })
+            .expect("the fixture must paint `target` somewhere");
+        let Some(Line::Items(items)) = tree.lines(line..line + 1).next() else {
+            panic!("text line");
+        };
+        let item = items
+            .iter()
+            .position(|it| matches!(it, LineItem::Run(run) if run.text == "target"))
+            .expect("a run");
+        let span = LinkSpan {
+            line,
+            first_item: item,
+            last_item: item,
+        };
+        let size = Size {
+            width: 60,
+            height: 3,
+        };
+        let mut painter = Painter::new(engine());
+
+        // Every scroll that still shows the marked line, so the row it lands
+        // on differs between iterations — which is the whole claim.
+        for scroll in line.saturating_sub(2)..=line {
+            let mut buf = Vec::new();
+            painter
+                .frame_with_selection(
+                    &tree,
+                    scroll,
+                    size,
+                    &StatusLine::default(),
+                    &[span],
+                    &mut buf,
+                )
+                .expect("paint");
+            let wire = String::from_utf8_lossy(&buf).into_owned();
+            let row = u16::try_from(line - scroll + 1).expect("small");
+            let spans = reversed_spans(&wire, row);
+            assert_eq!(
+                spans.iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>(),
+                vec!["target"],
+                "at scroll {scroll} the indicator must be on row {row}: {spans:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_dw_6_6_item_columns_agree_with_the_columns_the_painter_writes_to() {
+        // The oracle is the painted frame itself: every item's reported start
+        // column must be where its glyphs actually land.
+        let tree = linked_tree("ab [cd](x.md) efg\n", 40);
+        let Some(Line::Items(items)) = tree.lines(0..1).next() else {
+            panic!("text line");
+        };
+        let columns = item_columns(items, &engine(), 40);
+
+        let mut painter = Painter::new(engine());
+        let mut buf = Vec::new();
+        painter
+            .frame_with_status(
+                &tree,
+                0,
+                Size {
+                    width: 40,
+                    height: 2,
+                },
+                &StatusLine::default(),
+                &mut buf,
+            )
+            .expect("paint");
+        let row = crate::painter::tests::render_row_local(&String::from_utf8_lossy(&buf), 1, 40);
+
+        for (item, &(start, end)) in items.iter().zip(&columns) {
+            let LineItem::Run(run) = item else { continue };
+            if run.text.trim().is_empty() {
+                continue;
+            }
+            let painted: String = row
+                .chars()
+                .skip(usize::from(start))
+                .take(usize::from(end - start))
+                .collect();
+            assert_eq!(
+                painted, run.text,
+                "item_columns put {:?} at {start}..{end}, but the frame has {painted:?} there",
+                run.text
+            );
+        }
+    }
+
+    #[test]
+    fn test_item_columns_measures_double_width_clusters_rather_than_counting_them() {
+        // A CJK run is two cells per cluster; a hit-test that counted
+        // characters would put every later item two columns to the left of
+        // where it paints.
+        let tree = linked_tree("漢字 [x](a.md)\n", 40);
+        let Some(Line::Items(items)) = tree.lines(0..1).next() else {
+            panic!("text line");
+        };
+        let columns = item_columns(items, &engine(), 40);
+        let cjk = items
+            .iter()
+            .position(|item| matches!(item, LineItem::Run(run) if run.text.contains('漢')))
+            .expect("a CJK run");
+        let (start, end) = columns[cjk];
+        assert_eq!(
+            end - start,
+            4,
+            "two double-width clusters occupy four cells, not two"
+        );
+    }
+
+    #[test]
+    fn test_item_columns_clips_at_the_viewport_edge_and_stays_index_aligned() {
+        // Links are what split a line into several items — layout coalesces
+        // same-style text into one run, so a plain sentence is a single item
+        // and could not exercise the alignment claim at all.
+        let tree = linked_tree("aaaa [bbbb](b.md) cccc [dddd](d.md)\n", 60);
+        let Some(Line::Items(items)) = tree.lines(0..1).next() else {
+            panic!("text line");
+        };
+        assert!(items.len() > 3, "the fixture must produce several items");
+
+        let columns = item_columns(items, &engine(), 6);
+        assert_eq!(
+            columns.len(),
+            items.len(),
+            "every item must get an entry so indices stay aligned with `items`"
+        );
+        assert!(
+            columns.iter().all(|&(start, end)| start <= 6 && end <= 6),
+            "nothing may be reported past the viewport: {columns:?}"
+        );
+        assert!(
+            columns
+                .last()
+                .is_some_and(|&(start, end)| start == end && start == 6),
+            "once the budget is spent every later item must be zero-width at \
+             the clip column, so a click past the clip matches nothing: {columns:?}"
+        );
+    }
+
+    /// A copy of the integration harness's cell-grid replay, small enough to
+    /// live here: `tests/common/render.rs` is not reachable from a unit test.
+    pub(super) fn render_row_local(frame: &str, row: u16, width: usize) -> String {
+        let mut grid = vec![' '; width];
+        let chars: Vec<char> = frame.chars().collect();
+        let mut cur_row: u16 = 1;
+        let mut col = 0usize;
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i] == '\u{1b}' {
+                let mut j = i + 2;
+                while j < chars.len() && !chars[j].is_ascii_alphabetic() {
+                    j += 1;
+                }
+                let params: String = chars[i + 2..j].iter().collect();
+                match chars.get(j) {
+                    Some('H') => {
+                        let mut it = params.split(';');
+                        cur_row = it.next().and_then(|v| v.parse().ok()).unwrap_or(1);
+                        col = it
+                            .next()
+                            .and_then(|v| v.parse::<usize>().ok())
+                            .unwrap_or(1)
+                            .saturating_sub(1);
+                    }
+                    Some('K') if cur_row == row => {
+                        for c in grid.iter_mut().skip(col) {
+                            *c = ' ';
+                        }
+                    }
+                    _ => {}
+                }
+                i = j + 1;
+                continue;
+            }
+            if cur_row == row && col < width {
+                grid[col] = chars[i];
+            }
+            col += 1;
+            i += 1;
+        }
+        grid.into_iter().collect()
     }
 }

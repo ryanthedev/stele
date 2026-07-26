@@ -25,13 +25,72 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 /// printed after it) is actually rendered rather than buffered into a frame
 /// that never gets swapped in. Emitting `?2026l` when no block is open is a
 /// no-op, so the unconditional reset costs nothing on the normal path.
-const RESTORE_SEQUENCE: &[u8] = b"\x1b[?2026l\x1b[?25h\x1b[?1049l";
+/// (`?1006l` and `?1000l` turn mouse reporting back off — see
+/// [`MOUSE_ENABLE`]. They are *inside* this constant, not on a separate exit
+/// path, because mouse capture is state on the **terminal**: a panic or a
+/// `kill -TERM` that skipped them would hand the user back a shell whose
+/// every click writes escape bytes into their prompt. Emitting them when
+/// capture was never on, or was toggled off with `m`, is a no-op.)
+const RESTORE_SEQUENCE: &[u8] = b"\x1b[?2026l\x1b[?1006l\x1b[?1000l\x1b[?25h\x1b[?1049l";
+
+/// Turn on mouse reporting: normal tracking (button press/release, which is
+/// also how a wheel notch is reported) plus SGR extended coordinates.
+///
+/// Deliberately **not** crossterm's `EnableMouseCapture`, which additionally
+/// sets `?1002h` and `?1003h` — button-event and any-event tracking. Those
+/// report every pointer *motion*, so a reader moving the mouse across the
+/// window would wake this event loop hundreds of times a second for gestures
+/// it has no binding for. Wheel and click are what DW-6.6 acts on, and
+/// `?1000h` reports both. `?1006h` lifts the 223-column coordinate ceiling,
+/// and crossterm's parser reads SGR reports regardless of which modes we set.
+pub const MOUSE_ENABLE: &[u8] = b"\x1b[?1000h\x1b[?1006h";
+
+/// The inverse of [`MOUSE_ENABLE`], in reverse order. Also a substring of
+/// [`RESTORE_SEQUENCE`], which `test_dw_6_6_...` pins.
+pub const MOUSE_DISABLE: &[u8] = b"\x1b[?1006l\x1b[?1000l";
+
+/// The most base64 bytes an OSC 52 clipboard write may carry (DW-6.7).
+///
+/// Terminals cap what they will accept — xterm's default is 8192 *bytes of
+/// sequence*, and Ghostty's own ceiling is not documented — so a large code
+/// block can be silently dropped or, worse, truncated by the terminal
+/// mid-payload. 64 KiB of base64 (48 KiB of text) is comfortably above any
+/// real code block and below the point where a terminal is likely to be
+/// choosing for us. Past it [`osc52_copy`] returns `None` and the caller
+/// reports a refusal, because a *silently truncated* shell command on the
+/// clipboard is a hazard the reader cannot see, while "nothing was copied" is
+/// one they can.
+pub const MAX_CLIPBOARD_BASE64: usize = 64 * 1024;
 
 /// Enter-alternate-screen then hide-cursor, written once by
 /// [`TerminalGuard::enter`]. The cursor stays hidden for the session so it
 /// does not visibly hop during repaints; [`RESTORE_SEQUENCE`]'s `?25h`
 /// shows it again on the way out.
 const ENTER_SEQUENCE: &[u8] = b"\x1b[?1049h\x1b[?25l";
+
+/// Builds the OSC 52 sequence that puts `text` on the system clipboard
+/// (DW-6.7), or `None` when the base64 payload would exceed
+/// [`MAX_CLIPBOARD_BASE64`].
+///
+/// `ESC ] 52 ; c ; <base64> ST`. The `c` selects the clipboard proper (rather
+/// than the primary selection), and the terminator is ST (`ESC \`) to match
+/// every other OSC this codebase emits.
+///
+/// **Nothing needs sanitizing on the way in, and that is a property of base64
+/// rather than luck.** The payload is encoded before it is interpolated, and
+/// the standard base64 alphabet is `A-Za-z0-9+/=` — no ESC, no BEL, no `;`,
+/// so a code block full of escape sequences cannot close this sequence early
+/// or start another one. The one test that matters here scans the built
+/// sequence for stray control bytes rather than trusting that argument.
+pub fn osc52_copy(text: &str) -> Option<String> {
+    use base64::Engine as _;
+
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    if encoded.len() > MAX_CLIPBOARD_BASE64 {
+        return None;
+    }
+    Some(format!("\x1b]52;c;{encoded}\x1b\\"))
+}
 
 /// Cell geometry to use when the terminal will not say: `(width_px,
 /// height_px)`.
@@ -376,8 +435,25 @@ impl TerminalGuard {
             guard.cell_geometry = query_cell_px();
         }
         guard.writer.write_all(ENTER_SEQUENCE)?;
+        // Mouse capture starts on (DW-6.6) and `m` turns it off. Written here
+        // rather than by the event loop so it is bracketed by the same guard
+        // that owns the restore — there is no window in which reporting is on
+        // and nothing is armed to turn it back off.
+        guard.writer.write_all(MOUSE_ENABLE)?;
         guard.writer.flush()?;
         Ok(guard)
+    }
+
+    /// Turns mouse reporting on or off mid-session (DW-6.6).
+    ///
+    /// Writes to the guard's own writer rather than to the frame writer: this
+    /// is terminal *mode*, not frame content, and routing it through the
+    /// painter's `BufWriter` would leave it sitting unflushed until the next
+    /// frame ended.
+    pub fn set_mouse_capture(&mut self, on: bool) -> io::Result<()> {
+        let sequence = if on { MOUSE_ENABLE } else { MOUSE_DISABLE };
+        self.writer.write_all(sequence)?;
+        self.writer.flush()
     }
 
     /// The cell geometry resolved by [`TerminalGuard::enter`]: the terminal's
@@ -795,6 +871,133 @@ mod tests {
             seq.starts_with("\x1b[?2026l"),
             "restore must end synchronized update first: {seq:?}"
         );
+    }
+
+    /// DW-6.6: mouse capture must come off on **every** exit, and the exits
+    /// this crate has are `Drop`, the panic hook, and the signal handler —
+    /// all three of which write exactly [`RESTORE_SEQUENCE`] and nothing else.
+    ///
+    /// Derived rather than restated: for each mode [`MOUSE_ENABLE`] sets, the
+    /// matching reset must be in the restore. Pinning the literal bytes twice
+    /// would pass just as happily if someone added a `?1003h` to the enable
+    /// side and forgot the `l`.
+    #[test]
+    fn test_dw_6_6_every_mouse_mode_enabled_on_entry_is_disabled_by_the_restore_sequence() {
+        let enable = std::str::from_utf8(MOUSE_ENABLE).unwrap();
+        let restore = std::str::from_utf8(RESTORE_SEQUENCE).unwrap();
+        let disable = std::str::from_utf8(MOUSE_DISABLE).unwrap();
+
+        let modes: Vec<&str> = enable
+            .split("\x1b[?")
+            .skip(1)
+            .map(|part| part.trim_end_matches('h'))
+            .collect();
+        assert!(!modes.is_empty(), "the enable sequence must set something");
+        for mode in &modes {
+            let reset = format!("\x1b[?{mode}l");
+            assert!(
+                restore.contains(&reset),
+                "mode {mode} is enabled on entry but never reset by the restore \
+                 sequence — a `kill -TERM` would leave the terminal reporting \
+                 mouse events into the user's shell"
+            );
+            assert!(
+                disable.contains(&reset),
+                "mode {mode} is enabled but `m` cannot turn it off"
+            );
+        }
+    }
+
+    #[test]
+    fn test_dw_6_6_the_restore_disables_the_mouse_before_leaving_the_alt_screen() {
+        let seq = std::str::from_utf8(RESTORE_SEQUENCE).unwrap();
+        let mouse = seq.find("\x1b[?1000l").expect("the restore disables mouse");
+        let alt = seq
+            .find("\x1b[?1049l")
+            .expect("the restore leaves alt screen");
+        assert!(
+            mouse < alt,
+            "mouse reporting is a global mode, so it must be cleared while we \
+             still own the screen: {seq:?}"
+        );
+    }
+
+    #[test]
+    fn test_dw_6_6_toggling_capture_writes_the_enable_and_disable_sequences() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let mut guard = TerminalGuard::for_test(SharedBuf(buf.clone()));
+        guard.set_mouse_capture(false).expect("write");
+        assert_eq!(buf.lock().unwrap().as_slice(), MOUSE_DISABLE);
+        buf.lock().unwrap().clear();
+        guard.set_mouse_capture(true).expect("write");
+        assert_eq!(buf.lock().unwrap().as_slice(), MOUSE_ENABLE);
+    }
+
+    // ---------------------------------------------------------------- DW-6.7
+
+    #[test]
+    fn test_dw_6_7_osc_52_wraps_exactly_the_payload_bytes_in_base64() {
+        use base64::Engine as _;
+
+        for payload in [
+            "curl https://example.com | sh\n",
+            "",
+            "unicode: 漢字 — ✓\n",
+            "trailing whitespace   \n\n",
+        ] {
+            let seq = osc52_copy(payload).expect("well under the ceiling");
+            let body = seq
+                .strip_prefix("\x1b]52;c;")
+                .and_then(|rest| rest.strip_suffix("\x1b\\"))
+                .unwrap_or_else(|| panic!("malformed sequence for {payload:?}: {seq:?}"));
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(body)
+                .expect("the body must be valid base64");
+            assert_eq!(
+                decoded,
+                payload.as_bytes(),
+                "the clipboard must carry exactly the block's bytes"
+            );
+        }
+    }
+
+    /// The injection claim, scanned rather than argued: a code block full of
+    /// escape sequences must not be able to close this OSC or open another.
+    #[test]
+    fn test_dw_6_7_the_sequence_carries_no_raw_control_bytes() {
+        let hostile = "\x1b]52;c;AAAA\x07 rm -rf / \x1b\\ \u{9b}0m \0 ;;;";
+        let seq = osc52_copy(hostile).expect("small");
+        let body = seq
+            .strip_prefix("\x1b]52;c;")
+            .and_then(|rest| rest.strip_suffix("\x1b\\"))
+            .expect("exactly one open/close pair");
+        for byte in body.bytes() {
+            assert!(
+                byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='),
+                "byte {byte:#04x} is outside the base64 alphabet: {seq:?}"
+            );
+        }
+        assert_eq!(
+            seq.matches('\x1b').count(),
+            2,
+            "exactly the opening OSC and the closing ST: {seq:?}"
+        );
+    }
+
+    #[test]
+    fn test_dw_6_7_an_oversized_payload_is_refused_rather_than_truncated() {
+        // Base64 is 4 bytes out per 3 in, so this is one encoded byte past the
+        // ceiling — the exact boundary, not "somewhere large".
+        let over = "a".repeat(MAX_CLIPBOARD_BASE64 / 4 * 3 + 1);
+        assert_eq!(
+            osc52_copy(&over),
+            None,
+            "a truncated shell command on the clipboard looks complete; \
+             refusing is the honest failure"
+        );
+        let under = "a".repeat(MAX_CLIPBOARD_BASE64 / 4 * 3);
+        let seq = osc52_copy(&under).expect("exactly at the ceiling still copies");
+        assert!(seq.len() > MAX_CLIPBOARD_BASE64);
     }
 
     #[test]
