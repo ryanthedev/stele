@@ -700,6 +700,22 @@ mod tests {
         out
     }
 
+    /// The terminal cell geometry these mirrors assume — `stele`'s fallback,
+    /// which is what a test process (no terminal to query) measures against.
+    const CELL: (u32, u32) = (24, 48);
+
+    /// The em baseline the shipped pipeline renders at, mirroring
+    /// `stele::media::sizer::math_baseline_px`: **the cell height**, so one em
+    /// is one row.
+    ///
+    /// Derived from [`CELL`] rather than written as a number. This was a
+    /// hardcoded 40 in three places in this module, and when the product
+    /// stopped rendering at 40 px they kept modelling a pipeline that no
+    /// longer existed — the letterbox assertions below would have gone on
+    /// passing against boxes no reader ever sees, which is the one failure
+    /// this whole mirror exists to prevent.
+    const PIPELINE_EM_PX: u32 = CELL.1;
+
     /// The cell box the shipped pipeline lands on for a formula of em extent
     /// `(em_w, em_h)` at a `content_cols`-wide content column, mirroring
     /// `stele::media::sizer`'s `size_math` + `px_to_cells` (the 200-cell cap
@@ -713,12 +729,14 @@ mod tests {
     /// the other way round. The point of mirroring it at all is that
     /// [`render_fitted`]'s letterbox is only correct *relative to the box it
     /// is given*, so testing it against boxes the product never produces
-    /// would prove nothing about what a reader sees.
+    /// would prove nothing about what a reader sees — which is exactly what
+    /// this helper started doing when the em baseline stopped being 40 px and
+    /// became the terminal's cell height. It is kept honest by
+    /// [`PIPELINE_EM_PX`] deriving from `CELL` rather than restating a number.
     fn pipeline_target_px(em_w: f64, em_h: f64, content_cols: u64) -> (u32, u32) {
-        const CELL: (u32, u32) = (24, 48);
         const MAX_RESERVED: u64 = 200;
-        let px_w = ((em_w * 40.0).max(0.0) as u32).max(1);
-        let px_h = ((em_h * 40.0).max(0.0) as u32).max(1);
+        let px_w = ((em_w * f64::from(PIPELINE_EM_PX)).max(0.0) as u32).max(1);
+        let px_h = ((em_h * f64::from(PIPELINE_EM_PX)).max(0.0) as u32).max(1);
         let mut cols = u64::from(px_w.div_ceil(CELL.0)).max(1);
         let mut rows = u64::from(px_h.div_ceil(CELL.1)).max(1);
         if cols > MAX_RESERVED {
@@ -921,18 +939,24 @@ mod tests {
 
             // (2)+(3) The raster's size and shape follow the layout's em
             // extent and the box, per the letterbox contract.
-            let em_px = em_capped_to_box(em_w, em_h, 40, f64::from(target_w), f64::from(target_h));
-            let fits_at_the_fixed_em =
-                em_w * 40.0 <= f64::from(target_w) && em_h * 40.0 <= f64::from(target_h);
+            let em_px = em_capped_to_box(
+                em_w,
+                em_h,
+                PIPELINE_EM_PX,
+                f64::from(target_w),
+                f64::from(target_h),
+            );
+            let fits_at_the_fixed_em = em_w * f64::from(PIPELINE_EM_PX) <= f64::from(target_w)
+                && em_h * f64::from(PIPELINE_EM_PX) <= f64::from(target_h);
             assert_eq!(
-                em_px == 40,
+                em_px == PIPELINE_EM_PX,
                 fits_at_the_fixed_em,
                 "{file}: {} em was capped to {em_px} but its ink {:.0}x{:.0} px \
                  {} inside the {target_w}x{target_h} box — the fixed-em promise applies \
                  exactly when the ink fits",
                 short(tex),
-                em_w * 40.0,
-                em_h * 40.0,
+                em_w * f64::from(PIPELINE_EM_PX),
+                em_h * f64::from(PIPELINE_EM_PX),
                 if fits_at_the_fixed_em {
                     "does sit"
                 } else {
@@ -949,8 +973,29 @@ mod tests {
                  px extent its own layout declared at em {em_px}",
                 short(tex)
             );
+            // Underfill floors, per axis and measured at the em the product
+            // actually renders at. A single 0.65 for both axes used to stand
+            // here, and it was not scale-invariant: antialiased strokes spill a
+            // roughly *fixed* number of pixels past the typographic box, so the
+            // measured ratio falls as the em grows. `\frac{a}{b}` ratios 0.7156
+            // wide at em 40 and 0.5963 at em 48 — the same raster, the same
+            // formula, a threshold that only ever held at the smaller em. Some
+            // heights even exceeded 1.0 at em 40, absorbed by the +3 px slack
+            // above.
+            //
+            // Both axes underfill, for the same reason in two directions: a
+            // formula's declared extent is an advance box, and TeX reserves
+            // space in it that no glyph inks. Worst observed across all 31
+            // fixture formulas, measured at the em each one actually renders
+            // at — 0.5963 wide, `\frac{a}{b}`, whose rule is inset from both
+            // edges of the box reserved for it; 0.6738 tall,
+            // `\begin{aligned}`, whose row gap is reserved leading between two
+            // short rows and inks nothing at all.
+            const MIN_INK_FILL_W: f64 = 0.55;
+            const MIN_INK_FILL_H: f64 = 0.62;
             assert!(
-                f64::from(ink_w) >= 0.65 * ink_px_w && f64::from(ink_h) >= 0.65 * ink_px_h,
+                f64::from(ink_w) >= MIN_INK_FILL_W * ink_px_w
+                    && f64::from(ink_h) >= MIN_INK_FILL_H * ink_px_h,
                 "{file}: {} inked only {ink_w}x{ink_h} px of a declared \
                  {ink_px_w:.0}x{ink_px_h:.0} px extent at em {em_px}",
                 short(tex)
@@ -1483,7 +1528,7 @@ mod tests {
             w <= floor_w,
             "raster width {w} exceeds the MIN_PX_HEIGHT floor bound {floor_w} \
              (uncapped em would have rasterized {}px wide)",
-            (em_w * 40.0) as u32
+            (em_w * f64::from(PIPELINE_EM_PX)) as u32
         );
         // The width bound above is necessary but not sufficient: with
         // `em_capped_to_box` neutered, `fit_font_size` shrinks the font on its
