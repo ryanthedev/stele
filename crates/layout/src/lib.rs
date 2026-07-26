@@ -18,6 +18,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::HashSet;
 use std::ops::Range;
 
 use ast::{Document, NodeId};
@@ -450,7 +451,37 @@ impl LayoutTree {
     }
 }
 
-/// Lay out a parsed document at `width` cells.
+/// Which sections are folded, keyed by the heading [`NodeId`] whose section
+/// is collapsed (Phase 5) — not by a line index, which would not survive a width
+/// change (folding changes which lines exist at all) or a `--watch` reload
+/// (the whole tree, and every id in it, is replaced; see `AppState`'s own
+/// reload-time re-keying, which is the layer that owns identity across a
+/// re-parse — `FoldState` itself has no opinion on it beyond the ids it is
+/// handed).
+///
+/// Consulted by [`layout_with_folds`] during the walk, at the top level
+/// only: a heading nested inside a blockquote or list item is not itself
+/// foldable (out of Phase 5's scope), so an id that never names a top-level
+/// heading is simply never matched.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FoldState {
+    pub collapsed: HashSet<NodeId>,
+}
+
+impl FoldState {
+    pub fn is_folded(&self, id: NodeId) -> bool {
+        self.collapsed.contains(&id)
+    }
+
+    /// Folds `id` if it is open, opens it if it is folded.
+    pub fn toggle(&mut self, id: NodeId) {
+        if !self.collapsed.remove(&id) {
+            self.collapsed.insert(id);
+        }
+    }
+}
+
+/// Lay out a parsed document at `width` cells, with nothing folded.
 ///
 /// Pure and deterministic: identical `(doc, width, config, engine, sizer)`
 /// inputs yield structurally identical trees. `width` is clamped to
@@ -462,10 +493,27 @@ pub fn layout(
     engine: &WidthEngine,
     sizer: &dyn IntrinsicSizer,
 ) -> LayoutTree {
+    layout_with_folds(doc, width, config, engine, sizer, &FoldState::default())
+}
+
+/// Like [`layout`], but consulting `folds` during the walk (Phase 5): a top-level
+/// heading whose id is in [`FoldState::collapsed`] collapses its section —
+/// itself and every block up to the next heading of equal or shallower level
+/// — to exactly one marked line (DW-5.1, DW-5.6). Still pure and
+/// deterministic in all six arguments; `layout` is the zero-folds special
+/// case of this function, not the other way around.
+pub fn layout_with_folds(
+    doc: &Document,
+    width: u16,
+    config: &LayoutConfig,
+    engine: &WidthEngine,
+    sizer: &dyn IntrinsicSizer,
+    folds: &FoldState,
+) -> LayoutTree {
     let min = config.min_width.max(1);
     let max = config.max_width.max(min);
     let width = width.clamp(min, max);
-    let mut ctx = block::Ctx::new(doc, engine, sizer, width);
+    let mut ctx = block::Ctx::new(doc, engine, sizer, width, folds);
     block::walk_blocks(&mut ctx, doc.blocks(), true);
     let (lines, line_blocks, outline) = ctx.into_parts();
     LayoutTree {

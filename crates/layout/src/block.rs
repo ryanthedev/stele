@@ -11,8 +11,8 @@ use width::WidthEngine;
 
 use crate::inline::{self, Piece};
 use crate::{
-    AlertTone, CellSize, IntrinsicSizer, Line, LineItem, Outline, OutlineEntry, Reserved,
-    ReservedLine, Run, Semantic, StyleId,
+    AlertTone, CellSize, FoldState, IntrinsicSizer, Line, LineItem, Outline, OutlineEntry,
+    Reserved, ReservedLine, Run, Semantic, StyleId,
 };
 
 /// Minimum content columns the prefix may never consume (clamped to the
@@ -53,6 +53,9 @@ pub(crate) struct Ctx<'a> {
     /// point at which a heading's level, its inline children, its anchoring
     /// block and its first emitted line are all in hand at once.
     outline: Outline,
+    /// Which top-level headings are currently folded (Phase 5). Consulted only at
+    /// `depth == 1` — see [`walk_blocks`].
+    folds: &'a FoldState,
 }
 
 impl<'a> Ctx<'a> {
@@ -61,6 +64,7 @@ impl<'a> Ctx<'a> {
         engine: &'a WidthEngine,
         sizer: &'a dyn IntrinsicSizer,
         width: u16,
+        folds: &'a FoldState,
     ) -> Self {
         Ctx {
             doc,
@@ -73,6 +77,7 @@ impl<'a> Ctx<'a> {
             depth: 0,
             prefix: Vec::new(),
             outline: Outline::default(),
+            folds,
         }
     }
 
@@ -107,6 +112,87 @@ impl<'a> Ctx<'a> {
                 line,
             );
         }
+    }
+
+    /// If the top-level block at `index` is a folded heading, the exclusive
+    /// end index of the section it collapses: every following top-level
+    /// block up to, but not including, the next heading whose level is `<=`
+    /// this one's — "a section runs to the next heading of equal or
+    /// shallower level" (Phase 5's approach note). `blocks.len()` when no
+    /// such heading follows (folding the last heading in the document).
+    /// `None` when the block is not a heading, or is a heading that is not
+    /// folded.
+    fn fold_range(&self, blocks: &[Block], index: usize) -> Option<usize> {
+        let BlockKind::Heading { level, .. } = &blocks[index].kind else {
+            return None;
+        };
+        if !self.folds.is_folded(blocks[index].id) {
+            return None;
+        }
+        let end = blocks[index + 1..]
+            .iter()
+            .position(|b| matches!(&b.kind, BlockKind::Heading { level: lvl, .. } if lvl <= level))
+            .map_or(blocks.len(), |rel| index + 1 + rel);
+        Some(end)
+    }
+
+    /// Collapses the folded heading at `blocks[index]` and its section
+    /// (`blocks[index + 1..end]`) to exactly one line (DW-5.1): a marker
+    /// carrying the heading's own flattened text and how many lines are
+    /// hidden right now. "Right now" recursively respects a fold nested
+    /// inside the section (via [`Ctx::count_lines`]), so unfolding this
+    /// heading alone reveals exactly what is really underneath — which may
+    /// be another marker, not the fully expanded section.
+    ///
+    /// The outline still gets an entry, exactly as an open heading would:
+    /// `]]`/`[[` and the TOC keep working on a folded heading, landing on the
+    /// marker line instead of the heading's own first line.
+    fn emit_fold_marker(&mut self, blocks: &[Block], index: usize, end: usize) {
+        let BlockKind::Heading { level, children } = &blocks[index].kind else {
+            unreachable!("fold_range only returns Some for a Heading block");
+        };
+        let (level, title) = (*level, heading_text(children));
+        let hidden = self.count_lines(&blocks[index..end]).saturating_sub(1);
+        let text = fold_marker_text(&title, hidden);
+        let width = inline::cells(self.engine, &text);
+        let run = Run {
+            text,
+            style_id: StyleId::Semantic(Semantic::Heading(level)),
+            width,
+            aux: None,
+        };
+        let runs = inline::clip_runs(vec![run], self.content_width(), true, self.engine);
+        let line = self.lines.len();
+        self.emit_runs(runs);
+        self.outline.push(
+            OutlineEntry {
+                level,
+                text: title,
+                block: blocks[index].id,
+            },
+            line,
+        );
+    }
+
+    /// How many lines `blocks` would occupy if *its own* heading (always
+    /// `blocks[0]`, the one [`Ctx::emit_fold_marker`] is measuring) were
+    /// unfolded, while every *other* fold — including one nested inside this
+    /// section — stays exactly as it is. A dry run through the same walk on
+    /// a scratch [`Ctx`], discarded once its line count is read.
+    ///
+    /// Excluding just `blocks[0]` from the scratch fold set, rather than
+    /// reusing `self.folds` verbatim, is load-bearing and not an
+    /// optimization: `blocks[0]` is folded (that is why this is being
+    /// called at all), so a scratch walk that still considered it folded
+    /// would immediately re-collapse the identical slice it was just handed
+    /// and call itself again — the same one-line answer forever, which is a
+    /// stack overflow, not a wrong number.
+    fn count_lines(&self, blocks: &[Block]) -> usize {
+        let mut open = self.folds.clone();
+        open.collapsed.remove(&blocks[0].id);
+        let mut scratch = Ctx::new(self.doc, self.engine, self.sizer, self.width, &open);
+        walk_blocks(&mut scratch, blocks, true);
+        scratch.lines.len()
     }
 
     /// Push a container prefix; `first` shows on the next emitted line,
@@ -264,16 +350,31 @@ impl<'a> Ctx<'a> {
 /// line it emits — including lines from nested blockquotes/lists — is tagged
 /// with that top-level block for scroll anchoring. Nested calls run deeper
 /// and leave the tag alone.
+///
+/// Folding (Phase 5) is consulted only at `depth == 1`, for the same reason
+/// `current_block` is: a heading nested inside a blockquote or list item
+/// tags no line of its own (see [`crate::OutlineEntry::block`]), so it is not
+/// itself foldable, and a fold range is meaningful only among *this*
+/// document's top-level blocks. An index-based loop, rather than `enumerate`,
+/// is what lets a folded heading's whole section be skipped in one step
+/// instead of visited and then filtered.
 pub(crate) fn walk_blocks(ctx: &mut Ctx<'_>, blocks: &[Block], separate: bool) {
     ctx.depth += 1;
-    for (i, block) in blocks.iter().enumerate() {
-        if i > 0 && separate {
+    let mut index = 0;
+    while index < blocks.len() {
+        if index > 0 && separate {
             ctx.blank_line();
         }
         if ctx.depth == 1 {
-            ctx.current_block = Some(block.id);
+            ctx.current_block = Some(blocks[index].id);
+            if let Some(end) = ctx.fold_range(blocks, index) {
+                ctx.emit_fold_marker(blocks, index, end);
+                index = end;
+                continue;
+            }
         }
-        walk_block(ctx, block);
+        walk_block(ctx, &blocks[index]);
+        index += 1;
     }
     ctx.depth -= 1;
 }
@@ -420,6 +521,17 @@ fn alert_label(kind: AlertKind) -> (&'static str, AlertTone) {
         AlertKind::Warning => ("[!WARNING]", AlertTone::Warning),
         AlertKind::Caution => ("[!CAUTION]", AlertTone::Caution),
     }
+}
+
+/// The exact text of a folded section's one visible line (DW-5.1): a marker
+/// glyph, the heading's own flattened title, and how many lines it is
+/// currently hiding. The heading's *level* is not encoded here — it already
+/// reaches the painter as the run's `Semantic::Heading(level)` style, which
+/// is where a level belongs; restating it in the text would be a second,
+/// driftable source of the same fact.
+fn fold_marker_text(title: &str, hidden: usize) -> String {
+    let noun = if hidden == 1 { "line" } else { "lines" };
+    format!("\u{25b8} {title} ({hidden} hidden {noun})") // "▸ Title (N hidden lines)"
 }
 
 /// A heading's text for the outline: its inline children flattened to plain

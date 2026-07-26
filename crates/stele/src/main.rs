@@ -582,6 +582,23 @@ fn handle_chrome_key(
             ))));
             state.relayout_preserving_anchor(&ctx, *ctx.config);
         }
+        // Zero-arg by design (Phase 5's `Produces`): each of these only
+        // decides *what* changed in `AppState::folds`; the relayout that
+        // applies it needs `ctx`, which they do not take, so it happens here
+        // — the same split `Widen`/`Narrow` already draw between deciding
+        // and relaying out.
+        ChromeAction::ToggleFold => {
+            state.toggle_fold();
+            state.relayout_preserving_anchor(&ctx, *ctx.config);
+        }
+        ChromeAction::ExpandAllFolds => {
+            state.expand_all();
+            state.relayout_preserving_anchor(&ctx, *ctx.config);
+        }
+        ChromeAction::CollapseAllFolds => {
+            state.collapse_all();
+            state.relayout_preserving_anchor(&ctx, *ctx.config);
+        }
     }
     true
 }

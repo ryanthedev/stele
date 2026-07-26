@@ -2,13 +2,16 @@
 //! debounced resize/relayout — all pure and independently testable, so the
 //! event loop in `main.rs` stays thin glue over real crossterm I/O.
 
+use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
 
 use ast::{Document, NodeId};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use layout::{IntrinsicSizer, LayoutConfig, LayoutTree, Line, LineItem, Outline, layout};
+use layout::{
+    FoldState, IntrinsicSizer, LayoutConfig, LayoutTree, Line, LineItem, Outline, layout_with_folds,
+};
 use width::WidthEngine;
 
 use crate::painter::{SearchOverlay, Size};
@@ -302,6 +305,14 @@ pub enum ChromeAction {
     Narrow,
     /// `T` — swap the built-in theme variant (DW-1.5).
     ToggleTheme,
+    /// `z` — fold or unfold the heading at or above the cursor (DW-5.1).
+    /// Needs a relayout exactly as `Widen`/`Narrow` do, which is why this
+    /// lives here rather than in `handle_key_event`'s own table.
+    ToggleFold,
+    /// `R` — open every fold (DW-5.4).
+    ExpandAllFolds,
+    /// `M` — collapse every heading's section (DW-5.4).
+    CollapseAllFolds,
 }
 
 /// The viewer's mutable state: the current layout tree, scroll offset, and
@@ -335,6 +346,18 @@ pub struct AppState {
     /// width comparison cannot answer this on its own.
     document_changed: bool,
     search: SearchState,
+    /// Which sections are collapsed, keyed by heading [`NodeId`] (Phase 5).
+    /// Consulted by every [`AppState::relayout`] via `layout::layout_with_folds`.
+    folds: FoldState,
+    /// Set by [`AppState::toggle_fold`] when the viewport is inside the
+    /// section that is about to fold, so the next [`AppState::relayout`]
+    /// snaps the reader to the marker line instead of trusting the ordinary
+    /// block anchor — which cannot find a block that no longer emits a line
+    /// of its own once it is inside a collapsed range (DW-5.5). `None` for
+    /// every other relayout path (`widen`, `narrow`, a theme swap, a reload,
+    /// a resize, an unfold, `expand_all`, `collapse_all`), all of which are
+    /// well served by the ordinary anchor.
+    pending_fold_snap: Option<NodeId>,
 }
 
 impl AppState {
@@ -358,6 +381,8 @@ impl AppState {
             status_message: None,
             document_changed: false,
             search: SearchState::default(),
+            folds: FoldState::default(),
+            pending_fold_snap: None,
         }
     }
 
@@ -376,6 +401,11 @@ impl AppState {
     /// The document's headings, in document order.
     pub fn outline(&self) -> &Outline {
         self.tree.outline()
+    }
+
+    /// Which sections are currently folded (Phase 5).
+    pub fn folds(&self) -> &FoldState {
+        &self.folds
     }
 
     /// Which [`ChromeAction`] `key` requests, or `None` when the key is not
@@ -407,6 +437,9 @@ impl AppState {
             KeyCode::Char('+') => Some(ChromeAction::Widen),
             KeyCode::Char('-') => Some(ChromeAction::Narrow),
             KeyCode::Char('T') => Some(ChromeAction::ToggleTheme),
+            KeyCode::Char('z') => Some(ChromeAction::ToggleFold),
+            KeyCode::Char('R') => Some(ChromeAction::ExpandAllFolds),
+            KeyCode::Char('M') => Some(ChromeAction::CollapseAllFolds),
             _ => None,
         }
     }
@@ -598,8 +631,81 @@ impl AppState {
         self.file_info = file_info;
         self.clear_status();
         self.document_changed = true;
+        let old_outline = self.tree.outline().clone();
+        // Captured before clearing: `self.folds.collapsed` is about to be
+        // emptied, and this is the only record of which ids to re-key.
+        let old_collapsed = self.folds.collapsed.clone();
+        // A `NodeId` from the old document cannot be trusted against the new
+        // one at all — see `reseat_folds` — and worse than merely stale, a
+        // coincidentally-equal id in the fresh parse would make `fold_range`
+        // (`layout::block::Ctx`) collapse a section that was never folded.
+        // Clearing first means the very first relayout below is guaranteed
+        // fold-free, so `reseat_folds` has a clean, fully-expanded `Outline`
+        // to re-key the old ids against.
+        let had_folds = !old_collapsed.is_empty();
+        if had_folds {
+            self.folds.collapsed.clear();
+        }
         self.relayout_preserving_anchor(ctx, *ctx.config);
+        if had_folds {
+            self.reseat_folds(&old_outline, &old_collapsed);
+            if !self.folds.collapsed.is_empty() {
+                // A second pass to actually apply the re-keyed folds. Costs
+                // one extra `layout_with_folds` call, only when there was
+                // something to re-seat, and only on the reload path — never
+                // per keystroke or per frame.
+                self.relayout_preserving_anchor(ctx, *ctx.config);
+            }
+        }
         self.reseat_toc();
+    }
+
+    /// Re-seats fold state across a `--watch` reload (DW-5.2). A `NodeId` is
+    /// positional and reload reparses (see [`AppState::line_of_reloaded`]),
+    /// so a fold recorded against the old document's ids would silently
+    /// address whatever now happens to occupy that slot in the new one — or
+    /// nothing at all.
+    ///
+    /// Re-keyed by content plus occurrence, the same principle
+    /// [`AppState::line_of_reloaded`] uses for the scroll anchor, but over
+    /// `old_outline`'s flattened heading text rather than painted lines: a
+    /// folded heading's own line paints its *marker*, not its title, so
+    /// hashing what is currently on screen would compare a summary against a
+    /// title (or a title against a summary) and could never match. An
+    /// outline entry's `text` (`layout::block::heading_text`) is computed
+    /// from the same AST children whether the heading renders in full or
+    /// collapses to a marker, so it means the same thing on both sides of the
+    /// reload regardless of either document's fold state.
+    ///
+    /// Must be called after a relayout has installed the *new*, still
+    /// fold-free tree (`reload_document` clears `folds` before its first
+    /// relayout for exactly this reason) — `self.tree.outline()` here is
+    /// that fresh outline, never the one folds were captured against.
+    fn reseat_folds(&mut self, old_outline: &Outline, old_collapsed: &HashSet<NodeId>) {
+        let wanted: Vec<(u8, &str, usize)> = old_collapsed
+            .iter()
+            .filter_map(|&id| {
+                let index = old_outline.entries.iter().position(|e| e.block == id)?;
+                let entry = &old_outline.entries[index];
+                let occurrence = old_outline.entries[..index]
+                    .iter()
+                    .filter(|e| e.level == entry.level && e.text == entry.text)
+                    .count();
+                Some((entry.level, entry.text.as_str(), occurrence))
+            })
+            .collect();
+        let new_outline = self.tree.outline();
+        self.folds.collapsed = wanted
+            .into_iter()
+            .filter_map(|(level, text, occurrence)| {
+                new_outline
+                    .entries
+                    .iter()
+                    .filter(|e| e.level == level && e.text == text)
+                    .nth(occurrence)
+                    .map(|e| e.block)
+            })
+            .collect();
     }
 
     /// Puts an open TOC back on a heading that exists in the tree installed
@@ -765,6 +871,72 @@ impl AppState {
                 selected: first + offset == selected,
             })
             .collect()
+    }
+
+    /// `z` (DW-5.1): folds or unfolds the heading at or above the cursor.
+    ///
+    /// Zero-arg by design (see the plan's `Produces`): this only decides
+    /// *which* heading and flips its membership in [`AppState::folds`],
+    /// arming [`AppState::pending_fold_snap`] when folding would carry the
+    /// current line out of view. The relayout that actually applies it is the
+    /// caller's job (`main.rs::handle_chrome_key`), through the same
+    /// [`AppState::relayout_preserving_anchor`] every other chrome mutation
+    /// uses.
+    pub fn toggle_fold(&mut self) {
+        let outline = self.tree.outline();
+        let Some(index) = outline.index_at_or_before(self.scroll) else {
+            self.set_status(StatusMessage::new(NO_HEADINGS));
+            return;
+        };
+        let target = outline.entries[index].block;
+        let folding = !self.folds.is_folded(target);
+        self.pending_fold_snap =
+            (folding && self.section_line_range(index).contains(&self.scroll)).then_some(target);
+        self.folds.toggle(target);
+    }
+
+    /// `R` (DW-5.4): opens every fold. Equivalent to relaying out with an
+    /// empty [`FoldState`] — the full document, restored.
+    pub fn expand_all(&mut self) {
+        self.folds.collapsed.clear();
+    }
+
+    /// `M` (DW-5.4): folds every heading, top-level and nested alike.
+    /// Collapsing a nested heading is not wasted work: a fold range stops at
+    /// the next heading of equal or shallower level, so a top-level
+    /// heading's own fold already swallows every heading nested inside it
+    /// without ever visiting them — nesting the same id into
+    /// [`FoldState::collapsed`] just means that if the reader later opens the
+    /// outer one, the inner heading is still folded rather than snapping
+    /// wide open underneath it.
+    pub fn collapse_all(&mut self) {
+        self.folds.collapsed = self
+            .tree
+            .outline()
+            .entries
+            .iter()
+            .map(|entry| entry.block)
+            .collect();
+    }
+
+    /// The current (pre-fold) line range of the section the `index`-th
+    /// outline entry heads: from its own line up to, but not including, the
+    /// next heading of equal or shallower level — the same "runs to the next
+    /// heading of equal or shallower level" rule
+    /// `layout::block::Ctx::fold_range` applies during the walk, computed
+    /// here against line numbers in the *already laid out* tree instead of
+    /// block indices mid-walk, because this is what [`AppState::toggle_fold`]
+    /// needs to decide DW-5.5 before any relayout has happened.
+    fn section_line_range(&self, index: usize) -> Range<usize> {
+        let outline = self.tree.outline();
+        let level = outline.entries[index].level;
+        let start = outline.line_of(index).unwrap_or(0);
+        let end = outline.entries[index + 1..]
+            .iter()
+            .position(|e| e.level <= level)
+            .and_then(|rel| outline.line_of(index + 1 + rel))
+            .unwrap_or(self.tree.line_count());
+        start..end
     }
 
     /// Applies one key press *with its modifiers*. Returns `true` when the
@@ -1094,7 +1266,14 @@ impl AppState {
         // re-anchor there.
         self.document_changed = false;
 
-        self.tree = layout(ctx.doc, width, ctx.config, ctx.engine, ctx.sizer);
+        self.tree = layout_with_folds(
+            ctx.doc,
+            width,
+            ctx.config,
+            ctx.engine,
+            ctx.sizer,
+            &self.folds,
+        );
         self.size = new_size;
         // Resync to what layout actually used (already clamped), not the
         // raw `width` argument — the two agree today but this is the
@@ -1117,6 +1296,17 @@ impl AppState {
                 })
                 .unwrap_or_else(|| (ratio * self.max_scroll() as f64).round() as usize)
         };
+        // DW-5.5: a fold that just carried the reader's line into a collapsed
+        // range overrides the ordinary anchor here — that anchor's own block
+        // no longer emits a line of its own once it is inside the range, so
+        // it can only ever fall back to the proportional estimate above,
+        // which is not the exact marker line DW-5.5 requires. Every other
+        // relayout leaves this `None` and this is a no-op.
+        let target = self
+            .pending_fold_snap
+            .take()
+            .and_then(|id| self.tree.first_line_of(id))
+            .unwrap_or(target);
         self.set_scroll(target);
         self.reseat_search(reflowed);
         self.recompute_matches();
@@ -1173,6 +1363,14 @@ impl AppState {
     /// n-th match before the resize and, since matching is deterministic and
     /// the document did not change, the n-th match after it is the same
     /// text. Only a query whose match count somehow shrank needs the clamp.
+    ///
+    /// **Phase 5's answer to "a search match inside a folded range."** A
+    /// folded section contributes no lines to the tree at all — only its one
+    /// marker line does — so `find_matches` simply cannot see text that is
+    /// not there, and a match inside it is silently absent from the
+    /// recomputed set rather than merely skipped over. That is *skip*, not
+    /// *expand*: `n`/`N` step past it as if it did not match, and it
+    /// reappears the moment the section is unfolded and this runs again.
     fn recompute_matches(&mut self) {
         if self.search.query.is_empty() {
             return;
@@ -1602,7 +1800,7 @@ pub(crate) fn line_text_len(tree: &LayoutTree, index: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use ast::Document;
-    use layout::NullSizer;
+    use layout::{NullSizer, layout};
     use width::WidthConfig;
 
     use super::*;
@@ -4215,6 +4413,373 @@ mod tests {
             !status.render().contains("reload failed"),
             "the painted row must be the ruler, got {:?}",
             status.render()
+        );
+    }
+
+    // ---- Section folding (Phase 5) ----------------------------------------
+
+    /// `n` top-level headings, each with one distinctive body paragraph —
+    /// something to fold, and something folding must make disappear. Distinct
+    /// from the shared `heading_source` (Phase 3): every heading here is
+    /// level 1, so "next heading of equal or shallower level" never nests
+    /// one section inside another, which is what keeps these fold tests'
+    /// expectations simple and explicit.
+    fn fold_fixture(n: usize) -> String {
+        (0..n)
+            .map(|i| format!("# Heading {i:02}\n\nbody-{i:02} text.\n\n"))
+            .collect()
+    }
+
+    fn ctx_for<'a>(
+        doc: &'a Document,
+        config: &'a LayoutConfig,
+        engine: &'a WidthEngine,
+    ) -> LayoutContext<'a> {
+        LayoutContext {
+            doc,
+            config,
+            engine,
+            sizer: &NullSizer,
+        }
+    }
+
+    /// Mirrors `main.rs::handle_chrome_key`'s `ChromeAction::ToggleFold` arm
+    /// exactly: decide (`AppState::toggle_fold`), then relay out. That `z`
+    /// actually reaches this path, gated by `Mode::captures_all_keys` like
+    /// every other chrome key, is proven separately by driving the compiled
+    /// binary in `tests/fold_key_routing.rs`; this level exercises the state
+    /// transition `toggle_fold` + a relayout produces.
+    fn toggle_fold(state: &mut AppState, ctx: &LayoutContext) {
+        state.toggle_fold();
+        state.relayout_preserving_anchor(ctx, *ctx.config);
+    }
+
+    #[test]
+    fn test_dw_5_1_toggle_fold_collapses_and_restores_exactly() {
+        let (doc, config, engine, mut state) = build(&fold_fixture(3), 40, 20);
+        let ctx = ctx_for(&doc, &config, &engine);
+        let before = state.tree().clone();
+
+        toggle_fold(&mut state, &ctx); // cursor starts at line 0: "Heading 00"
+        assert_ne!(state.tree(), &before, "folding must change the tree");
+        let marker = line_text(&state, 0);
+        assert!(
+            !marker.contains("body-00") && marker.contains("hidden"),
+            "the section's body must be gone and the marker must report a hidden \
+             count: {marker:?}"
+        );
+
+        toggle_fold(&mut state, &ctx); // re-toggle the same heading
+        assert_eq!(
+            state.tree(),
+            &before,
+            "toggling the same heading twice must restore the tree exactly"
+        );
+    }
+
+    #[test]
+    fn test_toggle_fold_on_a_document_with_no_headings_reports_status_and_changes_nothing() {
+        let (doc, config, engine, mut state) = build(&non_reflowing_source(5), 40, 10);
+        let ctx = ctx_for(&doc, &config, &engine);
+        let before = state.tree().clone();
+
+        toggle_fold(&mut state, &ctx);
+
+        assert_eq!(state.tree(), &before, "no headings means nothing to fold");
+        assert_eq!(
+            state.status().message.as_deref(),
+            Some(NO_HEADINGS),
+            "the reader must be told there is nothing to fold"
+        );
+    }
+
+    #[test]
+    fn test_dw_5_2_fold_survives_a_width_change() {
+        // A viewport shorter than the fixture: `jump_to_block`'s `set_scroll`
+        // clamps to `max_scroll`, which is 0 (a no-op) for a document that
+        // already fits the whole screen.
+        let (doc, config, engine, mut state) = build(&fold_fixture(3), 40, 5);
+        let ctx = ctx_for(&doc, &config, &engine);
+        let target = state.outline().entries[1].block;
+        state.jump_to_block(target);
+        toggle_fold(&mut state, &ctx);
+        assert!(state.folds().is_folded(target));
+
+        state.widen(&ctx);
+
+        assert!(
+            state.folds().is_folded(target),
+            "widen must not disturb fold state — it is keyed by node, not line"
+        );
+        let index = state
+            .outline()
+            .entries
+            .iter()
+            .position(|e| e.block == target)
+            .expect("the folded heading is still in the outline");
+        let line = state.outline().line_of(index).unwrap();
+        assert!(
+            line_text(&state, line).contains("hidden"),
+            "the section must still render as a marker after the width change"
+        );
+    }
+
+    #[test]
+    fn test_dw_5_2_fold_survives_a_watch_reload_by_content_identity() {
+        let (doc, config, engine, mut state) = build(&fold_fixture(3), 40, 5);
+        let ctx = ctx_for(&doc, &config, &engine);
+        let target = state.outline().entries[1].block; // "Heading 01"
+        state.jump_to_block(target);
+        toggle_fold(&mut state, &ctx);
+        assert!(state.folds().is_folded(target));
+
+        // A reload that inserts content *before* the folded heading: ids are
+        // assigned pre-order at parse time, so every node from "Heading 01"
+        // onward gets a different `NodeId` in the reparsed document. This
+        // only passes if the fold is re-keyed by content, not carried across
+        // as the same (now wrong) id.
+        let edited = format!("# Intro\n\nintro text.\n\n{}", fold_fixture(3));
+        reload(&mut state, &edited, &config, &engine);
+
+        assert_eq!(
+            state.folds().collapsed.len(),
+            1,
+            "exactly the one fold must survive the reload, re-keyed onto the new document"
+        );
+        let new_index = state
+            .outline()
+            .entries
+            .iter()
+            .position(|e| e.text == "Heading 01")
+            .expect("\"Heading 01\" must still be in the reloaded outline");
+        let new_id = state.outline().entries[new_index].block;
+        assert_ne!(
+            new_id, target,
+            "test setup: the reload must actually have renumbered nodes, or this proves \
+             nothing about content-addressing"
+        );
+        assert!(
+            state.folds().is_folded(new_id),
+            "the fold must have followed \"Heading 01\" onto its new NodeId"
+        );
+        let line = state.outline().line_of(new_index).unwrap();
+        assert!(line_text(&state, line).contains("hidden"));
+
+        let untouched = state
+            .outline()
+            .entries
+            .iter()
+            .find(|e| e.text == "Heading 00")
+            .expect("Heading 00 survives the reload too");
+        assert!(
+            !state.folds().is_folded(untouched.block),
+            "only the heading that was folded before the reload may be folded after it"
+        );
+    }
+
+    #[test]
+    fn test_dw_5_3_folding_removes_the_folded_headings_reserved_lines_unfolding_restores_them() {
+        struct AlwaysSizes;
+        impl IntrinsicSizer for AlwaysSizes {
+            fn size(&self, _node: NodeId, _doc: &Document) -> Option<layout::CellSize> {
+                Some(layout::CellSize { cols: 10, rows: 2 })
+            }
+        }
+
+        fn has_reserved(state: &AppState) -> bool {
+            (0..state.tree().line_count())
+                .any(|i| matches!(state.tree().lines(i..i + 1).next(), Some(Line::Reserved(_))))
+        }
+
+        let source = "# One\n\n![alt](pic.png)\n\n# Two\n\nBeta.\n";
+        let doc = Document::parse(source);
+        let config = LayoutConfig::default();
+        let engine = WidthEngine::new(WidthConfig::default());
+        let tree = layout(&doc, 40, &config, &engine, &AlwaysSizes);
+        assert!(
+            (0..tree.line_count())
+                .any(|i| matches!(tree.lines(i..i + 1).next(), Some(Line::Reserved(_)))),
+            "test setup: the fixture must reserve a media box before it is folded"
+        );
+        let mut state = AppState::new(
+            tree,
+            Size {
+                width: 40,
+                height: 20,
+            },
+            FileInfo::default(),
+        );
+        let ctx = LayoutContext {
+            doc: &doc,
+            config: &config,
+            engine: &engine,
+            sizer: &AlwaysSizes,
+        };
+
+        let target = state.outline().entries[0].block;
+        state.jump_to_block(target);
+        toggle_fold(&mut state, &ctx);
+        assert!(
+            !has_reserved(&state),
+            "folding the section holding the image must drop its reserved lines — the \
+             painter and media sink place only what a frame's tree actually contains \
+             (DW-5.3; see `media/sink.rs`'s module doc)"
+        );
+
+        toggle_fold(&mut state, &ctx);
+        assert!(
+            has_reserved(&state),
+            "unfolding must bring the image's reserved lines back"
+        );
+    }
+
+    #[test]
+    fn test_dw_5_4_collapse_all_and_expand_all() {
+        let (doc, config, engine, mut state) = build(&fold_fixture(4), 40, 30);
+        let ctx = ctx_for(&doc, &config, &engine);
+        let before = state.tree().clone();
+
+        state.collapse_all();
+        state.relayout_preserving_anchor(&ctx, config);
+
+        let marker_lines = (0..state.tree().line_count())
+            .filter(|&i| line_text(&state, i).contains('\u{25b8}'))
+            .count();
+        assert_eq!(
+            marker_lines, 4,
+            "every heading here is top-level, so collapse-all must leave exactly one \
+             marker line per heading"
+        );
+        let all_text: String = (0..state.tree().line_count())
+            .map(|i| line_text(&state, i))
+            .collect();
+        for i in 0..4 {
+            assert!(
+                !all_text.contains(&format!("body-{i:02}")),
+                "every body paragraph must be hidden once every heading is collapsed"
+            );
+        }
+
+        state.expand_all();
+        state.relayout_preserving_anchor(&ctx, config);
+        assert_eq!(
+            state.tree(),
+            &before,
+            "expand-all must restore the full document exactly"
+        );
+    }
+
+    #[test]
+    fn test_dw_5_5_folding_while_scrolled_inside_the_range_snaps_to_the_marker() {
+        let (doc, config, engine, mut state) = build(&fold_fixture(3), 40, 5);
+        let ctx = ctx_for(&doc, &config, &engine);
+        let target = state.outline().entries[1].block; // "Heading 01"
+        let heading_line = state.outline().line_of(1).unwrap();
+        // Past the heading's own line, inside its body — the case the
+        // ordinary block anchor cannot resolve once the section collapses,
+        // because that line's own block stops emitting a line at all.
+        state.jump_to_block(target);
+        state.handle_key_event(plain(KeyCode::Down));
+        assert!(
+            state.scroll() > heading_line,
+            "test setup: the reader must be inside the section, past its heading line"
+        );
+
+        toggle_fold(&mut state, &ctx);
+
+        let new_index = state
+            .outline()
+            .entries
+            .iter()
+            .position(|e| e.block == target)
+            .unwrap();
+        let marker_line = state.outline().line_of(new_index).unwrap();
+        assert_eq!(
+            state.scroll(),
+            marker_line,
+            "folding a range the reader was scrolled inside must leave the viewport \
+             exactly at the fold marker"
+        );
+        assert!(
+            state.scroll() <= state.max_scroll(),
+            "the snap must never land past the end"
+        );
+    }
+
+    #[test]
+    fn test_dw_5_5_folding_while_the_cursor_sits_on_the_headings_own_line_also_lands_on_the_marker()
+    {
+        let (doc, config, engine, mut state) = build(&fold_fixture(3), 40, 5);
+        let ctx = ctx_for(&doc, &config, &engine);
+        let target = state.outline().entries[1].block;
+        state.jump_to_block(target); // cursor on the heading's own first line
+
+        toggle_fold(&mut state, &ctx);
+
+        let new_index = state
+            .outline()
+            .entries
+            .iter()
+            .position(|e| e.block == target)
+            .unwrap();
+        let marker_line = state.outline().line_of(new_index).unwrap();
+        assert_eq!(state.scroll(), marker_line);
+    }
+
+    #[test]
+    fn test_dw_5_6_no_line_exceeds_width_after_a_fold_driven_relayout() {
+        let long = "A heading title long enough on its own that folding it still cannot overflow";
+        let source = format!(
+            "# {long}\n\nSome body text that is also long enough to wrap on its own at a \
+             narrow width.\n\n# Two\n\nBeta.\n"
+        );
+        for width in [20u16, 24, 40] {
+            let (doc, config, engine, mut state) = build(&source, width, 20);
+            let ctx = ctx_for(&doc, &config, &engine);
+            let target = state.outline().entries[0].block;
+            state.jump_to_block(target);
+            toggle_fold(&mut state, &ctx);
+
+            for i in 0..state.tree().line_count() {
+                let text = line_text(&state, i);
+                let measured = engine.display_width(&text);
+                assert!(
+                    measured <= state.content_width() as usize,
+                    "at width {width}: line {text:?} measured {measured} cells"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_folding_a_range_containing_a_search_match_drops_it_and_unfolding_restores_it() {
+        let source = "# One\n\nneedle here.\n\n# Two\n\nneedle there too.\n";
+        let (doc, config, engine, mut state) = build(source, 40, 20);
+        let ctx = ctx_for(&doc, &config, &engine);
+        let matches = search_for(&mut state, "needle");
+        assert_eq!(matches.len(), 2, "test setup: two matches expected");
+
+        let one = state.outline().entries[0].block;
+        state.jump_to_block(one);
+        toggle_fold(&mut state, &ctx);
+
+        assert_eq!(
+            state.search().matches.len(),
+            1,
+            "folding a range containing a match must drop it from the active set — the \
+             phase's chosen answer to \"n must expand it or skip it\" (skip)"
+        );
+        let remaining = &state.search().matches[0];
+        assert!(
+            line_text(&state, remaining.line).contains("needle"),
+            "the surviving match must still address real, visible text"
+        );
+
+        toggle_fold(&mut state, &ctx); // unfold
+        assert_eq!(
+            state.search().matches.len(),
+            2,
+            "unfolding must restore the match that was inside the folded range"
         );
     }
 }
