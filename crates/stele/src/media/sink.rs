@@ -105,7 +105,7 @@ use width::WidthEngine;
 
 use crate::media::MediaSink;
 use crate::media::residency::{RasterCache, Resident};
-use crate::media::sizer::MATH_BASELINE_PX_HEIGHT;
+use crate::media::sizer::math_baseline_px;
 use crate::painter::{CellRect, sanitize};
 
 /// Kitty protocol / DW-6.1 cap: at most this many placements may be live at
@@ -768,7 +768,7 @@ impl GfxMediaSink {
             // which also holds the whole fixture corpus inside the cap.
             if self.has_placement_slot(node_id)
                 && let Ok(png) =
-                    math::render_fitted(&tex, MATH_BASELINE_PX_HEIGHT, target.0, target.1)
+                    math::render_fitted(&tex, math_baseline_px(self.cell_px), target.0, target.1)
                 && let Ok(boxed) = gfx::decode::letterbox_png(png.as_bytes(), target, self.limits)
                 && self.transmit_and_place(node_id, &boxed, target, reserved, rect, out)
             {

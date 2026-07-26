@@ -7,10 +7,23 @@ than the content column) rides the text baseline like a word. Anything
 **taller than one row, or wider than the content column,** falls through to
 claim its own line(s) — the same path display math and block images use.
 
-All cell sizes quoted below in parentheses were measured directly against
-this checkout's `math::intrinsic_em_size` / `math::render_text` (the same
-functions `stele::media::sizer::ImageSizer` calls), not guessed from the TeX
-source. `(cols, rows)` — `rows <= 1` is the baseline-riding condition.
+All sizes quoted below were measured directly against this checkout's
+`math::intrinsic_em_size` / `math::render_text` (the same functions
+`stele::media::sizer::ImageSizer` calls), not guessed from the TeX source.
+`rows <= 1` is the baseline-riding condition.
+
+**Rows are quoted; columns are not.** A formula's em baseline is the
+terminal's own cell height (`sizer::math_baseline_px`), so one em is one row
+and a formula's row count is the same on every terminal — that is what makes
+`rows` a fact worth writing down here. Its *column* count is not: an em-square
+covers twice as many columns in a 12x28 cell as in a 24x48 one, so any number
+this file quoted would be true only for whoever measured it.
+
+This file previously quoted both, from the 24x48 fallback geometry that every
+test in the workspace uses and no reader's terminal reports. The numbers were
+real and the conclusions drawn from them were wrong: `a+b=c` measured 1 row
+there and 2 rows on an actual Ghostty, which is the bug this section exists to
+catch and the bug the quoted numbers hid.
 
 ## Inline math mid-sentence
 
@@ -41,8 +54,8 @@ choice in `wrap()` never checks position — only size.*
 
 ## The boundary itself: near-1-row vs taller-than-1-row
 
-Simple formulas that measure **exactly 1 row** (verified: `a+b=c` → cols 7,
-rows 1; `x_1` → cols 2, rows 1):
+Simple formulas that measure **exactly 1 row** (verified: `a+b=c` → 0.778 em
+tall → 1 row; `x_1` → 0.581 em → 1 row; on every cell geometry):
 
 Simple sum $a+b=c$ and subscript $x_1$ sitting in a sentence.
 
@@ -50,9 +63,9 @@ Simple sum $a+b=c$ and subscript $x_1$ sitting in a sentence.
 bug we just fixed. This sentence must stay ONE line (or wrap only at normal
 word boundaries), never break into three lines around the formulas.*
 
-Formulas that measure **taller than 1 row** (verified: `\frac{a}{b}` → cols
-2, rows 2; `\sum_{i=0}^{n}` → cols 3, rows 3; `\int_0^\infty` → cols 3, rows
-2):
+Formulas that measure **taller than 1 row** (verified: `\frac{a}{b}` → 1.794
+em → 2 rows; `\sum_{i=0}^{n}` → 3.089 em → 4 rows; `\int_0^\infty` → 2.326 em
+→ 3 rows; on every cell geometry):
 
 A fraction $\frac{a}{b}$, a limited sum $\sum_{i=0}^{n}$, and a limited
 integral $\int_0^\infty$ all appear here mid-paragraph.

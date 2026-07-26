@@ -1,21 +1,32 @@
 //! Measures what a formula's raster actually comes out as, versus the cell
 //! box stele reserves for it.
 //!
-//! The question this answers: `sizer` picks a cell box from an em baseline of
-//! `MATH_BASELINE_PX_HEIGHT` (40px), while `sink` renders by handing
-//! `math::render` the box's *total pixel height* — but that argument is the
-//! em/`font_size`, not a total. This prints both sides so the mismatch is a
-//! measured number rather than an inference.
+//! The question this answers: `sizer` picks a cell box from an em baseline,
+//! while `sink` renders by handing `math::render` the box's *total pixel
+//! height* — but that argument is the em/`font_size`, not a total. This prints
+//! both sides so the mismatch is a measured number rather than an inference.
+//!
+//! Pass a cell geometry to see another terminal's answer:
+//! `cargo run -p math --example raster_probe -- 12 28`
 //!
 //! Run: `cargo run -p math --example raster_probe`
 
-/// Mirrors `stele::terminal::FALLBACK_CELL_PX`. stele asks the terminal with
-/// `CSI 16t` now and only falls back to this pair when nothing answers, so a
-/// live session may well be measuring something else — the numbers this probe
-/// prints are the fallback geometry's, not necessarily the reader's.
-const CELL_PX: (u32, u32) = (24, 48);
-/// Mirrors `stele::media::sizer::MATH_BASELINE_PX_HEIGHT`.
-const MATH_BASELINE_PX_HEIGHT: u32 = 40;
+/// Mirrors `stele::terminal::FALLBACK_CELL_PX`, used when no geometry is given
+/// on the command line. stele asks the terminal with `CSI 16t` and only falls
+/// back to this pair when nothing answers, so a live session may well be
+/// measuring something else.
+const FALLBACK_CELL_PX: (u32, u32) = (24, 48);
+
+/// Mirrors `stele::media::sizer::math_baseline_px`: the em baseline **is** the
+/// cell height, so one em is one row on every terminal.
+///
+/// It used to be a hardcoded 40 px here and there, and the two numbers were
+/// the same only by coincidence of the fallback cell. That is exactly the
+/// mismatch this probe was written to measure, so taking the cell as the
+/// argument rather than restating a constant is the point.
+fn math_baseline_px(cell_px: (u32, u32)) -> u32 {
+    cell_px.1
+}
 
 /// Reads a PNG's IHDR width/height. The signature is 8 bytes, then an
 /// 8-byte chunk header, then width and height as big-endian u32s.
@@ -26,6 +37,16 @@ fn png_size(bytes: &[u8]) -> Option<(u32, u32)> {
 }
 
 fn main() {
+    let mut args = std::env::args().skip(1);
+    let cell_px = match (
+        args.next().and_then(|a| a.parse().ok()),
+        args.next().and_then(|a| a.parse().ok()),
+    ) {
+        (Some(w), Some(h)) if w > 0 && h > 0 => (w, h),
+        _ => FALLBACK_CELL_PX,
+    };
+    println!("cell geometry: {}x{}px", cell_px.0, cell_px.1);
+
     let cases = [
         ("inline (the reported bug)", r"e^{i\pi}+1=0"),
         (
@@ -44,11 +65,12 @@ fn main() {
         println!("  intrinsic em size: {em_w:.3}w x {em_h:.3}h");
 
         // --- what the sizer reserves -------------------------------------
-        let px_w = (em_w * MATH_BASELINE_PX_HEIGHT as f64).max(0.0) as u32;
-        let px_h = (em_h * MATH_BASELINE_PX_HEIGHT as f64).max(0.0) as u32;
-        let cols = px_w.div_ceil(CELL_PX.0).max(1);
-        let rows = px_h.div_ceil(CELL_PX.1).max(1);
-        let box_px = (cols * CELL_PX.0, rows * CELL_PX.1);
+        let baseline = math_baseline_px(cell_px);
+        let px_w = (em_w * f64::from(baseline)).max(0.0) as u32;
+        let px_h = (em_h * f64::from(baseline)).max(0.0) as u32;
+        let cols = px_w.div_ceil(cell_px.0).max(1);
+        let rows = px_h.div_ceil(cell_px.1).max(1);
+        let box_px = (cols * cell_px.0, rows * cell_px.1);
         println!(
             "  sizer wants  : {px_w}x{px_h}px -> {cols}x{rows} cells = {}x{}px box",
             box_px.0, box_px.1
@@ -57,7 +79,7 @@ fn main() {
         // --- what the sink actually renders ------------------------------
         // sink.rs: target_px() = (width_cells * cell_w, rows * cell_h), and
         // target.1 is passed to math::render as its `px_height` argument.
-        let em_passed = MATH_BASELINE_PX_HEIGHT;
+        let em_passed = baseline;
         match math::render_fitted(tex, em_passed, box_px.0, box_px.1) {
             Ok(png) => {
                 let (rw, rh) = png_size(png.as_bytes()).expect("valid PNG header");

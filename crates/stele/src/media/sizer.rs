@@ -43,11 +43,36 @@ fn usable_cell_px(cell_px: (u32, u32)) -> (u32, u32) {
     )
 }
 
-/// RaTeX `RenderOptions::default().font_size` — the em-pixel baseline this
-/// sizer converts em units against. Matches `crates/math`'s own baseline so
-/// a size probed here and a raster later rendered at the same nominal size
-/// agree.
-pub(crate) const MATH_BASELINE_PX_HEIGHT: u32 = 40;
+/// The em-pixel baseline a formula is measured and rastered at: **one em is
+/// one terminal row**, so `cell_px.1` is the answer and there is no constant
+/// to pick.
+///
+/// This used to be a hardcoded 40 px, matching RaTeX's default `font_size`,
+/// and it produced two visible defects at once. A cell is whatever the
+/// terminal reports — around 28 px on a typical Ghostty — so a formula was
+/// rastered ~1.4x the height of the text beside it, and, worse, its row
+/// count came out as `ceil(em_h * 40 / cell_h)` rather than `ceil(em_h)`.
+/// At a 28 px cell that put the baseline-riding threshold at 0.7 em, so
+/// `a+b=c` (0.778 em) claimed its own row and broke the sentence around it
+/// — while `x_1` (0.581 em) stayed inline, which is what made the bug look
+/// intermittent rather than systematic.
+///
+/// Every test in this workspace constructs its sizer without calling
+/// [`ImageSizer::with_cell_px`] and therefore measured against the 48 px
+/// fallback, where the threshold is 1.2 em and both formulas fit. The
+/// fixture prose in `testdocs/02-math.md` quotes those fallback numbers as
+/// "verified". They were — in a geometry the product never runs in.
+///
+/// Tying the baseline to the cell makes the row count a property of the
+/// formula alone: a one-em formula is one row on every terminal, whatever
+/// it reports.
+/// `pub(crate)` because the raster half of the pipeline must render at the
+/// same baseline this half measured against: `media::sink` hands it to
+/// [`math::render_fitted`]. Two different answers here and there would size a
+/// box from one em and draw a formula at another.
+pub(crate) fn math_baseline_px(cell_px: (u32, u32)) -> u32 {
+    usable_cell_px(cell_px).1
+}
 
 /// Upper bound on a single reserved box's cell extent, independent of the
 /// probed pixel/em size — a legitimately large (within `gfx::Limits`)
@@ -131,8 +156,9 @@ impl ImageSizer {
 
     fn size_math(&self, tex: &str) -> Option<CellSize> {
         if let Some((em_w, em_h)) = math::intrinsic_em_size(tex) {
-            let px_w = (em_w * MATH_BASELINE_PX_HEIGHT as f64).max(0.0) as u32;
-            let px_h = (em_h * MATH_BASELINE_PX_HEIGHT as f64).max(0.0) as u32;
+            let baseline = f64::from(math_baseline_px(self.cell_px));
+            let px_w = (em_w * baseline).max(0.0) as u32;
+            let px_h = (em_h * baseline).max(0.0) as u32;
             return Some(px_to_cells(px_w.max(1), px_h.max(1), self.cell_px));
         }
         // RaTeX rung failed to parse: try the txm rung before giving up —
@@ -466,6 +492,86 @@ mod tests {
             .id();
         let size = sizer.size(math_node, &doc).expect("valid TeX must size");
         assert!(size.cols > 0 && size.rows > 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A formula's **row count is a property of the formula**, not of the
+    /// terminal it is being read in.
+    ///
+    /// This is the invariant the cell-height baseline buys, and the one the
+    /// hardcoded 40 px em did not have: rows came out as
+    /// `ceil(em_h * 40 / cell_h)`, so the baseline-riding threshold moved with
+    /// the reported cell — 1.2 em at the 48 px fallback every test used, but
+    /// 0.7 em at the ~28 px cell a real Ghostty reports. `a+b=c` is 0.778 em
+    /// tall, which is why it rode the baseline in the whole test suite and
+    /// broke its sentence in three on the actual product.
+    ///
+    /// The geometries below are the fallback, a retina Ghostty, and a small
+    /// non-retina cell. Column counts legitimately differ between them (an
+    /// em-square covers more columns in a narrow cell); rows must not.
+    #[test]
+    fn test_a_formulas_row_count_does_not_move_with_the_terminals_cell_size() {
+        let dir = scratch_dir("math-cell-invariance");
+        let doc = Document::parse("$a+b=c$ $x_1$ $\\frac{a}{b}$ $\\int_0^\\infty$\n");
+        let nodes: Vec<_> = doc
+            .nodes()
+            .filter(
+                |n| matches!(n, NodeRef::Inline(i) if matches!(i.kind, InlineKind::Math { .. })),
+            )
+            .map(|n| n.id())
+            .collect();
+        assert_eq!(nodes.len(), 4, "the fixture must parse as four math spans");
+
+        for node in nodes {
+            let rows: Vec<u16> = [(24, 48), (12, 28), (9, 19), (10, 21)]
+                .into_iter()
+                .map(|cell| {
+                    ImageSizer::new(&dir)
+                        .with_cell_px(cell)
+                        .size(node, &doc)
+                        .expect("every formula in the fixture sizes")
+                        .rows
+                })
+                .collect();
+            assert!(
+                rows.windows(2).all(|w| w[0] == w[1]),
+                "row count moved with the cell geometry: {rows:?} — a reader on \
+                 one terminal sees the formula ride the baseline and a reader on \
+                 another sees it break the sentence"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The specific regression from `testdocs/02-math.md`: at a realistic
+    /// terminal cell, the two formulas that fixture calls the "core regression
+    /// case" both measure one row and so ride the text baseline.
+    #[test]
+    fn test_a_simple_sum_rides_the_baseline_at_a_real_terminals_cell_size() {
+        let dir = scratch_dir("math-baseline-riding");
+        let doc = Document::parse("$a+b=c$ $x_1$\n");
+        let nodes: Vec<_> = doc
+            .nodes()
+            .filter(
+                |n| matches!(n, NodeRef::Inline(i) if matches!(i.kind, InlineKind::Math { .. })),
+            )
+            .map(|n| n.id())
+            .collect();
+
+        // 12x28 is the shape a retina Ghostty reports; the pre-fix code made
+        // `a+b=c` two rows here while leaving `x_1` at one, which is exactly
+        // what the screenshot of the bug showed.
+        for node in nodes {
+            let size = ImageSizer::new(&dir)
+                .with_cell_px((12, 28))
+                .size(node, &doc)
+                .expect("both formulas size");
+            assert_eq!(
+                size.rows, 1,
+                "a one-em formula must be one row so `wrap()` lets it ride the \
+                 baseline; got {size:?}"
+            );
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 

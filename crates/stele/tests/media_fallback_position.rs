@@ -84,19 +84,25 @@ fn test_the_terminal_model_honours_cup_el_and_skips_apc_payloads() {
 fn test_inline_box_text_fallback_is_cup_ed_to_the_box_origin() {
     let frame = frame_with_failed_math("ab $x+y$ cd\n", 40, 1, true);
 
-    // The exact bytes: SGR reset, four blanking spaces for the 4-cell box,
+    // The exact bytes: SGR reset, five blanking spaces for the 5-cell box,
     // then a CUP back to the box's own origin (row 1, column 4) before the
     // literal TeX. Column 4 is 1-based for the 0-based cell x=3, which is
     // where "ab " ends.
+    //
+    // Five, not four, since the em baseline became the cell height: `x+y`
+    // measures 2.32 em wide, and at the 24x48 fallback cell an em is 48 px,
+    // so it spans `ceil(2.32 * 48 / 24)` = 5 columns rather than the 4 it
+    // spanned at the old hardcoded 40 px em. The box width is what moved —
+    // the CUP-to-box-origin behaviour this test exists for did not.
     assert!(
-        frame.contains("\u{1b}[0mab \u{1b}[0m    \u{1b}[1;4Hx+y"),
+        frame.contains("\u{1b}[0mab \u{1b}[0m     \u{1b}[1;4Hx+y"),
         "expected a box-origin CUP between the blanking run and the \
          fallback text; got {frame:?}"
     );
     // ...and what the terminal shows for them.
     assert_eq!(
         &render_row(&frame, 1, 12),
-        "ab x+y  cd  ",
+        "ab x+y   cd ",
         "the fallback must render inside the box's own cells"
     );
 }
