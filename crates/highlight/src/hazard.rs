@@ -42,12 +42,25 @@
 ///   arrives to exploit a parser's leniency is refused on principle rather
 ///   than left as the next reviewer's finding.
 ///
-/// **Directional marks (LRM U+200E, RLM U+200F, ALM U+061C) are deliberately
-/// absent.** They influence ordering, they do not override it, and Arabic or
-/// Hebrew prose legitimately needs them — stripping them would corrupt honest
-/// documents to defend against a spoof they cannot mount. This is the one
-/// judgment call in the set, and it is why the set is enumerated by hand
-/// rather than taken wholesale from a Unicode category.
+/// Three families of *near*-hazard are deliberately absent, and each exclusion
+/// is a judgment call — which is why this set is enumerated by hand rather
+/// than taken wholesale from a Unicode category:
+///
+/// - **Directional marks (LRM U+200E, RLM U+200F, ALM U+061C).** They
+///   influence ordering, they do not override it, and Arabic or Hebrew prose
+///   legitimately needs them. Stripping them corrupts honest documents to
+///   defend against a spoof they cannot mount. The same reasoning keeps ZWJ
+///   (U+200D) and ZWNJ (U+200C): load-bearing for emoji sequences and for
+///   Persian and Indic scripts respectively.
+/// - **Tag characters (U+E0000-E007F).** Genuinely invisible and genuinely
+///   abusable, but they are also how subdivision flag emoji are spelled —
+///   🏴󠁧󠁢󠁳󠁣󠁴󠁿 is a base flag followed by six of them. Stripping the range
+///   breaks a character a document may legitimately contain.
+/// - **Look-alike fillers (U+115F, U+3164, U+FFA0) and the soft hyphen
+///   (U+00AD).** These enable confusable-string attacks, which are an
+///   identity-system problem — two names that must not collide. This viewer
+///   paints what a document says and has no notion of two strings that must
+///   differ, so the attack has no target here.
 pub fn is_display_hazard(c: char) -> bool {
     matches!(
         c as u32,

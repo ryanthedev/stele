@@ -1,7 +1,8 @@
 //! `Painter` — the paint boundary and terminal-injection barricade.
 //!
 //! [`Painter::frame`] is the single place document text meets the wire: it
-//! sanitizes every run's text (C0/DEL/C1 control code points stripped),
+//! sanitizes every run's text (every [`highlight::is_display_hazard`] code
+//! point stripped — controls and the bidi spoofing class),
 //! clips runs to the viewport width by grapheme cluster through the shared
 //! [`WidthEngine`], and wraps the whole viewport repaint in a mode-2026
 //! synchronized-update block. No cell-grid differ exists — every call is a
@@ -991,19 +992,18 @@ fn push_piece(
     });
 }
 
-/// The terminal-injection barricade: strips C0 (0x00-0x1F), DEL (0x7F), and
-/// C1 (0x80-0x9F) control code points from `text`, plus the Unicode bidi
-/// override/isolate formatting characters (U+202A-202E, U+2066-2069). After
-/// this runs, the only escape bytes that can reach the wire come from this
-/// module's own hardcoded sequences above — ESC (0x1B) falls inside the
-/// stripped C0 range, so no injected OSC/APC/DECSET sequence can survive
-/// with its leading ESC intact.
+/// The terminal-injection barricade: strips every code point
+/// [`highlight::is_display_hazard`] names from `text`. After this runs, the
+/// only escape bytes that can reach the wire come from this module's own
+/// hardcoded sequences above — ESC (0x1B) is one of the hazards, so no
+/// injected OSC/APC/DECSET sequence can survive with its leading ESC intact.
 ///
-/// The bidi strip is defense against Trojan-Source-style visual spoofing: a
-/// document viewer of untrusted markdown must not let override characters
-/// reorder rendered text to disguise a link or command. The directional
-/// *marks* (LRM/RLM/ALM) that legitimate RTL text needs are left intact;
-/// only the override and isolate controls are removed.
+/// **The set is deliberately not restated here.** It used to be, and the
+/// prose went stale the moment the set grew — describing a narrower strip
+/// than the code performed, which is worse than saying nothing because it
+/// reads as authoritative. `is_display_hazard` documents which ranges are in,
+/// which are out, and why, including the judgment call that leaves the
+/// directional marks (LRM/RLM/ALM) alone for legitimate RTL text.
 ///
 /// `pub(crate)` because the barricade has a second entrance: [`MediaSink`]
 /// implementations write text straight to the wire (image alt text, the txm
@@ -1225,9 +1225,15 @@ mod tests {
     /// codebase disagreeing about what a control character is. Anyone who
     /// re-inlines a list here fails this test rather than shipping the same
     /// divergence again.
+    ///
+    /// Swept to `char::MAX` rather than to a bound chosen around today's
+    /// ranges. A bound picked to cover the current set silently stops
+    /// covering it the moment the set grows past it — the guard narrowing as
+    /// the thing it guards widens, which is this test's own failure mode. 1.1M
+    /// iterations of two comparisons costs nothing worth optimizing.
     #[test]
     fn test_sanitize_strips_the_whole_shared_hazard_set_not_a_local_subset() {
-        for cp in 0u32..=0x2100 {
+        for cp in 0u32..=u32::from(char::MAX) {
             let Some(c) = char::from_u32(cp) else {
                 continue;
             };

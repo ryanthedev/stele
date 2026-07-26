@@ -115,9 +115,12 @@ pub enum LinkError {
     Fragment,
     /// A URL scheme outside [`ACTIVATABLE_SCHEMES`] (DW-6.3).
     UnsupportedScheme(String),
-    /// An `http(s)` URL carrying a control byte, a newline, or more than
-    /// [`MAX_URL_BYTES`]. Refused rather than sanitized: silently rewriting a
-    /// URL and then opening the rewrite is worse than declining.
+    /// An `http(s)` URL longer than [`MAX_URL_BYTES`], or carrying any code
+    /// point [`highlight::is_display_hazard`] names — a control byte, a
+    /// newline, or a bidi character that would let the URL preview as one
+    /// destination and open as another. Refused rather than sanitized:
+    /// silently rewriting a URL and then opening the rewrite is worse than
+    /// declining.
     MalformedUrl,
     /// The path does not exist, or cannot be canonicalized.
     Missing(PathBuf),
@@ -246,8 +249,10 @@ impl LinkTarget {
     /// Resolves this target against the open document's directory, returning
     /// a target that is safe to act on — **without reading one byte of it**.
     ///
-    /// For a URL: re-validates the scheme and refuses control bytes, newlines
-    /// and anything past [`MAX_URL_BYTES`].
+    /// For a URL: re-validates the scheme and refuses anything past
+    /// [`MAX_URL_BYTES`] or carrying a [`highlight::is_display_hazard`] code
+    /// point — see [`validated_url`] for why the bidi half is not redundant
+    /// with the OSC 8 sanitizer.
     ///
     /// For a path: joins `base`, canonicalizes (which resolves `..` and every
     /// symlink, and is also the existence check), then `stat`s and requires a

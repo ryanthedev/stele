@@ -152,27 +152,41 @@ fn main() {
 /// emit — i.e. one that leaked out of the document.
 ///
 /// This is the automated half of the injection barricade. `sanitize()` strips
-/// C0/DEL/C1 and bidi formatting from every run before it is written, so a
-/// hostile document's payloads should arrive as inert literal text. Anything
-/// here that is not a painter shape means that guarantee broke.
+/// every [`highlight::is_display_hazard`] code point from every run before it
+/// is written, so a hostile document's payloads should arrive as inert
+/// literal text. Anything here that is not a painter shape means that
+/// guarantee broke.
 ///
 /// The allowlist is wider than the one in `tests/painter_frame.rs` because
 /// that test runs with no media sink and no links: a real frame legitimately
 /// carries kitty graphics APCs and OSC 8 hyperlinks too.
+///
+/// **The hazard scan decodes UTF-8; the sequence scan walks bytes.** They are
+/// two passes on purpose. This function used to do both byte-wise, and the
+/// hazard half was consequently blind to everything above ASCII: C1 arrives
+/// as `C2 80`-`C2 9F` and every bidi control as a three-byte sequence, so
+/// neither byte is ever `< 0x20`. It reported `LEAKED: none` on the exact
+/// U+206B regression this barricade exists to catch. Escape-sequence *shape*
+/// is genuinely a byte question — an ESC is one byte and the parameters are
+/// ASCII — so that half stays as it was.
 fn barricade_report(bytes: &[u8]) {
     let mut leaked: Vec<(usize, String)> = Vec::new();
-    let mut raw_control: Vec<(usize, u8)> = Vec::new();
+    let mut raw_control: Vec<(usize, char)> = Vec::new();
     let mut i = 0;
     let mut accounted = 0usize;
 
+    // Pass one: hazards, by code point. ESC is excluded because the sequence
+    // scan below adjudicates it, and the ASCII whitespace the painter writes
+    // deliberately (`\n`, `\r`, `\t`) is not a leak.
+    for (at, ch) in String::from_utf8_lossy(bytes).char_indices() {
+        if ch != '\u{1b}' && !matches!(ch, '\n' | '\r' | '\t') && highlight::is_display_hazard(ch) {
+            raw_control.push((at, ch));
+        }
+    }
+
+    // Pass two: escape-sequence shape, by byte.
     while i < bytes.len() {
         let b = bytes[i];
-        // A raw control byte on the wire is a leak regardless of what follows.
-        if b != 0x1B && (b < 0x20 || b == 0x7F) && !matches!(b, b'\n' | b'\r' | b'\t') {
-            raw_control.push((i, b));
-            i += 1;
-            continue;
-        }
         if b != 0x1B {
             i += 1;
             continue;
@@ -220,9 +234,9 @@ fn barricade_report(bytes: &[u8]) {
         println!("  LEAKED: none — every escape on the wire is a painter shape");
         return;
     }
-    println!("  RAW CONTROL BYTES: {}", raw_control.len());
-    for (at, b) in raw_control.iter().take(5) {
-        println!("    byte {at}: {b:#04x}");
+    println!("  DISPLAY HAZARDS: {}", raw_control.len());
+    for (at, ch) in raw_control.iter().take(5) {
+        println!("    byte {at}: U+{:04X}", *ch as u32);
     }
     println!("  UNRECOGNIZED SEQUENCES: {}", leaked.len());
     for (at, s) in leaked.iter().take(5) {
