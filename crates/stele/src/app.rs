@@ -2,12 +2,19 @@
 //! debounced resize/relayout — all pure and independently testable, so the
 //! event loop in `main.rs` stays thin glue over real crossterm I/O.
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+
 use ast::{Document, NodeId};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use layout::{IntrinsicSizer, LayoutConfig, LayoutTree, layout};
+use layout::{IntrinsicSizer, LayoutConfig, LayoutTree, Line, LineItem, layout};
 use width::WidthEngine;
 
 use crate::painter::Size;
+
+/// Mixed into [`AppState::fingerprint`] between lines so two blocks whose runs
+/// concatenate to the same bytes but break differently cannot hash alike.
+const LINE_BOUNDARY: u8 = 0xff;
 
 /// Everything [`AppState::relayout`] needs to re-derive a [`LayoutTree`]
 /// from the retained document, bundled so the method stays under the
@@ -31,6 +38,15 @@ struct Anchor {
     block: NodeId,
     /// Lines of `block` scrolled off above the viewport top.
     offset: usize,
+    /// `(fingerprint, occurrence)` — a hash of what the block paints, and how
+    /// many earlier blocks paint the same thing. Together these are what
+    /// survives a re-parse; `block` does not, because a [`NodeId`] is
+    /// positional (see [`AppState::line_of_reloaded`]).
+    ///
+    /// `None` on a resize, where nothing re-parsed and the `NodeId` is
+    /// authoritative — computing it there would hash a block whose answer is
+    /// never consulted.
+    identity: Option<(u64, usize)>,
     /// Lines `block` occupied in the tree `offset` was measured in. Only
     /// meaningful paired with `offset`: together they are a *fraction* of the
     /// block, and a fraction is what stays comparable when reflow changes how
@@ -115,6 +131,10 @@ pub struct AppState {
     /// `(text, frames remaining)`. `None` once the TTL has been exhausted or
     /// no message has been set.
     status_message: Option<(String, u32)>,
+    /// Set by [`AppState::reload_document`] and consumed by the next
+    /// [`AppState::relayout`]. See [`AppState::no_reflow_occurred`] for why a
+    /// width comparison cannot answer this on its own.
+    document_changed: bool,
 }
 
 impl AppState {
@@ -133,6 +153,7 @@ impl AppState {
             content_width,
             file_info,
             status_message: None,
+            document_changed: false,
         }
     }
 
@@ -180,6 +201,20 @@ impl AppState {
     /// for [`STATUS_MESSAGE_TTL_FRAMES`] calls to [`AppState::status`].
     pub fn set_status(&mut self, message: StatusMessage) {
         self.status_message = Some((message.text, STATUS_MESSAGE_TTL_FRAMES));
+    }
+
+    /// Drops the transient message immediately, whatever is left of its TTL,
+    /// so the permanent ruler returns on the very next frame.
+    ///
+    /// The TTL is a budget for a message the reader may not have finished
+    /// reading; it is **not** a claim that the message is still true. Every
+    /// message this type shows describes the document as it was when the
+    /// message was set — `Ctrl-G`'s byte and line counts, or a failed
+    /// reload's reason — so replacing the document invalidates all of them at
+    /// once. Hence the caller: [`AppState::reload_document`], the one place a
+    /// document is replaced.
+    fn clear_status(&mut self) {
+        self.status_message = None;
     }
 
     /// `Ctrl-g`'s action (DW-1.3): shows the open document's name, byte
@@ -244,6 +279,32 @@ impl AppState {
         );
         // Safe: `clamped` is bounded by two `u16` values.
         self.content_width = clamped as u16;
+        self.relayout_preserving_anchor(ctx, *ctx.config);
+    }
+
+    /// A `--watch` reload (DW-2.2): `ctx.doc` is a **different** document from
+    /// the one the current tree was built from. Re-anchors the reader into
+    /// the new tree and refreshes what `Ctrl-G` reports.
+    ///
+    /// Separate from [`AppState::relayout_preserving_anchor`] because of
+    /// [`AppState::no_reflow_occurred`]: a reload happens at the same layout
+    /// width, so the width comparison that stands in for "the tree is
+    /// unchanged" would wrongly say nothing moved and keep the raw scroll
+    /// offset — correct only when the edit was entirely below the reader.
+    /// This marks the tree as genuinely new so the anchor path runs, and the
+    /// anchor is resolved *by content* rather than by node identity — see
+    /// [`AppState::line_of_reloaded`] for why identity alone is not enough.
+    /// Any transient status message is dropped here rather than left to age
+    /// out. A message on the row describes the document that produced it, so
+    /// once the document is replaced the message is not merely stale, it is
+    /// wrong: `reload failed: … No such file or directory` sat under a
+    /// correctly re-rendered document for ~100 frames after the file came
+    /// back, and `Ctrl-G`'s byte and line counts would have outlived the file
+    /// they measured the same way.
+    pub fn reload_document(&mut self, ctx: &LayoutContext, file_info: FileInfo) {
+        self.file_info = file_info;
+        self.clear_status();
+        self.document_changed = true;
         self.relayout_preserving_anchor(ctx, *ctx.config);
     }
 
@@ -378,7 +439,10 @@ impl AppState {
     ///    the old line index no longer names the same text but the *fraction*
     ///    of the way through the block still does.
     pub fn relayout(&mut self, ctx: &LayoutContext, width: u16, new_size: Size) {
-        let anchor = self.anchor();
+        // Read before `anchor()`: whether the document was replaced decides
+        // what identity the anchor has to carry.
+        let document_changed = self.document_changed;
+        let anchor = self.anchor(document_changed);
         let old_max = self.max_scroll();
         let ratio = if old_max == 0 {
             0.0
@@ -387,6 +451,10 @@ impl AppState {
         };
         let previous_scroll = self.scroll;
         let previous_width = self.tree.width();
+        // Cleared here, whatever path is taken below, so a reload's claim
+        // cannot survive into the *next* relayout and force a needless
+        // re-anchor there.
+        self.document_changed = false;
 
         self.tree = layout(ctx.doc, width, ctx.config, ctx.engine, ctx.sizer);
         self.size = new_size;
@@ -397,11 +465,17 @@ impl AppState {
         // through here, so a resize always overrides a stale toggle.
         self.content_width = self.tree.width();
 
-        let target = if self.no_reflow_occurred(previous_width) {
+        let target = if !document_changed && self.no_reflow_occurred(previous_width) {
             previous_scroll
         } else {
             anchor
-                .and_then(|anchor| self.line_of(anchor))
+                .and_then(|anchor| {
+                    if document_changed {
+                        self.line_of_reloaded(anchor)
+                    } else {
+                        self.line_of(anchor)
+                    }
+                })
                 .unwrap_or_else(|| (ratio * self.max_scroll() as f64).round() as usize)
         };
         self.set_scroll(target);
@@ -409,14 +483,166 @@ impl AppState {
 
     /// The reader's current position as an [`Anchor`], or `None` when the top
     /// line belongs to no block (an empty document).
-    fn anchor(&self) -> Option<Anchor> {
+    ///
+    /// `for_reload` asks for the extra identity a re-parse needs — the
+    /// fingerprint and the occurrence index. It is skipped on a resize, where
+    /// the `NodeId` is authoritative and hashing the block would be work whose
+    /// answer is never read.
+    fn anchor(&self, for_reload: bool) -> Option<Anchor> {
         let block = self.tree.block_at(self.scroll)?;
         let first = self.tree.first_line_of(block)?;
+        let span = self.block_span(block, first);
+        let identity = for_reload.then(|| {
+            let fingerprint = self.fingerprint(first, span);
+            (fingerprint, self.occurrence_of(first, fingerprint))
+        });
         Some(Anchor {
             block,
             offset: self.scroll.saturating_sub(first),
-            span: self.block_span(block, first),
+            span,
+            identity,
         })
+    }
+
+    /// How many blocks *above* line `first` paint the same thing it does —
+    /// making the anchored block "the `n`th block whose content hashes to
+    /// this" rather than "the block at index `k`".
+    ///
+    /// This is the property that survives an edit elsewhere in the file. An
+    /// absolute ordinal does not: it is an index in the **old** document, so
+    /// once blocks are inserted above the reader every candidate's ordinal has
+    /// shifted and choosing the one nearest the old value drags the reader
+    /// backwards — measured at up to 24 lines, onto a different copy, once the
+    /// insertion exceeded half the spacing between two identical blocks.
+    /// Occurrence index is invariant to *unrelated* content appearing or
+    /// disappearing above, which is exactly the `--watch` edit that broke it.
+    fn occurrence_of(&self, first: usize, fingerprint: u64) -> usize {
+        self.block_runs()
+            .into_iter()
+            .take_while(|&(candidate, _)| candidate < first)
+            .filter(|&(candidate, span)| self.fingerprint(candidate, span) == fingerprint)
+            .count()
+    }
+
+    /// A hash of what the block starting at `first` actually *paints*, over
+    /// its `span` lines — the identity that survives a re-parse.
+    ///
+    /// Painted text, not source text, because that is what this type has:
+    /// [`AppState::anchor`] runs before the new tree is installed and never
+    /// holds the old [`Document`] at all. It is equivalent for the purpose, so
+    /// long as the two trees were laid out at the same width — which a reload
+    /// always is, since [`AppState::reload_document`] goes through
+    /// [`AppState::relayout_preserving_anchor`] at the current
+    /// [`AppState::content_width`]. (At *different* widths the same block
+    /// wraps into different lines and this would not match, which is exactly
+    /// why the fingerprint is consulted only on the document-changed path and
+    /// never on a resize.)
+    ///
+    /// A media box contributes its cell extent rather than a `NodeId`, since
+    /// the id is the very thing a re-parse renumbers. A line separator is
+    /// mixed in so `["ab", "c"]` and `["a", "bc"]` cannot collide.
+    fn fingerprint(&self, first: usize, span: usize) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        for line in self.tree.lines(first..first.saturating_add(span)) {
+            match line {
+                Line::Items(items) => {
+                    for item in items {
+                        match item {
+                            LineItem::Run(run) => run.text.hash(&mut hasher),
+                            LineItem::Box(reserved) => {
+                                (reserved.cols, reserved.rows).hash(&mut hasher);
+                            }
+                        }
+                    }
+                }
+                Line::Reserved(reserved) => {
+                    for run in &reserved.prefix {
+                        run.text.hash(&mut hasher);
+                    }
+                    (reserved.boxed.cols, reserved.boxed.rows).hash(&mut hasher);
+                }
+            }
+            LINE_BOUNDARY.hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
+    /// Every block in the installed tree, top to bottom, as
+    /// `(first line, span)`.
+    ///
+    /// One walk of the line-to-block map; the blocks partition the lines, so
+    /// this is linear in the document even though it looks nested.
+    fn block_runs(&self) -> Vec<(usize, usize)> {
+        let mut runs = Vec::new();
+        let mut line = 0;
+        while line < self.tree.line_count() {
+            let Some(block) = self.tree.block_at(line) else {
+                line += 1;
+                continue;
+            };
+            let span = self.block_span(block, line);
+            runs.push((line, span));
+            line += span;
+        }
+        runs
+    }
+
+    /// Where `anchor` lands after the **document itself** was replaced.
+    ///
+    /// [`AppState::line_of`] cannot be used here, and the difference is the
+    /// whole of DW-2.2's anchor claim. A [`NodeId`] is a position in the
+    /// re-parsed node stream, so inserting one block at the top of the file
+    /// shifts every id below it — and `first_line_of` still answers `Some`
+    /// for the shifted id, so a positional lookup does not merely lose
+    /// precision, it returns a **different block** and reports success.
+    /// Measured before this was fixed: prepending a three-line fence above a
+    /// reader parked below a 200-line fence moved them 201 lines backwards,
+    /// into the fence.
+    ///
+    /// So the block is re-found by **content and occurrence**, never by
+    /// position: collect every block that hashes like the reader's, and take
+    /// the one at the same occurrence index. "The 3rd block that paints this"
+    /// stays the 3rd such block however much unrelated text appeared above it.
+    ///
+    /// There is deliberately no `NodeId` fast path. An id that still resolves
+    /// and still hashes the same looks like proof, and is not: with two
+    /// identical blocks in a document, a shifted id can land on the *other*
+    /// copy and match. Checking cheaply-but-sometimes-wrongly first, then
+    /// carefully, is only cheaper when the cheap answer can be trusted — here
+    /// it cannot, and the careful answer needs the whole-document scan anyway
+    /// to know the occurrence index. One path, always right, is worth more
+    /// than two paths where the first is a trap.
+    ///
+    /// Returns `None` when nothing in the new document paints like the
+    /// reader's block — their own paragraph was edited or deleted — so
+    /// [`AppState::relayout`] falls back to the proportional ratio. That
+    /// fallback is now reached when it *should* be, which a positional lookup
+    /// prevented by always "succeeding".
+    fn line_of_reloaded(&self, anchor: Anchor) -> Option<usize> {
+        let (fingerprint, occurrence) = anchor.identity?;
+        let matches: Vec<(usize, usize)> = self
+            .block_runs()
+            .into_iter()
+            .filter(|&(first, span)| self.fingerprint(first, span) == fingerprint)
+            .collect();
+
+        // Clamped rather than exact: if copies above the reader were deleted,
+        // their block is still in here, just at a lower index. Landing on the
+        // last remaining copy beats refusing to anchor at all.
+        let (first, span) = *matches.get(occurrence).or_else(|| matches.last())?;
+        Some(self.place(anchor, first, span))
+    }
+
+    /// The line the reader lands on, given the block they were anchored to now
+    /// starts at `first` and occupies `span` lines. Shared by both resolution
+    /// paths so "how far into the block" is decided in exactly one place.
+    fn place(&self, anchor: Anchor, first: usize, span: usize) -> usize {
+        let offset = if span == anchor.span {
+            anchor.offset
+        } else {
+            (anchor.offset as f64 * span as f64 / anchor.span as f64).round() as usize
+        };
+        first + offset.min(span - 1)
     }
 
     /// How many consecutive lines from `first` onward belong to `block`.
@@ -443,27 +669,33 @@ impl AppState {
     /// Rescaling is not a heuristic for a uniformly-wrapped block: text that
     /// sat 2/3 of the way through 300 wrapped lines sits 2/3 of the way through
     /// the 400 the same words take at a narrower width.
+    /// Used when the document is known unchanged (a resize, a width toggle, a
+    /// theme swap): the `NodeId` is authoritative because nothing re-parsed,
+    /// and the block's painted text is *expected* to differ after a reflow, so
+    /// a content check would be wrong here rather than merely redundant. A
+    /// reload goes to [`AppState::line_of_reloaded`] instead.
     fn line_of(&self, anchor: Anchor) -> Option<usize> {
         let first = self.tree.first_line_of(anchor.block)?;
         let span = self.block_span(anchor.block, first);
-        let offset = if span == anchor.span {
-            anchor.offset
-        } else {
-            (anchor.offset as f64 * span as f64 / anchor.span as f64).round() as usize
-        };
-        Some(first + offset.min(span - 1))
+        Some(self.place(anchor, first, span))
     }
 
     /// Whether the just-installed tree is identical to the one it replaced.
     ///
     /// `layout` is pure and deterministic in `(doc, width, config, engine,
     /// sizer)` and clamps `width` into the config's range *before* laying
-    /// out, storing the clamped value on the tree. The document, config,
-    /// engine and sizer are fixed for the session, so equal clamped widths
-    /// imply identical trees — which is why comparing one `u16` is a sound
+    /// out, storing the clamped value on the tree. The config, engine and
+    /// sizer are fixed for the session, so equal clamped widths imply
+    /// identical trees — which is why comparing one `u16` is a sound
     /// stand-in for comparing the whole tree, and why a resize between two
     /// widths that both clamp to the same value (say 10 and 15 against a
     /// 24-cell floor) correctly counts as "no reflow" too.
+    ///
+    /// **The document is the one input that stopped being fixed.** Since
+    /// `--watch` (DW-2.2) it can be replaced under an unchanged width, and
+    /// this function cannot see that — which is exactly what
+    /// [`AppState::document_changed`] carries, checked by the caller *before*
+    /// this. Callers must not use this alone.
     fn no_reflow_occurred(&self, previous_width: u16) -> bool {
         self.tree.width() == previous_width
     }
@@ -1449,5 +1681,441 @@ mod tests {
         (first..state.scroll())
             .map(|i| line_text(state, i).split_whitespace().count())
             .sum()
+    }
+
+    /// Lays out `source` into `state` as a `--watch` reload would, at the same
+    /// width the tree already has.
+    fn reload(state: &mut AppState, source: &str, config: &LayoutConfig, engine: &WidthEngine) {
+        let doc = Document::parse(source);
+        let ctx = LayoutContext {
+            doc: &doc,
+            config,
+            engine,
+            sizer: &NullSizer,
+        };
+        state.reload_document(
+            &ctx,
+            FileInfo {
+                name: "test.md".to_string(),
+                byte_size: source.len() as u64,
+                line_count: source.lines().count(),
+            },
+        );
+    }
+
+    /// DW-2.2: a reload happens at an *unchanged layout width*, so the width
+    /// comparison that stands in for "nothing moved" reports nothing moved,
+    /// and the raw scroll offset is kept — which slides the reader by however
+    /// many lines an edit above them added. Here a paragraph above the reader
+    /// grows from one line to many; the block count is unchanged, so the
+    /// anchor still names their block, and they must stay on it.
+    ///
+    /// This is the assertion the `document_changed` flag exists for: without
+    /// it the offset is carried verbatim and the top line becomes a different
+    /// paragraph.
+    #[test]
+    fn test_dw_2_2_a_reload_that_grows_a_block_above_the_reader_keeps_their_block() {
+        let (_doc, config, engine, mut state) = build(&non_reflowing_source(40), 40, 10);
+        for _ in 0..12 {
+            state.handle_key_event(plain(KeyCode::Down));
+        }
+        let anchored = topmost_line_text(&state);
+        assert_eq!(anchored, "line 6", "test setup: the reader is on line 6");
+        let scroll_before = state.scroll();
+
+        // The *first* paragraph rewraps from one line to many. Same 40
+        // blocks, so every block below it keeps its identity.
+        let grown = non_reflowing_source(40).replacen("line 0\n", &"word ".repeat(60), 1);
+        reload(&mut state, &grown, &config, &engine);
+
+        assert_eq!(
+            topmost_line_text(&state),
+            anchored,
+            "the reader must still be looking at the same block after the reload"
+        );
+        assert!(
+            state.scroll() > scroll_before,
+            "their block moved down the document, so the offset must have grown: \
+             {} vs {scroll_before}",
+            state.scroll()
+        );
+    }
+
+    /// A reload that only appends *below* the reader must not move them at
+    /// all — the anchor resolves to the same line it already occupied.
+    #[test]
+    fn test_dw_2_2_a_reload_that_appends_below_the_reader_leaves_the_scroll_alone() {
+        let (_doc, config, engine, mut state) = build(&non_reflowing_source(40), 40, 10);
+        for _ in 0..12 {
+            state.handle_key_event(plain(KeyCode::Down));
+        }
+        let anchored = topmost_line_text(&state);
+        let scroll_before = state.scroll();
+
+        let grown = format!("{}tail x\n\ntail y\n\n", non_reflowing_source(40));
+        reload(&mut state, &grown, &config, &engine);
+
+        assert_eq!(state.scroll(), scroll_before);
+        assert_eq!(topmost_line_text(&state), anchored);
+    }
+
+    /// A reload that shrinks the document out from under a reader scrolled
+    /// past its new end must clamp, not panic and not leave a scroll offset
+    /// the painter would read past the tail.
+    #[test]
+    fn test_dw_2_2_a_reload_past_the_new_end_clamps_instead_of_dangling() {
+        let (_doc, config, engine, mut state) = build(&non_reflowing_source(200), 40, 10);
+        state.handle_key_event(plain(KeyCode::Char('G')));
+        assert!(state.scroll() > 20, "test setup: the reader is deep in");
+
+        reload(&mut state, &non_reflowing_source(3), &config, &engine);
+
+        assert!(
+            state.scroll() <= state.max_scroll(),
+            "scroll {} must be clamped to max_scroll {}",
+            state.scroll(),
+            state.max_scroll()
+        );
+    }
+
+    /// The empty-file edge: an editor that truncates before writing leaves a
+    /// zero-byte document for one poll. It must lay out, clamp to 0, and
+    /// still report a status line rather than panicking on an absent anchor.
+    #[test]
+    fn test_dw_2_4_a_reload_to_an_empty_document_survives_and_clamps_to_the_top() {
+        let (_doc, config, engine, mut state) = build(&non_reflowing_source(40), 40, 10);
+        state.handle_key_event(plain(KeyCode::Char('G')));
+
+        reload(&mut state, "", &config, &engine);
+
+        assert_eq!(state.scroll(), 0);
+        assert_eq!(state.max_scroll(), 0);
+        let _ = state.status();
+    }
+
+    /// A reload refreshes what `Ctrl-G` reports: the file grew, and the
+    /// status message must say so rather than quoting the size it had at
+    /// startup.
+    #[test]
+    fn test_dw_2_2_a_reload_refreshes_the_file_info_ctrl_g_reports() {
+        let (_doc, config, engine, mut state) = build(&non_reflowing_source(4), 40, 10);
+        let grown = non_reflowing_source(40);
+        reload(&mut state, &grown, &config, &engine);
+
+        state.handle_key_event(ctrl('g'));
+        let status = state.status();
+        let message = status.message.expect("Ctrl-G sets a message");
+        assert!(
+            message.contains(&format!("{} bytes", grown.len())),
+            "status must quote the reloaded size, got {message:?}"
+        );
+    }
+
+    /// The reload flag is one-shot: a width toggle immediately after a reload
+    /// must go back to the cheap same-width path, not re-anchor forever.
+    #[test]
+    fn test_a_reload_does_not_leave_later_relayouts_permanently_re_anchoring() {
+        let (_doc, config, engine, mut state) = build(&non_reflowing_source(40), 40, 10);
+        for _ in 0..12 {
+            state.handle_key_event(plain(KeyCode::Down));
+        }
+        reload(&mut state, &non_reflowing_source(40), &config, &engine);
+        let scroll_after_reload = state.scroll();
+
+        // A relayout at the same width, with the document unchanged: the
+        // scroll offset must be carried verbatim.
+        let doc = Document::parse(&non_reflowing_source(40));
+        let ctx = LayoutContext {
+            doc: &doc,
+            config: &config,
+            engine: &engine,
+            sizer: &NullSizer,
+        };
+        state.relayout_preserving_anchor(&ctx, config);
+        assert_eq!(state.scroll(), scroll_after_reload);
+    }
+
+    /// The reviewer's reproduction, generalised: an author inserts a block
+    /// *above* what the reader is looking at — the ordinary `--watch` edit —
+    /// and the reader must still be looking at the same content afterwards.
+    ///
+    /// This is the case a positional `NodeId` anchor got wrong while
+    /// *reporting success*: prepending shifts every id, `first_line_of` still
+    /// answers `Some` for the shifted id, and the reader was silently moved
+    /// into a different block. Measured before the fix, on the fence fixture
+    /// below: 201 lines backwards, top line `"code 0"` instead of
+    /// `"AFTER-THE-FENCE"`.
+    ///
+    /// Asserted on the painted text of the reader's row, not on a line number
+    /// or a distance — a nearby line in the wrong block is exactly the failure
+    /// being ruled out.
+    #[test]
+    fn test_dw_2_2_a_block_inserted_above_the_reader_still_leaves_them_on_their_own_block() {
+        // Every shape the review measured drift for, plus a heading.
+        let insertions = [
+            ("one paragraph", "inserted paragraph\n\n".to_string()),
+            ("one heading", "# Inserted Heading\n\n".to_string()),
+            ("a bullet list", "- alpha\n- beta\n- gamma\n\n".to_string()),
+            (
+                "a small code fence",
+                format!("```\n{}```\n\n", "code 0\ncode 1\ncode 2\n"),
+            ),
+            (
+                "two hundred lines of fence",
+                format!(
+                    "```\n{}```\n\n",
+                    (0..200).map(|i| format!("deep {i}\n")).collect::<String>()
+                ),
+            ),
+        ];
+
+        for (label, inserted) in insertions {
+            // A long fence above the reader is what made the drift large: the
+            // shifted id resolved to a 200-line block, so `place` put the
+            // reader at its first line.
+            let fence: String = (0..200).map(|i| format!("fence {i}\n")).collect();
+            let body = format!(
+                "intro paragraph\n\n```\n{fence}```\n\nAFTER-THE-FENCE\n\n{}",
+                non_reflowing_source(60)
+            );
+
+            let (_doc, config, engine, mut state) = build(&body, 40, 10);
+            // Park the reader exactly on the paragraph after the fence.
+            let target = (0..state.tree().line_count())
+                .find(|&line| {
+                    let scroll = line;
+                    state
+                        .tree()
+                        .lines(scroll..scroll + 1)
+                        .any(|l| matches!(l, layout::Line::Items(items) if items.iter().any(|i| matches!(i, layout::LineItem::Run(r) if r.text.contains("AFTER-THE-FENCE")))))
+                })
+                .expect("fixture must contain the marker paragraph");
+            for _ in 0..target {
+                state.handle_key_event(plain(KeyCode::Down));
+            }
+            assert_eq!(
+                topmost_line_text(&state).trim(),
+                "AFTER-THE-FENCE",
+                "{label}: test setup — the reader must start on the marker"
+            );
+
+            reload(&mut state, &format!("{inserted}{body}"), &config, &engine);
+
+            assert_eq!(
+                topmost_line_text(&state).trim(),
+                "AFTER-THE-FENCE",
+                "{label}: inserting above the reader must not move them off their block"
+            );
+        }
+    }
+
+    /// The mirror case the review also measured: a block *deleted* above the
+    /// reader shifts ids the other way.
+    #[test]
+    fn test_dw_2_2_a_block_deleted_above_the_reader_still_leaves_them_on_their_own_block() {
+        let body = format!(
+            "first paragraph\n\nsecond paragraph\n\nMARKER-PARAGRAPH\n\n{}",
+            non_reflowing_source(40)
+        );
+        let (_doc, config, engine, mut state) = build(&body, 40, 10);
+        for _ in 0..4 {
+            state.handle_key_event(plain(KeyCode::Down));
+        }
+        assert_eq!(topmost_line_text(&state).trim(), "MARKER-PARAGRAPH");
+
+        let shrunk = body.replacen("first paragraph\n\n", "", 1);
+        reload(&mut state, &shrunk, &config, &engine);
+
+        assert_eq!(
+            topmost_line_text(&state).trim(),
+            "MARKER-PARAGRAPH",
+            "deleting a block above the reader must not move them off their block"
+        );
+    }
+
+    /// Duplicated text is ordinary in a document (a repeated `---`, an
+    /// identical list item, a boilerplate line under every heading). The
+    /// anchor must resolve to the copy the reader was actually on.
+    ///
+    /// The earlier version of this test used copies 21 blocks apart and
+    /// prepended a single block, so the old nearest-ordinal tiebreak won by a
+    /// margin of 20 and the test passed while the rule was wrong. It is
+    /// replaced — not merely renamed — by a sweep whose spacing and insertion
+    /// size actually cross the failure threshold: the ordinal rule breaks once
+    /// the insertion exceeds half the spacing between copies, so `gap = 1`
+    /// with 3 or 10 blocks prepended is squarely inside the broken region.
+    /// Measured on the old rule, 10 of these 15 combinations moved the reader
+    /// to a different copy, drifting up to 24 lines.
+    #[test]
+    fn test_dw_2_2_duplicated_content_re_anchors_to_the_copy_the_reader_was_on() {
+        const DUPLICATE: &str = "the same boilerplate line";
+
+        for gap in [1usize, 3, 10] {
+            for inserted in [1usize, 3, 10] {
+                // `gap` unique paragraphs, then an identical block, repeated.
+                // The unique markers are what make "which copy" observable.
+                let body: String = (0..20)
+                    .flat_map(|group| {
+                        (0..gap)
+                            .map(move |i| format!("unique-{:03}\n\n", group * gap + i))
+                            .chain(std::iter::once(format!("{DUPLICATE}\n\n")))
+                    })
+                    .collect();
+
+                let (_doc, config, engine, mut state) = build(&body, 40, 10);
+
+                // Park the reader on the 13th copy of the duplicated block.
+                let copy_line = duplicate_lines(&state, DUPLICATE)[12];
+                for _ in 0..copy_line {
+                    state.handle_key_event(plain(KeyCode::Down));
+                }
+                assert_eq!(
+                    topmost_line_text(&state).trim(),
+                    DUPLICATE,
+                    "gap={gap}: test setup — the reader must start on a duplicate"
+                );
+                // The unique marker just above the reader is the oracle: it
+                // names *which* copy they are on, which the duplicated text
+                // itself cannot.
+                let marker_before = marker_above(&state);
+
+                let grown = format!(
+                    "{}{body}",
+                    (0..inserted)
+                        .map(|i| format!("prepended-{i}\n\n"))
+                        .collect::<String>()
+                );
+                reload(&mut state, &grown, &config, &engine);
+
+                assert_eq!(
+                    topmost_line_text(&state).trim(),
+                    DUPLICATE,
+                    "gap={gap}, inserted={inserted}: reader must still be on a duplicate"
+                );
+                assert_eq!(
+                    marker_above(&state),
+                    marker_before,
+                    "gap={gap}, inserted={inserted}: the reader must be on the SAME copy — \
+                     the marker above them names which one"
+                );
+            }
+        }
+    }
+
+    /// The line index of every line whose painted text is exactly `text`.
+    fn duplicate_lines(state: &AppState, text: &str) -> Vec<usize> {
+        (0..state.tree().line_count())
+            .filter(|&line| line_text(state, line).trim() == text)
+            .collect()
+    }
+
+    /// The nearest `unique-NNN` marker at or above the viewport top — the
+    /// identity of the duplicated block the reader is sitting on.
+    fn marker_above(state: &AppState) -> String {
+        (0..=state.scroll())
+            .rev()
+            .map(|line| line_text(state, line))
+            .find(|text| text.trim().starts_with("unique-"))
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    }
+
+    /// When the reader's own block is what changed, there is no block to
+    /// return to — the anchor must *fail* and let the proportional fallback
+    /// run, rather than confidently resolving to a neighbour.
+    #[test]
+    fn test_a_reload_that_rewrites_the_readers_own_block_falls_back_proportionally() {
+        let body = format!("head\n\nEDIT-ME\n\n{}", non_reflowing_source(60));
+        let (_doc, config, engine, mut state) = build(&body, 40, 10);
+        // `head` on line 0, a blank separator on line 1, the marker on line 2.
+        for _ in 0..2 {
+            state.handle_key_event(plain(KeyCode::Down));
+        }
+        assert_eq!(topmost_line_text(&state).trim(), "EDIT-ME");
+        let scroll_before = state.scroll();
+
+        reload(
+            &mut state,
+            &body.replace("EDIT-ME", "COMPLETELY DIFFERENT TEXT"),
+            &config,
+            &engine,
+        );
+
+        // No panic, a valid position, and near where they were — the ratio
+        // fallback's job. The point is that it *ran*.
+        assert!(state.scroll() <= state.max_scroll());
+        assert!(
+            state.scroll().abs_diff(scroll_before) <= state.size().height as usize,
+            "the fallback should keep the reader within a viewport of where they \
+             were, got {} vs {scroll_before}",
+            state.scroll()
+        );
+    }
+
+    /// A message on the status row describes the document that produced it,
+    /// so replacing the document must take it down — otherwise the reader is
+    /// told something about a file that is no longer open.
+    ///
+    /// Both producers are covered here because the rule is about the
+    /// mechanism, not about one message: `Ctrl-G`'s counts and a reload
+    /// failure's reason are equally invalidated by a reload, and a third
+    /// producer added later gets the same treatment for free.
+    #[test]
+    fn test_dw_2_4_a_reload_takes_down_a_status_message_about_the_old_document() {
+        let (_doc, config, engine, mut state) = build(&non_reflowing_source(40), 40, 10);
+
+        // The reload-failure shape: an external message set by the event loop.
+        state.set_status(StatusMessage::new("reload failed: could not read file"));
+        assert!(
+            state.status().message.is_some(),
+            "test setup: the message must be showing before the reload"
+        );
+
+        reload(&mut state, &non_reflowing_source(41), &config, &engine);
+
+        assert_eq!(
+            state.status().message,
+            None,
+            "a message about the previous document must not outlive it"
+        );
+
+        // The Ctrl-G shape: a message this type sets about its own file_info.
+        state.handle_key_event(ctrl('g'));
+        assert!(
+            state.status().message.is_some(),
+            "test setup: Ctrl-G sets one"
+        );
+
+        reload(&mut state, &non_reflowing_source(42), &config, &engine);
+
+        assert_eq!(
+            state.status().message,
+            None,
+            "Ctrl-G's byte and line counts describe the file that was open when it \
+             was pressed, so a reload must take them down too"
+        );
+    }
+
+    /// The clearing must be surgical: a reload takes down the *message*, not
+    /// the status row. The permanent ruler has to come straight back.
+    #[test]
+    fn test_a_reload_leaves_the_permanent_ruler_intact() {
+        let (_doc, config, engine, mut state) = build(&non_reflowing_source(40), 40, 10);
+        state.set_status(StatusMessage::new("reload failed: something"));
+
+        reload(&mut state, &non_reflowing_source(80), &config, &engine);
+
+        let status = state.status();
+        assert_eq!(status.message, None);
+        assert_eq!(
+            status.name, "test.md",
+            "the ruler still names the document after a reload"
+        );
+        assert!(
+            !status.render().contains("reload failed"),
+            "the painted row must be the ruler, got {:?}",
+            status.render()
+        );
     }
 }

@@ -125,3 +125,76 @@ fn test_the_escape_hatch_governs_the_signals_module_and_nothing_wider() {
          happens to follow it"
     );
 }
+
+/// The load path's `Document::parse` count is the DW-2.5 oracle, and it is
+/// only an oracle while every parse on that path goes through
+/// `loader::counted_parse`. A direct `Document::parse` would be invisible to
+/// the counter — the parse-once test would then read 1 while the binary
+/// parsed twice, which is precisely the regression it exists to catch.
+///
+/// Scoped to the four files the pipeline runs through, and to the code above
+/// their `#[cfg(test)]` marker: their own unit tests parse documents freely,
+/// and should.
+#[test]
+fn test_dw_2_5_the_load_path_never_calls_document_parse_directly() {
+    let load_path = [
+        "loader.rs",
+        "main.rs",
+        "decor/mermaid.rs",
+        "decor/frontmatter.rs",
+    ];
+    let mut offenders = Vec::new();
+
+    for name in load_path {
+        let path = src_dir().join(name);
+        let text =
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{name} readable: {e}"));
+        let production = text
+            .split_once("#[cfg(test)]")
+            .map_or(text.as_str(), |(before, _)| before);
+        // The enclosing top-level item, so the one legitimate call — the one
+        // inside `counted_parse` itself — can be told from a bypass.
+        let mut enclosing = "";
+        for (i, line) in production.lines().enumerate() {
+            if let Some(rest) = line.split_once("fn ").map(|(head, rest)| {
+                if head.is_empty() || head.trim_start() == head {
+                    rest
+                } else {
+                    ""
+                }
+            }) && !rest.is_empty()
+            {
+                enclosing = rest.split(['(', '<']).next().unwrap_or("");
+            }
+            // Prose about the parse is fine — several of these files explain
+            // where it happens. Only a call site is a bypass.
+            if line.contains("Document::parse")
+                && !line.trim_start().starts_with("//")
+                && enclosing != "counted_parse"
+            {
+                offenders.push(format!("{name}:{}: {}", i + 1, line.trim()));
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "the load path must parse only through `loader::counted_parse`, or \
+         `loader::parse_count` stops being the whole truth and DW-2.5's test \
+         passes while parsing twice. Found: {offenders:#?}"
+    );
+
+    // The guard is only meaningful if the counter it protects is actually in
+    // use: assert the indirection exists rather than trusting the absence.
+    let loader = std::fs::read_to_string(src_dir().join("loader.rs")).expect("loader.rs readable");
+    assert!(
+        loader.contains("fn counted_parse"),
+        "loader must define the single counted parse entry point"
+    );
+    let mermaid =
+        std::fs::read_to_string(src_dir().join("decor/mermaid.rs")).expect("mermaid.rs readable");
+    assert!(
+        mermaid.contains("counted_parse"),
+        "the mermaid preprocessor parses, so it must parse through the counter"
+    );
+}

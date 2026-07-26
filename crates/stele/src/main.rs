@@ -3,22 +3,24 @@
 //! library (`app`, `painter`, `loader`, `terminal`, `media`, `decor`); this
 //! file is thin glue over real crossterm I/O and is not itself unit-tested —
 //! it is covered black-box, through the real binary, by
-//! `tests/cli_errors.rs`, `tests/quit_restore.rs` and `tests/signal_restore.rs`.
+//! `tests/cli_errors.rs`, `tests/document_source.rs`, `tests/quit_restore.rs`
+//! and `tests/signal_restore.rs`.
 
 use std::io::{self, Write};
 use std::process::ExitCode;
-use std::time::Duration;
+use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use ast::Document;
 use clap::Parser;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use layout::{LayoutConfig, layout};
+use layout::{IntrinsicSizer, LayoutConfig, layout};
 use width::{WidthConfig, WidthEngine};
 
-use stele::app::{AppState, FileInfo, LayoutContext};
+use stele::app::{AppState, LayoutContext, StatusMessage};
 use stele::cli::Cli;
 use stele::decor::themed::ThemedDecor;
-use stele::loader;
+use stele::loader::{DocumentSource, LoadOptions};
 use stele::media::{GfxMediaSink, ImageSizer, NoopMediaSink};
 use stele::painter::{Painter, Size};
 use stele::terminal::{CellQuery, PanicGuardedWriter, TerminalGuard, install_panic_hook};
@@ -29,43 +31,74 @@ use stele::terminal::{CellQuery, PanicGuardedWriter, TerminalGuard, install_pani
 /// promptly.
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(50);
 
+/// The longest one resize burst may go on coalescing before it must commit to
+/// a relayout and repaint, however many events are still arriving.
+///
+/// [`RESIZE_DEBOUNCE`] alone is a *quiet* period, re-armed by every arriving
+/// event, so it terminates only when the resizes stop. A drag that emits them
+/// faster than 50 ms — a live window drag at 60 Hz emits one every ~16 ms —
+/// holds the debounce loop open for as long as the drag lasts. Measured: at a
+/// 10 ms and a 40 ms resize interval the viewer painted **zero bytes** over
+/// six seconds; at 70 ms (past the debounce) it painted normally. The
+/// threshold was exactly the debounce.
+///
+/// So the burst gets a wall-clock ceiling as well as a quiet period. 200 ms
+/// puts a sustained drag at ~5 repaints per second instead of none, while
+/// still folding ~12 events of a 60 Hz drag into each relayout — the
+/// coalescing this loop exists for is preserved, it is simply no longer
+/// unbounded. Under `--watch` the ceiling is additionally clamped to the next
+/// tick, so a resize storm cannot defer a reload either (DW-2.2).
+const RESIZE_BURST_MAX: Duration = Duration::from_millis(200);
+
+/// How often `--watch` checks the file's mtime, and therefore the worst-case
+/// delay between an external write and the repaint (DW-2.2).
+///
+/// A period on the monotonic clock, not a `poll` timeout. It bounds the event
+/// loop's wait ([`Session::until_next_tick`]) *and* is the schedule the reload
+/// check runs on ([`Session::watch_tick_due`]) — because a timeout alone only
+/// fires when nothing else is happening, which made the bound evaporate the
+/// moment the reader held a key.
+///
+/// Deliberately polled rather than watched by the filesystem: one `stat` four
+/// times a second costs nothing, needs no dependency, no second thread, and no
+/// inotify/kqueue fallback matrix.
+const WATCH_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    // Load and validate the file *before* touching the terminal at all: a
-    // bad path should fail cleanly without ever entering raw mode / the
-    // alternate screen.
-    let source = match loader::load_document(&cli.file) {
+    // Resolved before anything is read: `--watch -` is a contradiction
+    // (DW-2.3) and must not cost the user a terminal switch to find out.
+    let source = match cli.source() {
         Ok(source) => source,
         Err(err) => {
             eprintln!("stele: {err}");
             return ExitCode::FAILURE;
         }
     };
-
-    // Captured from the raw file, before preprocessing touches it (DW-1.3):
-    // `Ctrl-G`'s byte size and line count describe the file on disk, not the
-    // frontmatter-stripped / mermaid-rendered text the layout engine sees.
-    let file_info = FileInfo {
-        name: cli.file.display().to_string(),
-        byte_size: source.len() as u64,
-        line_count: source.lines().count(),
+    let options = LoadOptions {
+        show_frontmatter: cli.frontmatter,
     };
 
-    // Source preprocessing before parse: hide a leading frontmatter block
-    // unless --frontmatter, then render top-level mermaid fences to grids.
-    let source = stele::decor::frontmatter::apply(&source, cli.frontmatter).into_owned();
-    let source = stele::decor::mermaid::preprocess(&source).into_owned();
+    // Load and validate *before* touching the terminal at all: a bad path
+    // should fail cleanly without ever entering raw mode / the alternate
+    // screen. Stamped before the read, not after, so a write that lands while
+    // we are reading is still seen as newer than this load.
+    let loaded_at = Instant::now();
+    let loaded = match source.load_with(options) {
+        Ok(loaded) => loaded,
+        Err(err) => {
+            eprintln!("stele: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let doc = Rc::clone(&loaded.doc);
+    let file_info = loaded.info;
 
-    let doc = Document::parse(&source);
     let engine = WidthEngine::new(WidthConfig::default());
 
     // Relative image paths resolve against the document's own directory.
-    let base_dir = cli
-        .file
-        .parent()
-        .map(std::path::Path::to_path_buf)
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let base_dir = source.base_dir();
 
     // Graphics are off under tmux (which does not pass kitty sequences
     // through), when the user asks, and on any terminal that isn't Ghostty —
@@ -124,29 +157,39 @@ fn main() -> ExitCode {
     // to rasterize into — resolution only.
     let geometry = guard.cell_geometry();
 
-    let sizer: Box<dyn layout::IntrinsicSizer> = if graphics_disabled {
+    let sizer: Box<dyn IntrinsicSizer> = if graphics_disabled {
         Box::new(ImageSizer::disabled(&base_dir))
     } else {
         Box::new(ImageSizer::new(&base_dir).with_cell_px(geometry.cell_px))
     };
 
-    let ctx = LayoutContext {
-        doc: &doc,
-        config: &config,
-        engine: &engine,
-        sizer: sizer.as_ref(),
+    let mut session = Session {
+        source,
+        options,
+        watch: cli.watch,
+        doc,
+        loaded_at,
+        config,
+        engine,
+        sizer,
+        last_failure: None,
+        last_tick: Instant::now(),
     };
-    let tree = layout(ctx.doc, size.width, ctx.config, ctx.engine, ctx.sizer);
+    let tree = {
+        let ctx = session.ctx();
+        layout(ctx.doc, size.width, ctx.config, ctx.engine, ctx.sizer)
+    };
     let mut state = AppState::new(tree, size, file_info);
 
     let mut painter = Painter::new(WidthEngine::new(WidthConfig::default()));
     if graphics_disabled {
         painter.register_media(Box::new(NoopMediaSink));
     } else {
-        // The sink keeps its own copy of the document: it resolves image
-        // paths and math sources by `NodeId` at paint time.
+        // The sink *shares* the document rather than copying it (DW-2.6): it
+        // resolves image paths and math sources by `NodeId` at paint time,
+        // which is read-only work.
         painter.register_media(Box::new(
-            GfxMediaSink::new(doc.clone(), &base_dir).with_cell_px(geometry.cell_px),
+            GfxMediaSink::new(Rc::clone(&session.doc), &base_dir).with_cell_px(geometry.cell_px),
         ));
     }
     // The themed decor provides real syntax highlighting and theme colors.
@@ -181,7 +224,13 @@ fn main() -> ExitCode {
         None => Box::new(buffered),
     };
 
-    let result = run_session(&ctx, &mut state, &mut painter, &mut theme, out.as_mut());
+    let result = run_session(
+        &mut session,
+        &mut state,
+        &mut painter,
+        &mut theme,
+        out.as_mut(),
+    );
 
     // Leave the alternate screen (drop restores the terminal) BEFORE printing
     // any error — an `eprintln!` while the alt screen is active is wiped out
@@ -205,11 +254,146 @@ struct ThemeState {
     color_mode: highlight::ColorMode,
 }
 
+/// Everything a relayout needs that outlives one document, plus what
+/// `--watch` needs to decide it is time for a new one.
+///
+/// This exists because [`LayoutContext`] borrows the document, and since
+/// `--watch` the document is no longer fixed for the session: a `LayoutContext`
+/// built once in `main` would pin the *first* `Rc` for the whole run. The
+/// owned parts live here and a fresh context is minted per relayout
+/// ([`Session::ctx`]) — four reference copies, so the borrow lasts exactly as
+/// long as the call that needs it.
+struct Session {
+    source: DocumentSource,
+    options: LoadOptions,
+    watch: bool,
+    doc: Rc<Document>,
+    /// When [`Session::doc`] was read, for [`DocumentSource::changed_since`].
+    /// Only advanced by a *successful* load: leaving it behind after a failure
+    /// is what lets a file that comes back with an unchanged mtime still be
+    /// noticed.
+    loaded_at: Instant,
+    config: LayoutConfig,
+    engine: WidthEngine,
+    sizer: Box<dyn IntrinsicSizer>,
+    /// The last reload failure already shown on the status row, so a file that
+    /// stays missing is reported once instead of repainting the same sentence
+    /// four times a second.
+    last_failure: Option<String>,
+    /// When the watch tick last ran, on the monotonic clock. This is what
+    /// makes DW-2.2's bound a bound — see [`Session::watch_tick_due`].
+    last_tick: Instant,
+}
+
+impl Session {
+    fn ctx(&self) -> LayoutContext<'_> {
+        LayoutContext {
+            doc: &self.doc,
+            config: &self.config,
+            engine: &self.engine,
+            sizer: self.sizer.as_ref(),
+        }
+    }
+
+    /// How long the event loop may block before the next watch tick is owed.
+    ///
+    /// Not a constant `WATCH_POLL_INTERVAL`: the wait has to *shrink* as the
+    /// interval is used up, or a stream of events would reset the clock on
+    /// every iteration and the tick would never come due.
+    fn until_next_tick(&self) -> Duration {
+        WATCH_POLL_INTERVAL.saturating_sub(self.last_tick.elapsed())
+    }
+
+    /// How long the resize debounce may wait for its next event, given it
+    /// started collecting with a deadline of `collect_until`.
+    ///
+    /// Three bounds, whichever is soonest: the debounce quantum itself, the
+    /// burst ceiling ([`RESIZE_BURST_MAX`]), and — under `--watch` — the
+    /// moment the next tick is owed. The third is what makes DW-2.2's latency
+    /// bound survive a resize storm. Bounding the *outer* loop's wait was not
+    /// enough: the debounce loop re-armed a fixed 50 ms on every arriving
+    /// event and sat entirely outside [`Session::until_next_tick`]'s reach, so
+    /// a resize stream faster than 50 ms held it open and the tick below was
+    /// never reached. Measured before this: no reload at all at a 10 ms or
+    /// 40 ms resize interval, against 0.29 s on an idle viewer.
+    ///
+    /// Returns zero when a deadline has passed, which the caller reads as
+    /// "stop collecting" rather than as "poll with no timeout".
+    fn debounce_wait(&self, collect_until: Instant) -> Duration {
+        let mut wait = RESIZE_DEBOUNCE.min(collect_until.saturating_duration_since(Instant::now()));
+        if self.watch {
+            wait = wait.min(self.until_next_tick());
+        }
+        wait
+    }
+
+    /// Whether a watch tick is owed now, resetting the clock when it is.
+    ///
+    /// Checked on a **wall clock**, not on "did `event::poll` time out". The
+    /// difference is the whole of DW-2.2's latency bound. Hanging the reload
+    /// check off the timeout branch means any pending event skips it, and an
+    /// autorepeating key produces a pending event on every iteration — so a
+    /// held `j` starved the reload indefinitely. Measured before this was
+    /// fixed: at ~14 keys/s (macOS default autorepeat) an external write went
+    /// unnoticed for 8 s and counting, while the same edit on an idle viewer
+    /// landed in well under a second. A reader holding a scroll key is the
+    /// most ordinary thing there is, so the bound has to hold under input,
+    /// not merely in its absence.
+    fn watch_tick_due(&mut self) -> bool {
+        if !self.watch || self.last_tick.elapsed() < WATCH_POLL_INTERVAL {
+            return false;
+        }
+        self.last_tick = Instant::now();
+        true
+    }
+
+    /// One `--watch` tick: reload if the file moved, and report whether the
+    /// caller must repaint.
+    ///
+    /// Both outcomes are frame-safe. A successful reload parses and lays out
+    /// **fully** before `state` is touched, so the swap is a single
+    /// assignment between frames rather than a half-updated tree the painter
+    /// could catch mid-flight. A failed one changes no tree at all: the last
+    /// good render stays on screen and the reader is told why on the status
+    /// row (DW-2.4), which is the right trade for a viewer — a missing file
+    /// should not cost someone their scroll position.
+    fn poll_reload(
+        &mut self,
+        state: &mut AppState,
+        painter: &mut Painter,
+        out: &mut dyn Write,
+    ) -> bool {
+        if !self.source.changed_since(self.loaded_at) {
+            return false;
+        }
+        let attempted_at = Instant::now();
+        match self.source.load_with(self.options) {
+            Ok(loaded) => {
+                self.doc = Rc::clone(&loaded.doc);
+                self.loaded_at = attempted_at;
+                self.last_failure = None;
+                painter.reload_media(loaded.doc, out);
+                state.reload_document(&self.ctx(), loaded.info);
+                true
+            }
+            Err(err) => {
+                let message = format!("reload failed: {err}");
+                if self.last_failure.as_deref() == Some(message.as_str()) {
+                    return false;
+                }
+                state.set_status(StatusMessage::new(message.clone()));
+                self.last_failure = Some(message);
+                true
+            }
+        }
+    }
+}
+
 /// The interactive session: initial paint, then the scroll/resize/paint event
 /// loop. Returns `Ok(())` on a clean quit and any terminal I/O error to the
 /// caller, which restores the terminal before surfacing it.
 fn run_session(
-    ctx: &LayoutContext,
+    session: &mut Session,
     state: &mut AppState,
     painter: &mut Painter,
     theme: &mut ThemeState,
@@ -219,52 +403,102 @@ fn run_session(
     painter.frame_with_status(state.tree(), state.scroll(), state.size(), &status, out)?;
 
     loop {
-        match event::read()? {
-            Event::Key(key) if key.kind == KeyEventKind::Press => {
-                if !handle_chrome_key(key, ctx, state, painter, theme)
-                    && state.handle_key_event(key)
-                {
-                    break;
+        let mut repaint = false;
+
+        // Without `--watch` this is the blocking `event::read` it always was.
+        // With it, the wait is capped at whatever is left of the current tick,
+        // so the loop reaches the reload check on schedule whether or not any
+        // events showed up in the meantime.
+        let event_ready = if session.watch {
+            event::poll(session.until_next_tick())?
+        } else {
+            true
+        };
+
+        if event_ready {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    if !handle_chrome_key(key, session, state, painter, theme)
+                        && state.handle_key_event(key)
+                    {
+                        break;
+                    }
+                    repaint = true;
                 }
-            }
-            Event::Resize(width, height) => {
-                // Same reservation as the initial `Size` in `main` — see its
-                // comment. `height` here is the raw terminal row count
-                // crossterm reports on a resize.
-                let mut sizes = vec![Size {
-                    width,
-                    height: height.saturating_sub(1),
-                }];
-                let mut quit = false;
-                while event::poll(RESIZE_DEBOUNCE).unwrap_or(false) {
-                    match event::read() {
-                        Ok(Event::Resize(w, h)) => sizes.push(Size {
-                            width: w,
-                            height: h.saturating_sub(1),
-                        }),
-                        // A keypress mid-storm (notably `q` or Ctrl-C) must
-                        // not be swallowed by the debounce drain — honor a
-                        // quit, otherwise fall through and repaint.
-                        Ok(Event::Key(key))
-                            if key.kind == KeyEventKind::Press && state.handle_key_event(key) =>
-                        {
-                            quit = true;
+                Event::Resize(width, height) => {
+                    // Same reservation as the initial `Size` in `main` — see
+                    // its comment. `height` here is the raw terminal row count
+                    // crossterm reports on a resize.
+                    let mut sizes = vec![Size {
+                        width,
+                        height: height.saturating_sub(1),
+                    }];
+                    let mut quit = false;
+                    let collect_until = Instant::now() + RESIZE_BURST_MAX;
+                    loop {
+                        let wait = session.debounce_wait(collect_until);
+                        // A zero wait means a deadline arrived rather than the
+                        // resizes stopping — the burst cap, or the moment a
+                        // watch tick is owed. Either way, stop collecting and
+                        // let the loop body run; the next iteration picks the
+                        // stream back up where it left off.
+                        if wait.is_zero() || !event::poll(wait).unwrap_or(false) {
                             break;
                         }
-                        Ok(_) => break,
-                        Err(_) => break,
+                        match event::read() {
+                            Ok(Event::Resize(w, h)) => sizes.push(Size {
+                                width: w,
+                                height: h.saturating_sub(1),
+                            }),
+                            // A keypress mid-storm ends the burst either way.
+                            // What matters is that it is *acted on* first, in
+                            // the same order the main loop uses — chrome keys,
+                            // then navigation. Testing only `handle_key_event`
+                            // here meant `T` was read off the queue, offered
+                            // to a handler that does not know it, and dropped:
+                            // a theme toggle pressed while dragging a window
+                            // edge did nothing at all. (`+`/`-` were dropped
+                            // too, but they are overridden a few lines below
+                            // regardless — `apply_resize_burst` resyncs
+                            // `content_width` to the new terminal width, which
+                            // is the documented "a resize always wins over a
+                            // stale toggle" rule, not a swallowed key.)
+                            Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
+                                if !handle_chrome_key(key, session, state, painter, theme)
+                                    && state.handle_key_event(key)
+                                {
+                                    quit = true;
+                                }
+                                break;
+                            }
+                            Ok(_) => break,
+                            Err(_) => break,
+                        }
                     }
+                    state.apply_resize_burst(&session.ctx(), &sizes);
+                    if quit {
+                        break;
+                    }
+                    repaint = true;
                 }
-                state.apply_resize_burst(ctx, &sizes);
-                if quit {
-                    break;
-                }
+                // Anything else (focus, mouse, paste) changes nothing on
+                // screen, so it does not earn a frame — but it must still fall
+                // through to the watch tick below rather than `continue`, or a
+                // stream of them would starve the reload just as keys did.
+                _ => {}
             }
-            _ => continue,
         }
 
-        let status = state.status();
-        painter.frame_with_status(state.tree(), state.scroll(), state.size(), &status, out)?;
+        // Independent of what the event branch did, and of whether it ran at
+        // all: the reload is owed on a clock, not on an idle keyboard.
+        if session.watch_tick_due() {
+            repaint |= session.poll_reload(state, painter, out);
+        }
+
+        if repaint {
+            let status = state.status();
+            painter.frame_with_status(state.tree(), state.scroll(), state.size(), &status, out)?;
+        }
     }
 
     Ok(())
@@ -279,7 +513,7 @@ fn run_session(
 /// the caller must not also pass `key` to `AppState::handle_key_event`.
 fn handle_chrome_key(
     key: KeyEvent,
-    ctx: &LayoutContext,
+    session: &Session,
     state: &mut AppState,
     painter: &mut Painter,
     theme: &mut ThemeState,
@@ -287,16 +521,17 @@ fn handle_chrome_key(
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return false;
     }
+    let ctx = session.ctx();
     match key.code {
-        KeyCode::Char('+') => state.widen(ctx),
-        KeyCode::Char('-') => state.narrow(ctx),
+        KeyCode::Char('+') => state.widen(&ctx),
+        KeyCode::Char('-') => state.narrow(&ctx),
         KeyCode::Char('T') => {
             theme.variant = toggled_variant(theme.variant);
             painter.register_decor(Box::new(ThemedDecor::new(highlight::Theme::new(
                 theme.variant,
                 theme.color_mode,
             ))));
-            state.relayout_preserving_anchor(ctx, *ctx.config);
+            state.relayout_preserving_anchor(&ctx, *ctx.config);
         }
         _ => return false,
     }

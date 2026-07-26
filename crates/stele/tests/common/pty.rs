@@ -23,11 +23,11 @@
 //! the shipped unsafe surface by one line.
 #![allow(unsafe_code)]
 
-use std::ffi::CStr;
+use std::ffi::{CStr, OsStr};
 use std::io::Write as _;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// The exact bytes `terminal::RESTORE_SEQUENCE` must put on the wire:
@@ -133,13 +133,158 @@ impl Pty {
         }
     }
 
+    /// Changes the terminal's window size, which is what a window drag does.
+    ///
+    /// `TIOCSWINSZ` on the master makes the kernel deliver a real `SIGWINCH`
+    /// to the slave's foreground process group — so this drives the viewer's
+    /// resize path end to end (signal → crossterm's signal-hook source →
+    /// `Event::Resize`), rather than faking an event the viewer would never
+    /// receive that way. The size must actually *change* for the signal to be
+    /// sent, so callers alternate between two sizes.
+    pub fn resize(&self, rows: u16, cols: u16) {
+        let size = libc::winsize {
+            ws_row: rows,
+            ws_col: cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: `TIOCSWINSZ` against a descriptor we own, with a fully
+        // initialised `winsize`.
+        let rc = unsafe { libc::ioctl(self.master.as_raw_fd(), libc::TIOCSWINSZ as _, &size) };
+        assert_eq!(
+            rc,
+            0,
+            "TIOCSWINSZ failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
     /// Type at the viewer, as a user would.
     pub fn type_bytes(&self, bytes: &[u8]) {
         // SAFETY: writing a borrowed slice, bounded by its own length, to a
         // descriptor we own.
         let n = unsafe { libc::write(self.master.as_raw_fd(), bytes.as_ptr().cast(), bytes.len()) };
-        assert_eq!(n, bytes.len() as isize, "short write to the pty master");
+        assert_eq!(
+            n,
+            bytes.len() as isize,
+            "short write to the pty master: {}",
+            std::io::Error::last_os_error()
+        );
     }
+}
+
+/// Where the spawned viewer's **stdin** comes from.
+///
+/// The distinction is the whole of DW-2.1. With `Tty`, stdin is the terminal
+/// and crossterm reads keys straight off it. With `Pipe`, stdin is a pipe
+/// carrying the document (`stele -`), so crossterm has to fall back to
+/// `/dev/tty` for keys — which only resolves because the child calls `setsid`
+/// and claims the pty slave as its controlling terminal below.
+pub enum ChildStdin<'a> {
+    Tty,
+    Pipe(&'a [u8]),
+}
+
+/// Spawns the real binary on `pty` with `args`, its stdout and stderr on the
+/// pty slave and its stdin as `stdin` says.
+///
+/// Environment is fixed rather than inherited: `TERM_PROGRAM` is *removed*, so
+/// graphics stay off and the startup cell-geometry query never runs — these
+/// tests are about what reaches the wire as text.
+pub fn spawn_viewer(pty: &Pty, args: &[&OsStr], stdin: ChildStdin<'_>) -> Child {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_stele"));
+    cmd.args(args)
+        .env("TERM", "xterm-256color")
+        .env_remove("TERM_PROGRAM")
+        .env_remove("TMUX")
+        // Truecolor is the default unless `NO_COLOR` is set, and a developer
+        // who exports it would otherwise silently change what these tests see
+        // on the wire.
+        .env_remove("NO_COLOR")
+        .stdout(Stdio::from(pty.slave_dup()))
+        .stderr(Stdio::from(pty.slave_dup()));
+
+    // Which descriptor is the pty, and therefore which one `TIOCSCTTY` must be
+    // asked on: fd 0 when stdin is the terminal, fd 1 (stdout) when stdin has
+    // been taken over by the document pipe. Getting this wrong is not a subtle
+    // failure — `/dev/tty` would resolve to nothing and the viewer could never
+    // read a key.
+    let ctty_fd = match stdin {
+        ChildStdin::Tty => {
+            cmd.stdin(Stdio::from(pty.slave_dup()));
+            0
+        }
+        ChildStdin::Pipe(_) => {
+            cmd.stdin(Stdio::piped());
+            1
+        }
+    };
+    // SAFETY: `pre_exec` runs between fork and exec, so it may only call
+    // async-signal-safe functions. `setsid` and `ioctl(TIOCSCTTY)` both are;
+    // together they make the pty the child's controlling terminal, which is
+    // what lets crossterm open `/dev/tty`.
+    unsafe {
+        cmd.pre_exec(move || {
+            libc::setsid();
+            libc::ioctl(ctty_fd, libc::TIOCSCTTY as _, 0);
+            Ok(())
+        });
+    }
+
+    let mut child = cmd.spawn().expect("spawn stele");
+    if let ChildStdin::Pipe(bytes) = stdin {
+        let mut pipe = child.stdin.take().expect("piped stdin");
+        pipe.write_all(bytes).expect("write document to stdin");
+        // Dropping the writer closes the pipe: without the EOF, a viewer
+        // reading stdin to end would wait forever and the test would hang
+        // rather than fail.
+        drop(pipe);
+    }
+    child
+}
+
+/// The bytes that close a frame. Every repaint is wrapped in a mode-2026
+/// synchronized update, so this is the one reliable "one whole frame has
+/// arrived" marker on the wire.
+pub const FRAME_END: &[u8] = b"\x1b[?2026l";
+
+/// Reads exactly one frame off `master`, as a lossy string ready for
+/// [`super::render::render_row`].
+///
+/// Only meaningful directly after [`drain_to_quiet`]: with an earlier frame
+/// still buffered this returns that one instead.
+pub fn read_one_frame(master: RawFd, deadline: Duration) -> String {
+    let bytes = read_until(master, FRAME_END, deadline);
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// Reads whatever arrives on `master` for `window`, without waiting for any
+/// particular content. For a test that must keep the wire drained while it does
+/// something else — feeding keys, say — and then inspect what came back.
+pub fn drain_for(master: RawFd, window: Duration) -> Vec<u8> {
+    let deadline = Instant::now() + window;
+    let mut buf = Vec::new();
+    while Instant::now() < deadline {
+        let mut pfd = libc::pollfd {
+            fd: master,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one initialised `pollfd`, count 1, 10 ms timeout.
+        let ready = unsafe { libc::poll(&mut pfd, 1, 10) };
+        if ready <= 0 {
+            continue;
+        }
+        let mut chunk = [0u8; 8192];
+        // SAFETY: reading into a stack buffer we own, bounded by its length.
+        let n = unsafe { libc::read(master, chunk.as_mut_ptr().cast(), chunk.len()) };
+        if n > 0 {
+            buf.extend_from_slice(&chunk[..n as usize]);
+        } else {
+            break;
+        }
+    }
+    buf
 }
 
 /// Drain the master until `needle` shows up or `deadline` elapses. Returns
@@ -185,6 +330,10 @@ pub fn read_until(master: RawFd, needle: &[u8], deadline: Duration) -> Vec<u8> {
 /// deleting it from `RESTORE_SEQUENCE` left the keystroke half of this harness
 /// green. Draining first is what makes the assertion "this ending emitted the
 /// restore sequence" instead of "these bytes appear somewhere on the wire".
+pub fn drain_to_quiet(master: RawFd) {
+    drain_quiet(master);
+}
+
 fn drain_quiet(master: RawFd) {
     let deadline = Instant::now() + Duration::from_secs(2);
     let mut idle = 0;

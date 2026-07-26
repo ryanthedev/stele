@@ -18,12 +18,43 @@ use std::borrow::Cow;
 
 use ast::{BlockKind, Document};
 
+/// Parses `source` with its top-level mermaid fences rendered — the load
+/// path's text→[`Document`] step.
+///
+/// **Exactly one parse when there is no renderable mermaid fence** (DW-2.5).
+/// The old shape was [`preprocess`] followed by a second `Document::parse` in
+/// `main`, which parsed every document twice however few fences it held —
+/// and finding the fences is itself what the first parse is for, so the
+/// second one was pure waste on the overwhelmingly common no-mermaid path.
+/// A document that *does* render a fence still costs two: the spliced text is
+/// different text, and there is no way to know what it parses to without
+/// parsing it.
+pub fn parse(source: &str) -> Document {
+    let doc = crate::loader::counted_parse(source);
+    match rendered(source, &doc) {
+        None => doc,
+        Some(spliced) => crate::loader::counted_parse(&spliced),
+    }
+}
+
 /// Replaces top-level ` ```mermaid ` blocks in `source` with a rendered
 /// box-drawing grid (as a plain code fence). Returns `source` unchanged when
 /// there are no renderable mermaid blocks.
+///
+/// The text-only half of [`parse`], kept for callers that want the
+/// preprocessed *source* rather than the document it parses to.
 pub fn preprocess(source: &str) -> Cow<'_, str> {
-    let doc = Document::parse(source);
+    match rendered(source, &crate::loader::counted_parse(source)) {
+        None => Cow::Borrowed(source),
+        Some(spliced) => Cow::Owned(spliced),
+    }
+}
 
+/// The splice, given `source` and the document it already parsed to.
+///
+/// Returns `None` when nothing was replaced — which is what lets [`parse`]
+/// keep `doc` instead of parsing again.
+fn rendered(source: &str, doc: &Document) -> Option<String> {
     // Collect (span, rendered) for each top-level mermaid fence that renders.
     let mut repls: Vec<(usize, usize, String)> = Vec::new();
     for block in doc.blocks() {
@@ -47,7 +78,7 @@ pub fn preprocess(source: &str) -> Cow<'_, str> {
     }
 
     if repls.is_empty() {
-        return Cow::Borrowed(source);
+        return None;
     }
 
     // Splice from the end backwards so earlier spans keep their offsets.
@@ -56,7 +87,7 @@ pub fn preprocess(source: &str) -> Cow<'_, str> {
     for (start, end, text) in repls.into_iter().rev() {
         out.replace_range(start..end, &text);
     }
-    Cow::Owned(out)
+    Some(out)
 }
 
 /// Wraps `grid` in a plain (no-language) fenced code block so it displays
@@ -102,6 +133,9 @@ mod tests {
     fn test_non_mermaid_source_is_returned_borrowed_unchanged() {
         let src = "# Title\n\n```rust\nfn main() {}\n```\n";
         assert!(matches!(preprocess(src), Cow::Borrowed(_)));
+        // The same fact one layer down: nothing was spliced, which is what
+        // lets `parse` keep the document it already has.
+        assert!(rendered(src, &Document::parse(src)).is_none());
     }
 
     #[test]
@@ -215,6 +249,44 @@ mod tests {
             assert!(
                 literal.contains(tildes),
                 "the hostile label must survive inside the code block: {literal:?}"
+            );
+        }
+    }
+
+    /// DW-2.5, at the seam that owns the rule: the no-mermaid path must reuse
+    /// the parse it already did to *look* for fences, not throw it away and
+    /// parse the identical text again.
+    #[test]
+    fn test_dw_2_5_a_fence_free_document_is_parsed_once_and_a_rendered_one_twice() {
+        let plain = "# Title\n\n```rust\nfn main() {}\n```\n";
+        let before = crate::loader::parse_count();
+        let doc = parse(plain);
+        assert_eq!(crate::loader::parse_count() - before, 1);
+        assert_eq!(doc.blocks().len(), 2);
+
+        assert!(
+            mermaid::render("graph TD\n  A-->B\n").is_ok(),
+            "graph TD must render for the second half of this test to mean anything"
+        );
+        let with_fence = "```mermaid\ngraph TD\n  A-->B\n```\n";
+        let before = crate::loader::parse_count();
+        parse(with_fence);
+        assert_eq!(crate::loader::parse_count() - before, 2);
+    }
+
+    /// `parse` and `preprocess` must not drift: whatever text the one splices
+    /// is the text the other parses.
+    #[test]
+    fn test_parse_agrees_with_parsing_the_preprocessed_text() {
+        for src in [
+            "# Title\n\nplain\n",
+            "```mermaid\ngraph TD\n  A-->B\n```\n",
+            "```mermaid\n```\n",
+        ] {
+            assert_eq!(
+                format!("{:?}", parse(src).blocks()),
+                format!("{:?}", Document::parse(&preprocess(src)).blocks()),
+                "parse and preprocess disagree on {src:?}"
             );
         }
     }

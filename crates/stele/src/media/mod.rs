@@ -5,8 +5,9 @@
 //! and testable independently of that fact.
 
 use std::io::Write;
+use std::rc::Rc;
 
-use ast::NodeId;
+use ast::{Document, NodeId};
 use layout::Reserved;
 
 use crate::painter::CellRect;
@@ -82,6 +83,21 @@ pub trait MediaSink {
     /// Defaulted to a no-op for that reason: with no caller, requiring every
     /// implementor to write an empty body only spreads the dead weight.
     fn evict(&mut self, _node_id: NodeId, _out: &mut dyn Write) {}
+
+    /// The document was reloaded (`--watch`); every `NodeId` the sink is
+    /// holding now names a node in a document that no longer exists.
+    ///
+    /// A sink that resolves nodes against its own copy of the AST must swap
+    /// to `doc` here **and** drop whatever it cached per node — a re-parse
+    /// renumbers nodes, so a retained cache silently starts answering with
+    /// the wrong node's content. `out` is the same writer a frame is painted
+    /// through, so a sink holding terminal-side state (a kitty placement) can
+    /// take it off the screen on the way past; this is called between frames,
+    /// outside any synchronized-update block.
+    ///
+    /// Defaulted to a no-op: a sink that keeps no per-node state has nothing
+    /// to do, and [`NoopMediaSink`] should not have to say so.
+    fn reload_document(&mut self, _doc: Rc<Document>, _out: &mut dyn Write) {}
 }
 
 /// The no-media default: a true no-op on every call.

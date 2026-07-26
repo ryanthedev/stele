@@ -1,9 +1,13 @@
-//! CLI surface: `stele <file.md>` and its flags. Parsing only — every flag is
+//! CLI surface: `stele <file.md>` and its flags. Parsing and the one
+//! cross-flag rule clap cannot express ([`Cli::source`]) — every other flag is
 //! acted on by `main.rs`, which is where the flag doc comments below point.
 
-use std::path::PathBuf;
+use std::fmt;
+use std::path::{Path, PathBuf};
 
 use clap::Parser;
+
+use crate::loader::DocumentSource;
 
 /// Commit + build time this binary was produced from, stamped by `build.rs`.
 /// Shown by `--version` and painted in the viewport corner, so "the fix does
@@ -23,8 +27,17 @@ pub const BUILD_SHA: &str = env!("STELE_BUILD_SHA");
     about = "A terminal markdown viewer for Ghostty"
 )]
 pub struct Cli {
-    /// The markdown file to open.
+    /// The markdown file to open, or `-` to read the document from stdin.
+    /// With `-`, keys are read from `/dev/tty` instead (see
+    /// [`Cli::source`]).
     pub file: PathBuf,
+
+    /// Reloads the document whenever the file changes on disk, preserving
+    /// the scroll anchor. Polled on the event loop's own timeout — no
+    /// filesystem watcher, no extra thread. Meaningless with `-`, and
+    /// rejected in combination with it (DW-2.3).
+    #[arg(long)]
+    pub watch: bool,
 
     /// Clamps content width to at most this many cells (default 100; see
     /// `layout::LayoutConfig`).
@@ -44,6 +57,53 @@ pub struct Cli {
     pub frontmatter: bool,
 }
 
+/// A combination of flags that parse individually but cannot mean anything
+/// together. Separate from [`crate::loader::LoadError`] on purpose: this one
+/// is decided before a single byte is read, and before the terminal is
+/// touched at all.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CliError {
+    /// `--watch -`. Every word of the message names one half of the
+    /// conflict, so the reader is not left to infer which flag to drop.
+    WatchStdin,
+}
+
+impl fmt::Display for CliError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CliError::WatchStdin => write!(
+                f,
+                "--watch cannot be combined with `-`: stdin is a stream read \
+                 once to end, not a file whose changes can be watched"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CliError {}
+
+/// The conventional argument for "read the document from standard input".
+const STDIN_ARG: &str = "-";
+
+impl Cli {
+    /// Which [`DocumentSource`] these arguments name, or why they name none.
+    ///
+    /// This is where the `-` convention lives, and the only place: `main`
+    /// never compares the path to `"-"`, and neither does the loader. The
+    /// rejected combination is checked here rather than left to clap's
+    /// `conflicts_with` because the conflict is with a positional *value*
+    /// (`-`), not with another flag — clap has no rule for that.
+    pub fn source(&self) -> Result<DocumentSource, CliError> {
+        if self.file != Path::new(STDIN_ARG) {
+            return Ok(DocumentSource::Path(self.file.clone()));
+        }
+        if self.watch {
+            return Err(CliError::WatchStdin);
+        }
+        Ok(DocumentSource::Stdin)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -61,6 +121,55 @@ mod tests {
         assert_eq!(cli.max_width, None);
         assert!(!cli.no_images);
         assert!(!cli.frontmatter);
+        assert!(!cli.watch);
+    }
+
+    #[test]
+    fn test_dw_2_1_a_bare_dash_names_the_stdin_source() {
+        let cli = Cli::parse_from(["stele", "-"]);
+        assert_eq!(cli.source(), Ok(DocumentSource::Stdin));
+    }
+
+    #[test]
+    fn test_any_other_path_names_a_file_source_dash_or_not() {
+        // `-` is only the stdin convention when it is the *whole* argument;
+        // a file that merely starts with one is still a file.
+        assert_eq!(
+            Cli::parse_from(["stele", "notes.md"]).source(),
+            Ok(DocumentSource::Path(PathBuf::from("notes.md")))
+        );
+        assert_eq!(
+            Cli::parse_from(["stele", "--", "-notes.md"]).source(),
+            Ok(DocumentSource::Path(PathBuf::from("-notes.md")))
+        );
+    }
+
+    /// DW-2.3: the two cannot mean anything together, and the message must
+    /// name *both* halves — a reader told only "invalid arguments" has to
+    /// guess which one to drop.
+    #[test]
+    fn test_dw_2_3_watch_with_stdin_is_rejected_naming_both_flags() {
+        let cli = Cli::parse_from(["stele", "-", "--watch"]);
+        let err = cli.source().unwrap_err();
+        assert_eq!(err, CliError::WatchStdin);
+
+        let message = err.to_string();
+        assert!(message.contains("--watch"), "message was: {message}");
+        assert!(message.contains('`'), "message was: {message}");
+        assert!(message.contains("stdin"), "message was: {message}");
+    }
+
+    /// The rejection is about the *combination*: each half alone is fine.
+    #[test]
+    fn test_dw_2_3_watch_on_a_file_and_stdin_without_watch_both_resolve() {
+        assert_eq!(
+            Cli::parse_from(["stele", "notes.md", "--watch"]).source(),
+            Ok(DocumentSource::Path(PathBuf::from("notes.md")))
+        );
+        assert_eq!(
+            Cli::parse_from(["stele", "-"]).source(),
+            Ok(DocumentSource::Stdin)
+        );
     }
 
     #[test]

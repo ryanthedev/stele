@@ -86,6 +86,7 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use ast::{Document, Inline, InlineKind, NodeId, NodeRef};
 use layout::Reserved;
@@ -153,7 +154,12 @@ enum Resolved {
 }
 
 pub struct GfxMediaSink {
-    doc: Document,
+    /// Shared with the app rather than copied (DW-2.6). The sink only ever
+    /// *reads* the AST — it resolves a `NodeId` to its image path or TeX
+    /// source at paint time — so a second copy of every node bought nothing
+    /// but the allocation. `Rc`, not `Arc`: the sink is painted from the
+    /// event loop's thread and never crosses one.
+    doc: Rc<Document>,
     base_dir: PathBuf,
     emitter: gfx::Emitter,
     limits: gfx::Limits,
@@ -190,12 +196,18 @@ pub struct GfxMediaSink {
 }
 
 impl GfxMediaSink {
-    /// `doc` is the sink's own copy of the parsed document (media nodes
-    /// are resolved by `NodeId` against it); `base_dir` resolves relative
-    /// image paths (typically the markdown file's parent directory).
-    pub fn new(doc: Document, base_dir: impl Into<PathBuf>) -> Self {
+    /// `doc` is the parsed document media nodes are resolved by `NodeId`
+    /// against; `base_dir` resolves relative image paths (typically the
+    /// markdown file's parent directory).
+    ///
+    /// Takes anything that becomes an `Rc<Document>`, which is both an
+    /// `Rc<Document>` the caller already holds — the sharing path the viewer
+    /// uses (DW-2.6) — and a bare `Document`, moved into a fresh `Rc`, which
+    /// is what a test that owns its own document wants. Neither copies the
+    /// AST.
+    pub fn new(doc: impl Into<Rc<Document>>, base_dir: impl Into<PathBuf>) -> Self {
         GfxMediaSink {
-            doc,
+            doc: doc.into(),
             base_dir: base_dir.into(),
             emitter: gfx::Emitter::new(),
             limits: gfx::Limits::default(),
@@ -805,6 +817,27 @@ impl MediaSink for GfxMediaSink {
 
     fn evict(&mut self, node_id: NodeId, out: &mut dyn Write) {
         self.delete_placement(node_id, out);
+    }
+
+    /// Swaps in the reloaded document and forgets every node, screen and
+    /// raster both.
+    ///
+    /// Forgetting is not optional housekeeping — it is the whole reason this
+    /// method exists. Every key in `placements` is a `NodeId` into the
+    /// *previous* document, and a re-parse renumbers nodes: keeping the map
+    /// would leave a repaint of new node 7 reusing the image transmitted for
+    /// old node 7, which is a different picture. Dropping the sink and
+    /// registering a fresh one is not an alternative either: the old
+    /// placements are state on the **terminal**, and a sink that no longer
+    /// knows about them can never take them off the screen.
+    fn reload_document(&mut self, doc: Rc<Document>, out: &mut dyn Write) {
+        let known: Vec<NodeId> = self.placements.keys().copied().collect();
+        for node_id in known {
+            self.delete_placement(node_id, out);
+        }
+        self.row_in_frame.clear();
+        self.resolved_this_frame.clear();
+        self.doc = doc;
     }
 }
 
@@ -2665,5 +2698,139 @@ mod tests {
             glyphs.contains('+'),
             "the formula must degrade to visible glyphs, got {glyphs:?}"
         );
+    }
+
+    /// DW-2.6: the sink shares the caller's allocation instead of copying the
+    /// AST into one of its own. `strong_count` is the oracle a type signature
+    /// cannot be — a field declared `Rc<Document>` still copies if the
+    /// constructor calls `Rc::new` on a clone.
+    #[test]
+    fn test_dw_2_6_the_sink_holds_the_caller_s_rc_not_a_copy() {
+        let doc = std::rc::Rc::new(Document::parse("![alt](./a.png)\n\n$x+1$\n"));
+        assert_eq!(std::rc::Rc::strong_count(&doc), 1);
+
+        let sink = GfxMediaSink::new(std::rc::Rc::clone(&doc), ".");
+        assert_eq!(std::rc::Rc::strong_count(&doc), 2);
+
+        drop(sink);
+        assert_eq!(std::rc::Rc::strong_count(&doc), 1);
+    }
+
+    /// The convenience overload must produce a sink that behaves like the
+    /// sharing one — a bare `Document` is moved into a fresh `Rc`, and its
+    /// nodes stay resolvable through it.
+    ///
+    /// Asserted on painted bytes rather than on "the document is non-empty",
+    /// which was the earlier form of this test and which a sink holding an
+    /// entirely different document would also have satisfied. Move-vs-copy
+    /// itself is a memory property with no behavioural signature; the
+    /// `strong_count` test above is where that claim is actually made.
+    #[test]
+    fn test_a_bare_document_argument_produces_the_same_sink_as_a_shared_one() {
+        let dir = scratch_dir("bare-doc-equivalence");
+        write_png(&dir, "a.png");
+        let source = "![alt text](./a.png)\n";
+
+        let paint = |sink: &mut GfxMediaSink| {
+            let node_id = sink
+                .doc
+                .nodes()
+                .find(|n| {
+                    matches!(n, NodeRef::Inline(i) if matches!(i.kind, InlineKind::Image { .. }))
+                })
+                .map(|n| n.id())
+                .expect("the fixture has an image node");
+            let mut out = Vec::new();
+            sink.begin_frame(&mut out);
+            sink.paint(
+                &Reserved {
+                    node_id,
+                    cols: 4,
+                    rows: 1,
+                    row: 0,
+                },
+                CellRect {
+                    x: 0,
+                    y: 0,
+                    width: 4,
+                    height: 1,
+                },
+                &mut out,
+            );
+            out
+        };
+
+        let mut from_bare = GfxMediaSink::new(Document::parse(source), &dir);
+        let mut from_shared = GfxMediaSink::new(std::rc::Rc::new(Document::parse(source)), &dir);
+
+        let bare_bytes = paint(&mut from_bare);
+        assert!(
+            !bare_bytes.is_empty(),
+            "the moved document's node must actually resolve and paint"
+        );
+        assert_eq!(
+            commands(&bare_bytes).len(),
+            commands(&paint(&mut from_shared)).len(),
+            "both constructor forms must drive the same protocol commands"
+        );
+    }
+
+    /// A `--watch` reload renumbers every node, so the sink must swap
+    /// documents **and** take its images off the terminal. Asserted on the
+    /// modelled terminal state, not on a delete count: a delete that named
+    /// the wrong id would still count.
+    #[test]
+    fn test_a_reload_takes_every_image_off_the_terminal_and_swaps_the_document() {
+        let dir = scratch_dir("reload-clears");
+        write_png(&dir, "r.png");
+        let doc = std::rc::Rc::new(Document::parse("![alt](./r.png)\n"));
+        let node_id = doc
+            .nodes()
+            .find(|n| matches!(n, NodeRef::Inline(i) if matches!(i.kind, InlineKind::Image { .. })))
+            .map(|n| n.id())
+            .unwrap();
+        let mut sink = GfxMediaSink::new(std::rc::Rc::clone(&doc), &dir);
+
+        let mut screen = TerminalGfx::default();
+        let mut out = Vec::new();
+        sink.begin_frame(&mut out);
+        sink.paint(
+            &Reserved {
+                node_id,
+                cols: 4,
+                rows: 1,
+                row: 0,
+            },
+            CellRect {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 1,
+            },
+            &mut out,
+        );
+        let placed = screen.apply(&out);
+        assert!(!placed.is_empty(), "the setup must really place an image");
+        assert!(!screen.stored.is_empty());
+
+        let replacement = std::rc::Rc::new(Document::parse("# no media here\n"));
+        let mut reload_out = Vec::new();
+        sink.reload_document(std::rc::Rc::clone(&replacement), &mut reload_out);
+        screen.apply(&reload_out);
+
+        assert!(
+            screen.visible.is_empty(),
+            "images from the old document must leave the screen: {screen:?}"
+        );
+        assert!(
+            screen.stored.is_empty(),
+            "their rasters must be freed too, or they leak for the session: {screen:?}"
+        );
+        assert!(
+            std::rc::Rc::ptr_eq(&sink.doc, &replacement),
+            "the sink must resolve nodes against the reloaded document"
+        );
+        // And the old `Rc` is no longer held by the sink.
+        assert_eq!(std::rc::Rc::strong_count(&doc), 1);
     }
 }

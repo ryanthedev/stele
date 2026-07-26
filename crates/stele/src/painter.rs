@@ -121,6 +121,14 @@ impl Painter {
         self.decor = decor;
     }
 
+    /// Tells the registered sink the document was reloaded (`--watch`), so it
+    /// can drop per-`NodeId` state a re-parse has invalidated. Forwarded
+    /// rather than exposed as a sink accessor: the painter owns the sink, and
+    /// handing it out would let a caller paint through it outside a frame.
+    pub fn reload_media(&mut self, doc: std::rc::Rc<ast::Document>, out: &mut dyn Write) {
+        self.media.reload_document(doc, out);
+    }
+
     /// Paints one full viewport repaint of `tree` starting at line `scroll`,
     /// sized `size`, to `out`. Deterministic: identical arguments always
     /// produce identical bytes. Never panics on any `tree`/`scroll`/`size`

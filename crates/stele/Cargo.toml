@@ -22,7 +22,20 @@ layout = { path = "../layout" }
 math = { path = "../math" }
 mermaid = { path = "../mermaid" }
 width = { path = "../width" }
-crossterm = "0.29"
+# `use-dev-tty` is load-bearing for `stele -` (DW-2.1), not a preference.
+# When stdin is a pipe, crossterm reads keys from `/dev/tty` instead — and its
+# *default* event source registers that descriptor with the platform poller,
+# which on macOS is kqueue. XNU's controlling-terminal device has no kqueue
+# filter: the registration fails with EINVAL, crossterm reports "Failed to
+# initialize input reader", and the viewer exits the moment it wants a key.
+# Measured, not inferred — a `kevent(EVFILT_READ)` on `/dev/tty` returns
+# EINVAL while the same call on the underlying `/dev/ttysNNN` succeeds.
+#
+# This feature swaps that source for a `poll(2)`-based one, which has no such
+# restriction on either platform. It is why `tests/document_source.rs` can
+# type at a viewer whose stdin is a pipe; without it that test fails, which is
+# the guard against someone tidying this line away.
+crossterm = { version = "0.29", features = ["use-dev-tty"] }
 clap = { version = "4", features = ["derive"] }
 
 # Signal handling for terminal restore (DW-5.1): SIGTERM/SIGHUP/SIGINT bypass
