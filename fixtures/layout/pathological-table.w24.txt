@@ -1,4 +1,5 @@
-Pathological tables
+▌ Pathological tables   
+────────────────────────
 
 A table whose natural
 widths overflow any sane

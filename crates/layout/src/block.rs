@@ -22,6 +22,24 @@ const MIN_CONTENT_COLS: u16 = 8;
 /// Gutter bar for blockquotes and alerts.
 const QUOTE_BAR: &str = "\u{2502} "; // "│ "
 
+/// One unit of a heading's depth marker: LEFT HALF BLOCK. Half-width ink in
+/// a full cell, so consecutive markers read as separated bars without
+/// spending a cell on the gap — six of them cost six columns, where six
+/// space-separated full blocks would cost eleven.
+const HEADING_MARKER: &str = "\u{258c}"; // "▌"
+
+/// The ember rule drawn under a top-level heading.
+const HEADING_RULE: &str = "\u{2500}"; // "─"
+
+/// Deepest heading level that gets an ember rule under it. Below this the
+/// marker count and the case transform carry the level on their own, and a
+/// rule per heading would stripe the page.
+const HEADING_RULE_MAX_LEVEL: u8 = 2;
+
+/// Deepest heading level whose line is extended to the full measure so a
+/// themed background reads as a band. Only the document's title earns it.
+const HEADING_WASH_MAX_LEVEL: u8 = 1;
+
 struct Seg {
     /// Emitted on the first line after the segment is pushed (the marker).
     first: String,
@@ -101,7 +119,17 @@ impl<'a> Ctx<'a> {
     /// nothing can jump to would be a dead row in the TOC.
     fn heading(&mut self, level: u8, children: &[ast::Inline], id: ast::NodeId) {
         let line = self.lines.len();
+        let pushed = self.push_heading_marker(level);
         self.flow(children, Semantic::Heading(level));
+        for _ in 0..pushed {
+            self.pop_prefix();
+        }
+        if self.lines.len() > line && level <= HEADING_WASH_MAX_LEVEL {
+            self.wash_heading_lines(line, level);
+        }
+        if self.lines.len() > line && level <= HEADING_RULE_MAX_LEVEL {
+            self.emit_heading_rule(level);
+        }
         if self.lines.len() > line {
             self.outline.push(
                 OutlineEntry {
@@ -153,6 +181,24 @@ impl<'a> Ctx<'a> {
         };
         let (level, title) = (*level, heading_text(children));
         let hidden = self.count_lines(&blocks[index..end]).saturating_sub(1);
+        // Pushed before the width is measured, so the marker is paid for out
+        // of the fold marker's own budget rather than overrunning the
+        // measure — a folded H6 spends six columns on blocks like any other.
+        //
+        // ...unless paying for it would cost the hidden count. DW-5.1 says
+        // the count is shown whole or the marker line is lying about how much
+        // it hides, and at a narrow width the depth blocks are exactly what
+        // pushes `(15 hidden lines)` over the edge. Depth is decoration here
+        // (the fold marker's own glyph already says "heading"); the count is
+        // information. So the blocks yield, matching what `prefix_budget`
+        // already does for container prefixes.
+        let mut pushed = self.push_heading_marker(level);
+        if self.content_width() < fold_marker_min_width(self.engine, hidden) {
+            for _ in 0..pushed {
+                self.pop_prefix();
+            }
+            pushed = 0;
+        }
         let text = fold_marker_text(self.engine, &title, hidden, self.content_width());
         let width = inline::cells(self.engine, &text);
         let run = Run {
@@ -164,6 +210,9 @@ impl<'a> Ctx<'a> {
         let runs = inline::clip_runs(vec![run], self.content_width(), true, self.engine);
         let line = self.lines.len();
         self.emit_runs(runs);
+        for _ in 0..pushed {
+            self.pop_prefix();
+        }
         self.outline.push(
             OutlineEntry {
                 level,
@@ -208,6 +257,125 @@ impl<'a> Ctx<'a> {
 
     fn pop_prefix(&mut self) {
         self.prefix.pop();
+    }
+
+    /// Extend a top-level heading's own line(s) to the full measure with
+    /// blank cells carrying that heading's style, so the theme's background
+    /// for the level reads as a band across the page rather than stopping
+    /// where the words do.
+    ///
+    /// Padding here rather than at paint time is what keeps the wash honest
+    /// about width: layout is the only place that knows the measure *and*
+    /// the container prefix already consumed part of it. The pad is styled
+    /// `Heading(level)` like the text it follows, so a variant with no
+    /// background simply paints nothing and this costs a few space runs.
+    ///
+    /// Reserved (media) lines are left alone — a heading cannot produce one,
+    /// and padding a media row would fight the box's own geometry.
+    fn wash_heading_lines(&mut self, from: usize, level: u8) {
+        let measure = self.width;
+        for idx in from..self.lines.len() {
+            let Some(Line::Items(items)) = self.lines.get_mut(idx) else {
+                continue;
+            };
+            let used: u16 = items
+                .iter()
+                .fold(0u16, |acc, it| acc.saturating_add(it.width()));
+            let Some(pad) = measure.checked_sub(used).filter(|p| *p > 0) else {
+                continue;
+            };
+            items.push(LineItem::Run(Run {
+                text: " ".repeat(usize::from(pad)),
+                style_id: StyleId::Semantic(Semantic::Heading(level)),
+                width: pad,
+                aux: None,
+            }));
+        }
+    }
+
+    /// Emit the rule that sits under a top-level heading — an ember: bright
+    /// at the margin, dimming across the measure.
+    ///
+    /// The gradient is banded across `Heading(level..=6)` rather than given
+    /// its own colours. That is deliberate, and it is the same trick the
+    /// depth marker uses: the theme's ramp already holds six rungs of one
+    /// hue, so indexing it by *position along the rule* buys a fade for no
+    /// new palette roles, and ties the rule's bright end to the rung its own
+    /// heading is painted in. H1 gets six bands, H2 five, so the rule is
+    /// visibly shorter-lived under the shallower heading.
+    ///
+    /// Emitted after the marker prefix is popped, so it spans the full
+    /// measure rather than starting under the heading's text.
+    ///
+    /// This line does not exist in the document. It is counted like any other
+    /// emitted line because `count_lines` re-runs this same walk, so fold
+    /// counts, scroll anchoring and the outline all stay consistent without
+    /// knowing the rule is special.
+    fn emit_heading_rule(&mut self, level: u8) {
+        let width = self.content_width();
+        if width == 0 {
+            return;
+        }
+        let rungs: Vec<u8> = (level.clamp(1, 6)..=6).collect();
+        let bands = u16::try_from(rungs.len()).unwrap_or(1);
+        let mut runs: Vec<Run> = Vec::with_capacity(rungs.len());
+        let mut filled = 0u16;
+        for (i, &rung) in rungs.iter().enumerate() {
+            // Cumulative division rather than `width / bands` per band, so
+            // rounding loss cannot leave the rule short of the measure.
+            let upto = u16::try_from(
+                (u32::from(i as u16 + 1) * u32::from(width)) / u32::from(bands),
+            )
+            .unwrap_or(width);
+            let cells = upto.saturating_sub(filled);
+            filled = upto;
+            if cells == 0 {
+                continue;
+            }
+            let text = HEADING_RULE.repeat(usize::from(cells));
+            let measured = inline::cells(self.engine, &text);
+            runs.push(Run {
+                text,
+                style_id: StyleId::Semantic(Semantic::Heading(rung)),
+                width: measured,
+                aux: None,
+            });
+        }
+        let runs = inline::clip_runs(runs, width, false, self.engine);
+        self.emit_runs(runs);
+    }
+
+    /// Push the heading depth marker: one half-block per level, then a space.
+    /// Returns how many segments were pushed, for the matching pops.
+    ///
+    /// The count is the signal — a reader counts blocks rather than learning
+    /// what a colour means — so this is *content*, not styling, and it has to
+    /// be a prefix rather than a decoration bolted on at paint time. Being a
+    /// prefix buys three things for free: `content_width` shrinks by the
+    /// marker so a heading still cannot overrun the measure, `rest` indents
+    /// wrapped heading lines to hang under the text instead of under the
+    /// blocks, and `prefix_budget`'s clamp drops the marker rather than
+    /// squeezing the text to nothing at a pathological width.
+    ///
+    /// Each block is its own segment styled `Heading(1..=level)` — not all
+    /// `Heading(level)`. The theme's ramp has exactly one rung per level, so
+    /// indexing it by *position in the run* makes every marker start on the
+    /// brightest rung and fade toward the page as it lengthens, which is the
+    /// run fade, at the cost of no new palette roles.
+    ///
+    /// This never reaches `heading_text`, so the outline, the TOC and fold
+    /// markers keep the author's text with no blocks in it.
+    fn push_heading_marker(&mut self, level: u8) -> usize {
+        let level = level.clamp(1, 6);
+        for rung in 1..=level {
+            self.push_prefix(
+                HEADING_MARKER.to_string(),
+                " ".to_string(),
+                Semantic::Heading(rung),
+            );
+        }
+        self.push_prefix(" ".to_string(), " ".to_string(), Semantic::Heading(level));
+        usize::from(level) + 1
     }
 
     /// The widest prefix layout will actually honor.
@@ -306,8 +474,16 @@ impl<'a> Ctx<'a> {
     }
 
     /// Flatten + wrap an inline sequence under `base` style and emit it.
+    ///
+    /// Headings pass through [`inline::recase`] between the two, so their
+    /// level's case transform is applied to the text that then gets measured
+    /// and wrapped — not bolted on afterwards, where a width-changing
+    /// uppercase could overrun the measure.
     fn flow(&mut self, inlines: &[ast::Inline], base: Semantic) {
-        let atoms = inline::flatten(inlines, base, self.doc, self.sizer, true);
+        let mut atoms = inline::flatten(inlines, base, self.doc, self.sizer, true);
+        if let Semantic::Heading(level) = base {
+            inline::recase(&mut atoms, crate::heading_case(level));
+        }
         let pieces = inline::wrap(atoms, self.content_width(), self.engine);
         self.emit_pieces(pieces);
     }
@@ -542,8 +718,20 @@ fn alert_label(kind: AlertKind) -> (&'static str, AlertTone) {
 /// suffix (glyph + count) is measured first and the title gets whatever
 /// width is left over, itself clipped with the usual `…` indicator via
 /// [`clipped_text`] — never the assembled whole.
+/// The narrowest measure at which [`fold_marker_text`] can still show the
+/// glyph and the whole hidden count, with nothing left over for the title.
+/// Below this, something has to give, and it must not be the count.
+fn fold_marker_min_width(engine: &WidthEngine, hidden: usize) -> u16 {
+    let noun = if hidden == 1 { "line" } else { "lines" };
+    inline::cells(engine, FOLD_GLYPH)
+        .saturating_add(inline::cells(engine, &format!(" ({hidden} hidden {noun})")))
+}
+
+/// Leading glyph on a folded heading's marker line.
+const FOLD_GLYPH: &str = "\u{25b8} "; // "▸ "
+
 fn fold_marker_text(engine: &WidthEngine, title: &str, hidden: usize, width: u16) -> String {
-    const GLYPH: &str = "\u{25b8} "; // "▸ "
+    const GLYPH: &str = FOLD_GLYPH;
     let noun = if hidden == 1 { "line" } else { "lines" };
     let suffix = format!(" ({hidden} hidden {noun})");
     let glyph_w = inline::cells(engine, GLYPH);

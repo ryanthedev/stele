@@ -244,8 +244,11 @@ fn test_dw_2_4_a_deleted_file_reports_on_the_status_row_and_keeps_the_last_frame
         status.contains("could not read file"),
         "and must say what actually went wrong, got {status:?}"
     );
+    // `▌` is the heading depth marker: one per level ahead of the text.
     assert_eq!(
-        render_row(&after, 1, COLS).trim(),
+        render_row(&after, 1, COLS)
+            .trim()
+            .trim_start_matches(['\u{258c}', ' ']),
         "still-here",
         "the last good render must still be on screen"
     );

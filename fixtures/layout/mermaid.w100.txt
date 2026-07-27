@@ -1,4 +1,5 @@
-Mermaid fences
+▌ Mermaid fences                                                                                    
+────────────────────────────────────────────────────────────────────────────────────────────────────
 
 A flowchart with a decision node, rendered as a text block:
 

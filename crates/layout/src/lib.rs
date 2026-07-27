@@ -87,6 +87,35 @@ pub enum AlertTone {
     Caution,
 }
 
+/// How a heading level's text is cased when rendered.
+///
+/// This lives in `layout`, not in the theme, because case changes *text* and
+/// therefore changes measured width (`ß`.to_uppercase() is `SS`) — it has to
+/// be settled before wrapping, not painted on afterwards. `highlight`
+/// re-exports it; the dependency only runs that way.
+///
+/// Display-only in the sense that matters: the outline and the TOC read
+/// `heading_text` off the AST and keep the author's own capitalisation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HeadingCase {
+    /// H1, H2 — the author's own casing, untouched.
+    AsWritten,
+    /// H3, H4 — `SUPPORTED PLATFORMS`.
+    Upper,
+    /// H5, H6 — `Checksum Mismatches`.
+    Title,
+}
+
+/// The case transform for a heading level. Clamps like every other consumer,
+/// so an out-of-range level degrades to the nearest rung.
+pub fn heading_case(level: u8) -> HeadingCase {
+    match level.clamp(1, 6) {
+        1 | 2 => HeadingCase::AsWritten,
+        3 | 4 => HeadingCase::Upper,
+        _ => HeadingCase::Title,
+    }
+}
+
 /// The style roles layout can distinguish. Theme resolution (role → color/
 /// attribute) happens later, at paint (P5) and theming (P7); layout only
 /// says *what* a run is, never how it looks.

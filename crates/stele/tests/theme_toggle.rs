@@ -32,10 +32,18 @@ fn fg_before(wire: &str, needle: &str) -> Color {
         .unwrap_or_else(|| panic!("no truecolor fg SGR before {needle:?}: {wire:?}"));
     let rest = &prefix[start + "38;2;".len()..];
     let end = rest.find('m').unwrap_or(rest.len());
-    let mut parts = rest[..end].splitn(3, ';');
-    let r: u8 = parts.next().unwrap().parse().unwrap();
-    let g: u8 = parts.next().unwrap().parse().unwrap();
-    let b: u8 = parts.next().unwrap().parse().unwrap();
+    // Take exactly the three channels and stop. A background (`48;2;r;g;b`)
+    // can follow the foreground inside the same SGR sequence — H1 carries the
+    // wash — so the triple is not necessarily what runs up to the `m`.
+    let mut parts = rest[..end].split(';');
+    let mut channel = |name: &str| -> u8 {
+        parts
+            .next()
+            .unwrap_or_else(|| panic!("truecolor fg before {needle:?} has no {name}: {wire:?}"))
+            .parse()
+            .unwrap_or_else(|e| panic!("fg {name} before {needle:?} is not a u8: {e}"))
+    };
+    let (r, g, b) = (channel("r"), channel("g"), channel("b"));
     Color::new(r, g, b)
 }
 

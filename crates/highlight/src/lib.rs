@@ -40,4 +40,4 @@ pub use hyperlink::{CLOSE as HYPERLINK_CLOSE, open as hyperlink_open, sanitize_u
 pub use role::Capture;
 pub use theme::{Style, Theme, Variant, role_count, variant_from_osc11_reply};
 
-pub use layout::StyleId;
+pub use layout::{HeadingCase, StyleId, heading_case};

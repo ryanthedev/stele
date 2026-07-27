@@ -36,7 +36,7 @@ pub enum Variant {
 /// uncolored `Plain` catch-all) follow these, and anything added later
 /// follows the captures — see [`TRAILING_ROLE_BASE`]. Kept in one constant
 /// so the palette size and the role-index functions can never drift apart.
-/// The first [`HEADING_TIERS`] entries are the heading ramp, not one shared
+/// The first [`HEADING_RUNGS`] entries are the heading ramp, not one shared
 /// heading slot.
 ///
 /// **Do not raise this to make room for a new role.** [`build_palette`]
@@ -48,7 +48,7 @@ pub enum Variant {
 /// invariant here forbids and no test caught, because distinctness survives
 /// any permutation. New roles go at [`TRAILING_ROLE_BASE`], where appending
 /// is inert.
-const SEMANTIC_ROLES: usize = 22;
+const SEMANTIC_ROLES: usize = HEADING_RUNGS + 19;
 
 /// The first palette slot past every historically-allocated role. A role
 /// added here inherits a brand-new color and disturbs nothing that already
@@ -65,9 +65,23 @@ const CAPTURE_ROLES: usize = role::ALL.len() - 1;
 /// panicking on an out-of-range palette index.
 const HEADING_LEVELS: u8 = 6;
 
-/// How many palette slots the heading ramp occupies — two levels per tier.
-/// See [`HEADING_RAMP`] for why this is 3 and not 6.
-const HEADING_TIERS: usize = 3;
+/// How many palette slots the heading ramp occupies — one per level.
+///
+/// This was 3, with two levels sharing a tier, because six rungs of one hue
+/// could not all stay legible *and* stay distinct after 256-color
+/// downsampling (see [`HEADING_RAMP`]). That constraint bound only while
+/// **color was the signal** for heading depth. It no longer is: every heading
+/// now carries a run of `level` block markers, and the count is what a reader
+/// reads. The ramp became cohesion — it says "these are all headings" — so
+/// two adjacent rungs landing on the same 256-color cell is a cosmetic loss,
+/// not an ambiguity, and the ramp can span all six levels.
+///
+/// Raising this shifts every semantic role after the ramp by three slots, so
+/// every colored capture role takes a new color. That is the repaint
+/// [`SEMANTIC_ROLES`] warns about, done deliberately here rather than by
+/// accident — `test_capture_colors_are_pinned_so_a_new_role_cannot_silently_restyle_code_blocks`
+/// is the gate it had to pass through.
+const HEADING_RUNGS: usize = 6;
 
 /// The owned theme: a built-in [`Variant`] plus a [`ColorMode`]. Construct
 /// with [`Theme::new`]; [`Theme::resolve`] is the total function P7 commits
@@ -118,7 +132,21 @@ impl Theme {
             Semantic::Heading(level) => heading_attrs(level, fg.is_none()),
             other => semantic_attrs(other),
         };
-        Style { fg, ..attrs }
+        // The H1 wash. Gated on `fg` rather than on the color mode for the
+        // same reason the ladder is: a heading with no color resolved is
+        // monochrome in practice, and a background under NO_COLOR would be
+        // a color arriving through the back door.
+        // Matched on the *clamped* level, not the literal 1 — every other
+        // heading consumer here clamps, and an out-of-range `Heading(0)` that
+        // resolved to H1's colour but not H1's wash would be a style no level
+        // actually has.
+        let bg = match semantic {
+            Semantic::Heading(level) if fg.is_some() && level.clamp(1, HEADING_LEVELS) == 1 => {
+                Some(heading_wash(self.variant))
+            }
+            _ => None,
+        };
+        Style { fg, bg, ..attrs }
     }
 
     fn resolve_capture(&self, capture: Capture) -> Style {
@@ -225,30 +253,23 @@ fn heading_attrs(level: u8, monochrome: bool) -> Style {
         italic: true,
         ..Style::default()
     };
-    match (level.clamp(1, HEADING_LEVELS), monochrome) {
-        (1, _) => Style {
-            underline: true,
-            ..bold
-        },
-        (2, _) => bold,
-        (3, _) => Style {
-            italic: true,
-            ..bold
-        },
-        (4, _) => italic,
-        // Tier 3 in color: plain and italic, distinguished from the identical
-        // pair in tier 2 by the ramp color they carry.
-        (5, false) => Style::default(),
-        (_, false) => italic,
-        (5, true) => Style {
-            dim: true,
-            ..Style::default()
-        },
-        (_, true) => Style {
-            dim: true,
-            italic: true,
-            ..Style::default()
-        },
+    // Weight and slope only. The other half of the ladder is *case* — H3/H4
+    // render uppercase and H5/H6 title case — which is a text transform, not
+    // an SGR attribute, so it cannot live in `Style`. See `heading_case`.
+    //
+    // This no longer maintains a six-way distinct attribute ladder for
+    // monochrome. It doesn't need one: every heading is preceded by a run of
+    // `level` block markers, and that count survives `ColorMode::NoColor`
+    // untouched (the markers are glyphs; only their color is stripped).
+    // Combined with case, the only pair sharing an attribute set *and* a case
+    // is H1/H2, which the count separates 1-from-2 — the easiest reading in
+    // the set.
+    let _ = monochrome;
+    match level.clamp(1, HEADING_LEVELS) {
+        1 | 2 => bold,
+        3 => bold,
+        4 | 5 => Style::default(),
+        _ => italic,
     }
 }
 
@@ -258,30 +279,31 @@ fn heading_attrs(level: u8, monochrome: bool) -> Style {
 /// Exhaustive for the same reason as [`semantic_attrs`].
 fn semantic_role_index(semantic: Semantic) -> Option<usize> {
     Some(match semantic {
-        // Heading levels share three palette slots (0–2), two levels per
-        // tier: the ramp carries the tier, `heading_attrs` separates the two
-        // levels inside it. `heading_tier` clamps, so an out-of-range level
-        // lands on a real tier instead of indexing past the ramp.
-        Semantic::Heading(level) => heading_tier(level),
-        Semantic::CodeInline => 3,
-        Semantic::Link => 4,
-        Semantic::ImageAlt => 5,
-        Semantic::ListMarker => 6,
-        Semantic::TaskMarker => 7,
-        Semantic::BlockquoteMarker => 8,
-        Semantic::AlertTitle(AlertTone::Note) => 9,
-        Semantic::AlertTitle(AlertTone::Tip) => 10,
-        Semantic::AlertTitle(AlertTone::Important) => 11,
-        Semantic::AlertTitle(AlertTone::Warning) => 12,
-        Semantic::AlertTitle(AlertTone::Caution) => 13,
-        Semantic::Rule => 14,
-        Semantic::TableBorder => 15,
-        Semantic::TableHeader => 16,
-        Semantic::FootnoteRef => 17,
-        Semantic::FootnoteLabel => 18,
-        Semantic::Html => 19,
-        Semantic::FrontMatter => 20,
-        Semantic::OverflowIndicator => 21,
+        // Heading levels take one palette slot each (0–5). `heading_rung`
+        // clamps, so an out-of-range level lands on a real rung instead of
+        // indexing past the ramp. Every index below is `HEADING_RUNGS + n`
+        // rather than a bare literal, so growing or shrinking the ramp again
+        // moves them together instead of silently overlapping it.
+        Semantic::Heading(level) => heading_rung(level),
+        Semantic::CodeInline => HEADING_RUNGS,
+        Semantic::Link => HEADING_RUNGS + 1,
+        Semantic::ImageAlt => HEADING_RUNGS + 2,
+        Semantic::ListMarker => HEADING_RUNGS + 3,
+        Semantic::TaskMarker => HEADING_RUNGS + 4,
+        Semantic::BlockquoteMarker => HEADING_RUNGS + 5,
+        Semantic::AlertTitle(AlertTone::Note) => HEADING_RUNGS + 6,
+        Semantic::AlertTitle(AlertTone::Tip) => HEADING_RUNGS + 7,
+        Semantic::AlertTitle(AlertTone::Important) => HEADING_RUNGS + 8,
+        Semantic::AlertTitle(AlertTone::Warning) => HEADING_RUNGS + 9,
+        Semantic::AlertTitle(AlertTone::Caution) => HEADING_RUNGS + 10,
+        Semantic::Rule => HEADING_RUNGS + 11,
+        Semantic::TableBorder => HEADING_RUNGS + 12,
+        Semantic::TableHeader => HEADING_RUNGS + 13,
+        Semantic::FootnoteRef => HEADING_RUNGS + 14,
+        Semantic::FootnoteLabel => HEADING_RUNGS + 15,
+        Semantic::Html => HEADING_RUNGS + 16,
+        Semantic::FrontMatter => HEADING_RUNGS + 17,
+        Semantic::OverflowIndicator => HEADING_RUNGS + 18,
         // The two search roles take their own palette slots rather than
         // sharing one, so DW-4.8's "distinct after 256-color downsampling"
         // holds by construction of `build_palette` — the same greedy
@@ -361,59 +383,80 @@ fn candidate_color(attempt: usize, variant: Variant) -> Color {
     color::hsl_to_rgb(hue, saturation, lightness)
 }
 
-/// The heading ramp's hue, in turns — the hue headings have always carried
-/// (`candidate_color`'s attempt 0 lands here too), so the ramp stays in the
-/// family the theme already used, even though every tier's *lightness* is new
-/// and no tier reproduces the old heading color exactly.
+/// The heading ramp's hue now lives per-variant in [`HEADING_RAMP`], because
+/// dark and light no longer share one: dark is Tron cyan (0.52) and light is
+/// newsprint ink (0.075). It used to be a single constant at hue 0.0, which
+/// [`candidate_color`]'s attempt 0 also lands on.
 ///
-/// Because this hue is now reserved, [`build_palette`] starts its
-/// golden-angle loop at attempt 1: leaving attempt 0 in the general pool
-/// handed `CodeInline` a color 11.5 rgb units from the tier-3 heading color on
-/// dark (`#de7373` against `#e07b7b` — indistinguishable in truecolor), where
-/// the palette's tightest pre-existing pair was 18.4 apart.
-///
-/// Every other role's palette slot shifts by `HEADING_TIERS - 1` as a result;
-/// nothing persists a palette index across runs, so the renumbering itself is
-/// invisible outside this file, though the colors those roles resolve to do
-/// change.
-const HEADING_HUE_TURNS: f64 = 0.0;
+/// [`build_palette`] still starts its golden-angle loop at attempt 1. The
+/// original reason has lapsed on dark — headings moved off hue 0, so attempt
+/// 0 no longer shadows them there — but light's ink sits at 0.075, close
+/// enough to hue 0 that the skip keeps earning its place. It also costs
+/// nothing: the golden angle never revisits hue 0.
+/// `test_no_ordinary_role_lands_on_the_heading_family` is what actually
+/// enforces the separation, in both variants.
+const PALETTE_FIRST_ATTEMPT: usize = 1;
 
-/// Saturation and per-tier lightness for the heading ramp, loudest first,
+/// Saturation and per-level lightness for the heading ramp, loudest first,
 /// where "loud" means *furthest from the background*: lightness descends on
 /// dark, ascends on light.
 ///
-/// Three tiers, not six, and the reason is legibility rather than taste. The
-/// ramp holds one hue, and one hue offers only about six cells that survive
-/// the 256-color cube's 6-steps-per-channel quantization — spanning all six
-/// forces the deep end down to where it stops being readable (measured
-/// against the Spike A reference background `#1a1b26`: a six-rung version of
-/// this table put H6 at 3.13:1 and H5 at 4.20:1, both under WCAG AA's 4.5:1,
-/// and the light variant's H6 at 2.73:1). Three tiers keep every heading
-/// color at 5.9:1 or better in both variants; [`heading_attrs`] separates the
-/// two levels inside a tier. Move a value and [`build_palette`] refuses to
-/// build rather than ship two tiers that look identical in 256-color mode;
-/// `test_heading_tiers_clear_wcag_aa_against_the_reference_backgrounds` is
-/// what stops a "nicer" value from quietly going back under AA.
-const HEADING_RAMP: [(f64, [f64; HEADING_TIERS]); 2] = [
-    // Dark background: pale → deep.
-    (0.62, [0.86, 0.76, 0.68]),
-    // Light background: deep → pale.
-    (0.68, [0.22, 0.30, 0.40]),
+/// Six rungs, one per level. The earlier three-tier table existed because a
+/// six-rung ramp put H6 at 3.13:1 and H5 at 4.20:1 on dark — under WCAG AA's
+/// 4.5:1 for text — and the light variant's H6 at 2.73:1. These rungs are
+/// chosen to clear AA anyway: the shallowest measures 7.53:1 (light H6) and
+/// nothing falls below it. The 256-color collisions the old table could not
+/// tolerate are now allowed, because the block-marker count carries the
+/// level; see [`HEADING_RUNGS`].
+///
+/// `test_heading_rungs_clear_wcag_aa_against_the_reference_backgrounds` is
+/// what stops a "nicer" value from quietly going under AA.
+const HEADING_RAMP: [(f64, f64, [f64; HEADING_RUNGS]); 2] = [
+    // Dark — Tron: electric cyan igniting out of near-black. Hue 0.52 is
+    // ~187°. Measured against `#1a1b26`: 13.35 → 10.57:1.
+    (0.52, 0.95, [0.80, 0.74, 0.69, 0.64, 0.59, 0.55]),
+    // Light — newsprint: warm, nearly neutral ink laid on paper. The ramp
+    // runs the other way because on paper "receding" means approaching the
+    // page, not approaching black. Against `#ffffff`: 16.01 → 7.53:1.
+    (0.075, 0.08, [0.13, 0.17, 0.21, 0.25, 0.29, 0.33]),
 ];
 
-/// Which color tier a heading level draws from: levels 1–2 the loudest, 3–4
-/// the middle, 5–6 the quietest.
-fn heading_tier(level: u8) -> usize {
-    usize::from(level.clamp(1, HEADING_LEVELS) - 1) / 2
+/// Which rung of the color ramp a heading level draws from — one each, now
+/// that the ramp spans all six levels. Clamps, so an out-of-range level lands
+/// on a real rung instead of indexing past the ramp.
+fn heading_rung(level: u8) -> usize {
+    usize::from(level.clamp(1, HEADING_LEVELS) - 1)
 }
 
-/// One tier of the heading color ramp.
-fn heading_ramp_color(tier: usize, variant: Variant) -> Color {
-    let (saturation, lightnesses) = match variant {
+/// The band laid behind the document title's line.
+///
+/// Deliberately close to the page — 1.23:1 against the dark reference and
+/// 1.13:1 against the light one. It is not trying to be legible on its own;
+/// it is trying to be *felt*, and anything louder competes with the heading
+/// text sitting on it. Because it is a background rather than a mark, no
+/// contrast floor applies to the band itself — what must clear AA is the
+/// heading text *against* it, which
+/// `test_the_h1_wash_never_costs_the_title_its_contrast` checks directly
+/// rather than assuming the page-background measurement carries over.
+fn heading_wash(variant: Variant) -> Color {
+    let (hue, saturation, _) = match variant {
         Variant::Dark => HEADING_RAMP[0],
         Variant::Light => HEADING_RAMP[1],
     };
-    color::hsl_to_rgb(HEADING_HUE_TURNS, saturation, lightnesses[tier])
+    let lightness = match variant {
+        Variant::Dark => 0.115,
+        Variant::Light => 0.945,
+    };
+    color::hsl_to_rgb(hue, saturation, lightness)
+}
+
+/// One rung of the heading color ramp.
+fn heading_ramp_color(rung: usize, variant: Variant) -> Color {
+    let (hue, saturation, lightnesses) = match variant {
+        Variant::Dark => HEADING_RAMP[0],
+        Variant::Light => HEADING_RAMP[1],
+    };
+    color::hsl_to_rgb(hue, saturation, lightnesses[rung.min(HEADING_RUNGS - 1)])
 }
 
 /// Builds `role_count()` truecolor palette entries for `variant`, greedily
@@ -428,29 +471,32 @@ fn build_palette(variant: Variant) -> Vec<Color> {
     let mut palette = Vec::with_capacity(total);
     let mut used_downsampled = std::collections::HashSet::with_capacity(total);
 
-    // Slots 0..HEADING_TIERS first, so the ramp keeps one hue instead of
+    // Slots 0..HEADING_RUNGS first, so the ramp keeps one hue instead of
     // drawing golden-angle-separated hues — a rainbow of heading levels would
-    // read as unrelated roles rather than one hierarchy. These still pass
-    // through the same 256-downsample distinctness filter as every other
-    // role, so DW-7.2's invariant holds by construction here too.
-    for tier in 0..HEADING_TIERS {
-        let candidate = heading_ramp_color(tier, variant);
-        assert!(
-            used_downsampled.insert(color::downsample_256(candidate)),
-            "heading ramp tier {tier} downsamples onto a cell an earlier tier already took \
-             ({variant:?}) — two heading tiers would be the same color in 256-color mode; \
-             pick a different lightness in HEADING_RAMP"
-        );
+    // read as unrelated roles rather than one hierarchy.
+    //
+    // These rungs are deliberately NOT held to the 256-downsample
+    // distinctness rule the other roles pass through. Six rungs of one hue do
+    // collide once quantized to the cube's 6 steps per channel (dark loses
+    // H4/H5; light loses H1/H2 and H3/H4), and this used to be a hard error.
+    // It is allowed now because the block-marker count carries heading depth
+    // — see [`HEADING_RUNGS`]. Their downsampled cells are still *recorded*,
+    // so no ordinary role may land on one: a heading looking like a heading is
+    // cosmetic, a `CodeInline` looking like a heading is not.
+    for rung in 0..HEADING_RUNGS {
+        let candidate = heading_ramp_color(rung, variant);
+        used_downsampled.insert(color::downsample_256(candidate));
         palette.push(candidate);
     }
 
-    // Attempt 0 shares the heading ramp's hue (both sit at hue 0), and the
-    // 256-cell filter below is too coarse to catch that: its color survives as
-    // a distinct *cell* while looking identical to a heading tier. Skipping it
-    // costs nothing — the golden angle never revisits hue 0 — and it is what
-    // keeps `CodeInline`, the role that inherits this slot, off the heading
-    // family. See [`HEADING_HUE_TURNS`] for the measurement.
-    let mut attempt = 1usize;
+    // Attempt 0 sits at hue 0, near enough to light's newsprint ink (0.075)
+    // that the 256-cell filter below cannot separate them: its color survives
+    // as a distinct *cell* while looking like a heading rung. Skipping it
+    // costs nothing — the golden angle never revisits hue 0 — and it keeps
+    // `CodeInline`, the role that inherits this slot, off the heading family.
+    // See [`PALETTE_FIRST_ATTEMPT`] for why the skip outlived dark's move to
+    // cyan.
+    let mut attempt = PALETTE_FIRST_ATTEMPT;
     while palette.len() < total {
         let candidate = candidate_color(attempt, variant);
         if used_downsampled.insert(color::downsample_256(candidate)) {
@@ -511,7 +557,7 @@ fn parse_channel(group: &str) -> Option<u8> {
 mod tests {
     use std::collections::HashSet;
 
-    use layout::{AlertTone, Semantic};
+    use layout::{AlertTone, HeadingCase, Semantic, heading_case};
 
     use super::*;
 
@@ -556,25 +602,48 @@ mod tests {
         for variant in [Variant::Dark, Variant::Light] {
             let palette = build_palette(variant);
             assert_eq!(palette.len(), role_count());
+            // Heading rungs are exempt from mutual distinctness: six rungs of
+            // one hue genuinely cannot all survive the 256-cube's 6 steps per
+            // channel (dark loses H4/H5, light loses H1/H2 and H3/H4), and
+            // that is accepted because the block-marker count carries depth.
+            // Everything else must still be distinct from everything else
+            // *including* from every heading rung — a `CodeInline` that reads
+            // as a heading is a real ambiguity, unlike H4 reading as H5.
             let mut seen = HashSet::new();
-            for (idx, &truecolor) in palette.iter().enumerate() {
-                let color = color::apply_mode(truecolor, ColorMode::Downsample256)
-                    .expect("Downsample256 always yields a color");
+            let down = |c| {
+                color::apply_mode(c, ColorMode::Downsample256)
+                    .expect("Downsample256 always yields a color")
+            };
+            for (idx, &truecolor) in palette.iter().enumerate().skip(HEADING_RUNGS) {
                 assert!(
-                    seen.insert(color),
-                    "role index {idx} collided with an earlier role after 256-color downsample ({variant:?}): {color:?}"
+                    seen.insert(down(truecolor)),
+                    "role index {idx} collided with an earlier role after 256-color downsample ({variant:?}): {:?}",
+                    down(truecolor)
                 );
             }
-            assert_eq!(seen.len(), role_count());
+            for (rung, &truecolor) in palette.iter().enumerate().take(HEADING_RUNGS) {
+                assert!(
+                    !seen.contains(&down(truecolor)),
+                    "heading rung {rung} downsamples onto a cell an ordinary role already took \
+                     ({variant:?}): {:?}",
+                    down(truecolor)
+                );
+            }
+            assert_eq!(seen.len(), role_count() - HEADING_RUNGS);
 
             // Cross-check the same invariant through the public `resolve`
             // entry point (not just the internal palette function): every
-            // colored semantic role and every colored capture role must
-            // still land on one of the `seen` colors, with no two distinct
-            // roles resolving to the same one.
+            // colored non-heading role must still land on one of the `seen`
+            // colors, with no two distinct roles resolving to the same one.
+            // Headings are excluded on both sides — they are the exempt set
+            // above, and folding them in would just re-assert the collision
+            // this test now permits.
             let theme = Theme::new(variant, ColorMode::Downsample256);
             let mut resolved = HashSet::new();
             for semantic in all_semantics() {
+                if matches!(semantic, Semantic::Heading(_)) {
+                    continue;
+                }
                 if let Some(fg) = theme.resolve(StyleId::Semantic(semantic)).fg {
                     resolved.insert(fg);
                 }
@@ -737,21 +806,31 @@ mod tests {
     /// asserts the palette is a *set* of distinct colors, and a permutation
     /// of a set is still that set.
     ///
-    /// The values below are the pre-Phase-4 colors, read off the base commit
-    /// and diffed against the current palette to confirm they were restored
-    /// exactly. Pinned in both variants and at both ends of the capture
-    /// block, so an insertion anywhere inside it fails here. If a deliberate
-    /// palette change ever makes these wrong, the fix is to re-record them
-    /// in the same commit as the change — not to loosen the assertion.
+    /// Pinned in both variants and at both ends of the capture block, so an
+    /// insertion anywhere inside it fails here. If a deliberate palette
+    /// change ever makes these wrong, the fix is to re-record them in the
+    /// same commit as the change — not to loosen the assertion.
+    ///
+    /// **Re-recorded once, deliberately.** Growing the heading ramp from
+    /// three tiers to six rungs ([`HEADING_RUNGS`]) inserted three slots
+    /// ahead of the capture block and moved every capture color — the exact
+    /// failure mode this test was written to catch. It caught it. The values
+    /// below are the post-change palette, and the change was wanted: the
+    /// ramp legitimately lives at the front of the palette, and the
+    /// alternative (scattering three heading rungs out at
+    /// `TRAILING_ROLE_BASE`) would have split one ramp across two disjoint
+    /// index ranges to preserve colors that no user has seen, since the
+    /// default theme changed in the same commit. A *role* being added still
+    /// must not do this; that is still the rule.
     #[test]
     fn test_capture_colors_are_pinned_so_a_new_role_cannot_silently_restyle_code_blocks() {
         let expected = [
-            (Variant::Dark, Capture::Keyword, Color::new(193, 110, 103)),
-            (Variant::Dark, Capture::Comment, Color::new(232, 205, 186)),
-            (Variant::Dark, Capture::String, Color::new(134, 194, 243)),
-            (Variant::Light, Capture::Keyword, Color::new(13, 122, 211)),
+            (Variant::Dark, Capture::Keyword, Color::new(134, 243, 175)),
+            (Variant::Dark, Capture::Comment, Color::new(115, 222, 190)),
+            (Variant::Dark, Capture::String, Color::new(222, 33, 81)),
+            (Variant::Light, Capture::Keyword, Color::new(64, 201, 69)),
             (Variant::Light, Capture::Comment, Color::new(201, 195, 64)),
-            (Variant::Light, Capture::String, Color::new(211, 45, 13)),
+            (Variant::Light, Capture::String, Color::new(154, 29, 35)),
         ];
         for (variant, capture, color) in expected {
             let theme = Theme::new(variant, ColorMode::Truecolor);
@@ -868,47 +947,66 @@ mod tests {
         for variant in [Variant::Dark, Variant::Light] {
             let theme = Theme::new(variant, ColorMode::Truecolor);
             let mut seen = Vec::new();
-            let mut tiers = HashSet::new();
+            let mut rungs = HashSet::new();
             for level in 1..=HEADING_LEVELS {
                 let style = theme.resolve(StyleId::Semantic(Semantic::Heading(level)));
-                let fg = style.fg.expect("every heading level carries a tier color");
-                tiers.insert(fg);
+                let fg = style.fg.expect("every heading level carries a rung color");
+                rungs.insert(fg);
+                // Identity is (color, attributes, case) — the ramp alone no
+                // longer has to separate levels, and neither do attributes.
+                let identity = (style, heading_case(level));
                 assert!(
-                    !seen.contains(&style),
-                    "H{level} is indistinguishable from a shallower level in {variant:?}: {style:?}"
+                    !seen.contains(&identity),
+                    "H{level} is indistinguishable from a shallower level in {variant:?}: \
+                     {identity:?}"
                 );
                 assert!(
                     !style.dim,
                     "H{level} carries SGR faint on top of a ramp color in {variant:?} — \
                      that is the combination that fell under WCAG AA"
                 );
-                seen.push(style);
+                seen.push(identity);
             }
             assert_eq!(
-                tiers.len(),
-                HEADING_TIERS,
-                "the six levels should draw on exactly {HEADING_TIERS} tier colors"
+                rungs.len(),
+                HEADING_RUNGS,
+                "the six levels should draw on exactly {HEADING_RUNGS} rung colors in truecolor"
             );
 
-            // The attribute half must stand alone with color stripped.
+            // With color stripped, attributes and case are all that is left in
+            // the *style*. They no longer separate all six on their own, and
+            // are not required to: every heading is preceded by a run of
+            // `level` block markers, which are glyphs and survive NoColor. So
+            // this pins exactly how far the style alone gets, and names the
+            // pair that leans on the count — if that set ever grows, this
+            // fails and the growth has to be argued for.
             let no_color = Theme::new(variant, ColorMode::NoColor);
-            let mut bare_attrs = Vec::new();
+            let mut collapsed = Vec::new();
+            let mut bare = Vec::new();
             for level in 1..=HEADING_LEVELS {
                 let style = no_color.resolve(StyleId::Semantic(Semantic::Heading(level)));
                 assert_eq!(style.fg, None);
-                assert!(
-                    !bare_attrs.contains(&style),
-                    "H{level} collapsed onto another level under NO_COLOR: {style:?}"
-                );
-                bare_attrs.push(style);
+                let identity = (style, heading_case(level));
+                if bare.contains(&identity) {
+                    collapsed.push(level);
+                }
+                bare.push(identity);
             }
+            assert_eq!(
+                collapsed,
+                vec![2],
+                "under NoColor only H2 may share H1's style-and-case (the marker count, 1 vs 2, \
+                 is what separates them); in {variant:?} the collapsed set was {collapsed:?}"
+            );
         }
     }
 
     /// The ramp is a hierarchy, so its contrast against the background must
-    /// fall monotonically with depth — tier 2 may not out-shout tier 1.
-    /// Asserted through resolved colors rather than the generator, so it also
-    /// covers the level → tier mapping.
+    /// fall monotonically with depth — H4 may not out-shout H3. Now that the
+    /// ramp has one rung per level, this holds between *every adjacent pair*
+    /// rather than only across tier boundaries. Asserted through resolved
+    /// colors rather than the generator, so it also covers the level → rung
+    /// mapping.
     #[test]
     fn test_heading_ramp_is_monotone_in_contrast() {
         for variant in [Variant::Dark, Variant::Light] {
@@ -917,32 +1015,25 @@ mod tests {
                 let fg = theme
                     .resolve(StyleId::Semantic(Semantic::Heading(level)))
                     .fg
-                    .expect("every heading level carries a tier color");
+                    .expect("every heading level carries a rung color");
                 0.2126 * f64::from(fg.r) + 0.7152 * f64::from(fg.g) + 0.0722 * f64::from(fg.b)
             };
-            // Levels 1, 3, 5 are the first level of each tier.
-            for level in [3u8, 5] {
-                let (deeper, shallower) = (luminance(level), luminance(level - 2));
+            for level in 2..=HEADING_LEVELS {
+                let (deeper, shallower) = (luminance(level), luminance(level - 1));
                 match variant {
                     // Dark background: louder = brighter, so luminance falls.
                     Variant::Dark => assert!(
                         deeper < shallower,
                         "H{level} is brighter than H{} on dark ({deeper} >= {shallower})",
-                        level - 2
+                        level - 1
                     ),
                     // Light background: louder = darker, so luminance rises.
                     Variant::Light => assert!(
                         deeper > shallower,
                         "H{level} is darker than H{} on light ({deeper} <= {shallower})",
-                        level - 2
+                        level - 1
                     ),
                 }
-                assert_eq!(
-                    luminance(level),
-                    luminance(level + 1),
-                    "H{level} and H{} share a tier and must share its color",
-                    level + 1
-                );
             }
         }
     }
@@ -960,35 +1051,23 @@ mod tests {
             italic: true,
             ..Style::default()
         };
-        let colored = [
-            Style {
-                underline: true,
-                ..bold
-            },
-            bold,
-            Style {
-                italic: true,
-                ..bold
-            },
-            italic,
-            Style::default(),
-            italic,
+        // H1 bold · H2 bold · H3 bold (rendered uppercase) · H4 plain
+        // (uppercase) · H5 plain (title case) · H6 italic (title case).
+        // Weight and slope only; `case` below carries the rest, and the
+        // marker count carries what neither does.
+        let ladder = [bold, bold, bold, Style::default(), Style::default(), italic];
+        let case = [
+            HeadingCase::AsWritten,
+            HeadingCase::AsWritten,
+            HeadingCase::Upper,
+            HeadingCase::Upper,
+            HeadingCase::Title,
+            HeadingCase::Title,
         ];
-        let monochrome = [
-            colored[0],
-            colored[1],
-            colored[2],
-            colored[3],
-            Style {
-                dim: true,
-                ..Style::default()
-            },
-            Style {
-                dim: true,
-                italic: true,
-                ..Style::default()
-            },
-        ];
+        // Stripping color changes nothing about the attribute ladder — there
+        // is no separate monochrome ladder any more, because the markers do
+        // not need one.
+        let (colored, monochrome) = (ladder, ladder);
 
         for variant in [Variant::Dark, Variant::Light] {
             let theme = Theme::new(variant, ColorMode::Truecolor);
@@ -997,55 +1076,114 @@ mod tests {
                 let idx = usize::from(level - 1);
                 let got = theme.resolve(StyleId::Semantic(Semantic::Heading(level)));
                 assert_eq!(
-                    Style { fg: None, ..got },
+                    Style {
+                        fg: None,
+                        bg: None,
+                        ..got
+                    },
                     colored[idx],
                     "H{level}'s colored attributes in {variant:?}"
+                );
+                // Exactly one level carries the wash, and it is the title.
+                assert_eq!(
+                    got.bg.is_some(),
+                    level == 1,
+                    "H{level} background in {variant:?}: only H1 wears the wash"
                 );
                 assert_eq!(
                     no_color.resolve(StyleId::Semantic(Semantic::Heading(level))),
                     monochrome[idx],
                     "H{level}'s monochrome attributes in {variant:?}"
                 );
+                assert_eq!(
+                    heading_case(level),
+                    case[idx],
+                    "H{level}'s case transform"
+                );
             }
 
-            // ...and that the tiers pair the levels they claim to: 1-2, 3-4,
-            // 5-6, each pair sharing one color, each pair differing from the
-            // next. Uniqueness alone would allow H2 to sit in tier 2.
+            // ...and that every level now owns its own rung, rather than
+            // pairing up. The old ladder asserted 1-2, 3-4, 5-6 shared a
+            // color; the inverse is the invariant now.
             let fg = |level: u8| {
                 theme
                     .resolve(StyleId::Semantic(Semantic::Heading(level)))
                     .fg
-                    .expect("every heading level carries a tier color")
+                    .expect("every heading level carries a rung color")
             };
-            for pair_start in [1u8, 3, 5] {
-                assert_eq!(
-                    fg(pair_start),
-                    fg(pair_start + 1),
-                    "H{pair_start} and H{} must share a tier color in {variant:?}",
-                    pair_start + 1
+            for level in 2..=HEADING_LEVELS {
+                assert_ne!(
+                    fg(level - 1),
+                    fg(level),
+                    "H{} and H{level} must sit on different rungs in {variant:?}",
+                    level - 1
                 );
             }
-            assert_ne!(fg(2), fg(3), "tier 1 and tier 2 must differ in {variant:?}");
-            assert_ne!(fg(4), fg(5), "tier 2 and tier 3 must differ in {variant:?}");
         }
     }
 
-    /// The heading ramp reserves hue 0, so no ordinary role may resolve to a
-    /// color that reads as the same hue at a similar lightness. The specific
+    /// The H1 wash sits *behind* the title, so the contrast that matters is
+    /// title-against-band, not title-against-page. Those are different
+    /// numbers, and only one of them is what a reader has to read — a wash
+    /// nudged toward the text's own lightness would pass every other check in
+    /// this file while making the title harder to read than before it existed.
+    #[test]
+    fn test_the_h1_wash_never_costs_the_title_its_contrast() {
+        fn luminance(c: Color) -> f64 {
+            let ch = |v: u8| {
+                let v = f64::from(v) / 255.0;
+                if v <= 0.03928 {
+                    v / 12.92
+                } else {
+                    ((v + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * ch(c.r) + 0.7152 * ch(c.g) + 0.0722 * ch(c.b)
+        }
+        const AA_NORMAL_TEXT: f64 = 4.5;
+        for variant in [Variant::Dark, Variant::Light] {
+            // Both the truecolor values and the 256-color cells they snap to:
+            // a terminal in 256-color mode paints the cells, not the ideals.
+            for mode in [ColorMode::Truecolor, ColorMode::Downsample256] {
+                let theme = Theme::new(variant, mode);
+                let h1 = theme.resolve(StyleId::Semantic(Semantic::Heading(1)));
+                let (fg, bg) = (
+                    h1.fg.expect("H1 carries a rung color"),
+                    h1.bg.expect("H1 carries the wash"),
+                );
+                let (x, y) = (luminance(fg), luminance(bg));
+                let ratio = (x.max(y) + 0.05) / (x.min(y) + 0.05);
+                assert!(
+                    ratio >= AA_NORMAL_TEXT,
+                    "H1 title on its own wash is {ratio:.2}:1 in {variant:?}/{mode:?} — \
+                     under AA. The wash has to stay near the page, not drift toward the text."
+                );
+            }
+        }
+    }
+
+    /// The heading ramp reserves its hue, so no ordinary role may resolve to
+    /// a color that reads as the same hue at a similar lightness. The specific
     /// regression: with `build_palette`'s golden-angle loop starting at
     /// attempt 0, `CodeInline` inherited hue 0 and landed 11.5 rgb units from
     /// the tier-3 heading color on dark — indistinguishable, and inline code
     /// sits next to headings constantly. The threshold is the palette's own
     /// pre-existing dark-variant floor (18.4 between two non-heading roles),
-    /// rounded down; this asserts only the heading tiers against everything
+    /// rounded down; this asserts only the heading rungs against everything
     /// else, since tightening the whole palette is a separate question.
+    ///
+    /// This matters *more* now, not less. Heading rungs are allowed to
+    /// collide with each other after 256-downsampling, so `build_palette` no
+    /// longer asserts their distinctness — but their cells are still recorded
+    /// precisely so an ordinary role cannot take one, and this is what proves
+    /// the recording works in both variants.
     #[test]
     fn test_no_ordinary_role_lands_on_the_heading_family() {
         const MIN_RGB_DISTANCE: f64 = 15.0;
         for variant in [Variant::Dark, Variant::Light] {
             let palette = build_palette(variant);
-            for (tier, &heading) in palette.iter().take(HEADING_TIERS).enumerate() {
-                for (idx, &other) in palette.iter().enumerate().skip(HEADING_TIERS) {
+            for (rung, &heading) in palette.iter().take(HEADING_RUNGS).enumerate() {
+                for (idx, &other) in palette.iter().enumerate().skip(HEADING_RUNGS) {
                     let squared = |a: u8, b: u8| (f64::from(a) - f64::from(b)).powi(2);
                     let distance = (squared(heading.r, other.r)
                         + squared(heading.g, other.g)
@@ -1054,7 +1192,7 @@ mod tests {
                     assert!(
                         distance >= MIN_RGB_DISTANCE,
                         "role slot {idx} ({other:?}) is {distance:.1} rgb units from heading \
-                         tier {tier} ({heading:?}) in {variant:?} — they will read as the same color"
+                         rung {rung} ({heading:?}) in {variant:?} — they will read as the same color"
                     );
                 }
             }
@@ -1068,7 +1206,7 @@ mod tests {
     /// reference (`\x1b]11;rgb:1a1a/1b1b/2626`) and plain white, matching how
     /// [`variant_from_osc11_reply`] classifies each variant.
     #[test]
-    fn test_heading_tiers_clear_wcag_aa_against_the_reference_backgrounds() {
+    fn test_heading_rungs_clear_wcag_aa_against_the_reference_backgrounds() {
         fn relative_luminance(c: Color) -> f64 {
             let channel = |v: u8| {
                 let v = f64::from(v) / 255.0;
@@ -1098,7 +1236,7 @@ mod tests {
                     let fg = theme
                         .resolve(StyleId::Semantic(Semantic::Heading(level)))
                         .fg
-                        .expect("every heading level carries a tier color");
+                        .expect("every heading level carries a rung color");
                     let ratio = contrast(fg, background);
                     assert!(
                         ratio >= AA_NORMAL_TEXT,

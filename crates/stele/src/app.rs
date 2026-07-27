@@ -5553,9 +5553,13 @@ mod tests {
         let all: Vec<String> = (0..state.tree().line_count())
             .map(|i| line_text(&state, i))
             .collect();
+        // A heading line now carries a depth marker (`▌` per level) ahead of
+        // the text, and an H1 is padded to the full measure so its wash
+        // background reads as a band — so `# B` renders as `▌ B` plus trailing
+        // blanks.
         let b_line = all
             .iter()
-            .position(|t| t == "B")
+            .position(|t| t.trim_start_matches(['\u{258c}', ' ']).trim_end() == "B")
             .expect("B must be open and its own heading line visible");
         let notes_after_b = all[b_line..]
             .iter()

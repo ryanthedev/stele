@@ -12,7 +12,7 @@ use std::rc::Rc;
 use ast::{Document, Inline, InlineKind};
 use width::{WidthEngine, graphemes};
 
-use crate::{CellSize, IntrinsicSizer, LineItem, Reserved, Run, Semantic, StyleId};
+use crate::{CellSize, HeadingCase, IntrinsicSizer, LineItem, Reserved, Run, Semantic, StyleId};
 
 /// The clip indicator (code blocks, table rung 3, break-anywhere guard).
 pub(crate) const INDICATOR: &str = "\u{2026}"; // …
@@ -60,6 +60,92 @@ pub(crate) enum Atom {
     HardBreak,
     /// A sizer-sized media box (image or math), already at natural size.
     Box(ast::NodeId, CellSize, BoxFlow),
+}
+
+/// Small words that stay lowercase in title case unless they are the first
+/// or last word of the heading — the ordinary typographic rule, so
+/// "Installing the Toolchain" rather than "Installing The Toolchain".
+const TITLE_SMALL_WORDS: &[&str] = &[
+    "a", "an", "the", "and", "but", "or", "nor", "for", "so", "yet", "at", "by", "in", "of", "on",
+    "to", "up", "via", "as", "is", "it", "with", "from", "into", "over",
+];
+
+/// Rewrite heading atoms to the case their level renders in.
+///
+/// This runs **before** [`wrap`], so widths are measured on the text that
+/// actually gets painted. It has to: `ß`.to_uppercase() is `SS`, so casing
+/// after measurement would let a heading overrun the measure it was wrapped
+/// to.
+///
+/// Casing here rather than at paint time is what keeps search honest. Search
+/// scans the rendered line text (`append_line_text` over the layout tree), so
+/// if the painter did the casing, a reader looking at `SUPPORTED PLATFORMS`
+/// could not search for it — they would have to guess the author's original
+/// capitalisation. The outline and the TOC are unaffected either way: those
+/// come from `heading_text` over the AST, which never passes through here, so
+/// the sidebar keeps the author's own words.
+pub(crate) fn recase(atoms: &mut [Atom], case: HeadingCase) {
+    if case == HeadingCase::AsWritten {
+        return;
+    }
+    let word_positions: Vec<usize> = atoms
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| matches!(a, Atom::Word(_)))
+        .map(|(i, _)| i)
+        .collect();
+    let (first, last) = match (word_positions.first(), word_positions.last()) {
+        (Some(&f), Some(&l)) => (f, l),
+        _ => return,
+    };
+    for idx in word_positions {
+        let Some(Atom::Word(frags)) = atoms.get_mut(idx) else {
+            continue;
+        };
+        match case {
+            HeadingCase::AsWritten => {}
+            HeadingCase::Upper => {
+                for frag in frags.iter_mut() {
+                    frag.text = frag.text.to_uppercase();
+                }
+            }
+            HeadingCase::Title => {
+                // A word is split across fragments when a style changes mid
+                // word, so "capitalise the first letter" means the first
+                // letter of the *word*, not of each fragment.
+                let whole: String = frags.iter().map(|f| f.text.as_str()).collect();
+                let small = TITLE_SMALL_WORDS
+                    .iter()
+                    .any(|w| whole.trim_matches(|c: char| !c.is_alphanumeric()).eq_ignore_ascii_case(w));
+                let keep_lower = small && idx != first && idx != last;
+                let mut seen_alpha = false;
+                for frag in frags.iter_mut() {
+                    frag.text = recase_word(&frag.text, keep_lower, &mut seen_alpha);
+                }
+            }
+        }
+    }
+}
+
+/// One fragment of a title-cased word. `seen_alpha` carries across fragments
+/// so only the word's genuine first letter is capitalised.
+fn recase_word(text: &str, keep_lower: bool, seen_alpha: &mut bool) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch.is_alphabetic() && !*seen_alpha {
+            *seen_alpha = true;
+            if keep_lower {
+                out.extend(ch.to_lowercase());
+            } else {
+                out.extend(ch.to_uppercase());
+            }
+        } else if ch.is_alphabetic() {
+            out.extend(ch.to_lowercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 /// One wrapped output line, or a standalone media box that claims its own
