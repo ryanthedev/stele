@@ -179,3 +179,67 @@ fn test_theming_a_heading_moves_its_markers_on_the_wire() {
         "the heading's marker did not follow its title into the theme colour: {wire:?}"
     );
 }
+
+/// Where a theme stops: syntax highlighting.
+///
+/// A fenced block with a known language is re-tagged into `StyleId::Capture`
+/// runs by the highlighter, and `Theme::resolve` sends those to
+/// `resolve_capture`, which never consults the overlay. So `code_block` only
+/// reaches code the highlighter did *not* claim. This pins that boundary so a
+/// future change cannot quietly move it either way.
+#[test]
+fn test_a_theme_colours_unhighlighted_code_but_not_syntax_captures() {
+    let dir = scratch("captures");
+    let path = write_theme(
+        &dir,
+        "appearance = \"dark\"\n\n[colors]\ncode_block = \"#ff00ff\"\ncode_inline = \"#00ff00\"\n",
+    );
+    let source = ThemeSource::load(Some(&path), None, Variant::Dark, ColorMode::Truecolor)
+        .expect("theme loads");
+
+    let doc = Document::parse(
+        "Prose with `a span`.\n\n```rust\nfn main() { let x = 1; }\n```\n\n```\nno language here\n```\n",
+    );
+    let engine = engine();
+    let config = LayoutConfig {
+        min_width: 24,
+        max_width: 80,
+    };
+    let tree = layout(&doc, 80, &config, &engine, &NullSizer);
+    let mut painter = Painter::new(engine);
+    painter.register_decor(Box::new(ThemedDecor::new(source.theme())));
+    let mut frame = Vec::new();
+    painter
+        .frame(
+            &tree,
+            0,
+            Size {
+                width: 80,
+                height: 20,
+            },
+            &mut frame,
+        )
+        .expect("paint");
+    let wire = String::from_utf8_lossy(&frame).into_owned();
+
+    assert!(
+        wire.contains("38;2;0;255;0"),
+        "an inline code span is a Semantic role and must take the theme: {wire:?}"
+    );
+    assert!(
+        wire.contains("38;2;255;0;255"),
+        "a fenced block with no language stays Semantic::CodeBlock and must \
+         take the theme: {wire:?}"
+    );
+    // The Rust block's `fn` is a Keyword capture. It must NOT be the themed
+    // code_block colour — it comes from the generated palette.
+    let keyword_at = wire.find("fn").expect("the rust block is painted");
+    let before = &wire[..keyword_at];
+    let last_fg = before.rfind("38;2;").expect("the keyword carries a colour");
+    assert!(
+        !before[last_fg..].starts_with("38;2;255;0;255"),
+        "a syntax capture took the theme's code_block colour — captures are \
+         not themeable: {:?}",
+        &before[last_fg..]
+    );
+}
