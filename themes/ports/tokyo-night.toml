@@ -1,0 +1,94 @@
+# Tokyo Night — a port of folke/tokyonight.nvim (Night variant).
+#
+# Neon over deep navy. Worth knowing: stele's own dark reference background
+# is #1a1b26, which *is* Tokyo Night's — so this port's contrast numbers are
+# the ones its author intended rather than an approximation.
+#
+# Every colour below is a value published by the upstream theme, with two
+# exceptions, both forced by things stele has and an editor does not:
+#
+#   - The six heading rungs are interpolated between two of the theme's own
+#     colours. No editor theme defines a six-level markdown ramp, and a
+#     rainbow of six unrelated accents would break the one thing the ramp is
+#     for — saying "these are all headings" while the marker count says how
+#     deep. See docs/theming.md.
+#   - Where the upstream palette offers one tier and stele wants two, the
+#     second is derived from the first and said so above.
+#
+# Contrast is measured against stele's reference background rather than the
+# upstream theme's own, because stele does not set your terminal background.
+#
+# This port is faithful rather than corrected, so it inherits the roles
+# upstream ships below WCAG AA. stele will say so in the status line every
+# time you load it. Brightening them would make this a theme that merely
+# resembles Tokyo Night rather than one that is it. The roles are
+# listed below so you can edit them if you would rather have the contrast.
+#
+# under-aa: footnote_label, front_matter, html, image_alt, strikethrough, syntax.comment, syntax.comment_doc
+name = "Tokyo Night"
+appearance = "dark"
+
+[colors]
+text = "#c0caf5"
+emphasis = "#a9b1d6"
+strong = "#c0caf5"
+strikethrough = "#565f89"
+heading1 = "#7aa2f7"
+heading2 = "#819af1"
+heading3 = "#8893eb"
+heading4 = "#8f8be4"
+heading5 = "#9684de"
+heading6 = "#9d7cd8"
+code_inline = "#7dcfff"
+code_block = "#a9b1d6"
+link = "#2ac3de"
+image_alt = "#737aa2"
+math = "#bb9af7"
+list_marker = "#ff9e64"
+task_marker = "#b9f27c"
+blockquote = "#737aa2"
+alert_note = "#2ac3de"
+alert_tip = "#b9f27c"
+alert_important = "#c8a9ff"
+alert_warning = "#ffc777"
+alert_caution = "#ff7a93"
+rule = "#737aa2"
+table_border = "#737aa2"
+table_header = "#e0af68"
+footnote_ref = "#7dcfff"
+footnote_label = "#737aa2"
+html = "#737aa2"
+front_matter = "#737aa2"
+overflow = "#737aa2"
+search_match = "#ffc777"
+search_current = "#ffb489"
+
+# Naming any of these hands the theme the whole code block — see
+# docs/theming.md. Mapped the way the upstream theme maps its own
+# TextMate and tree-sitter scopes.
+[syntax]
+plain = "#c0caf5"
+comment = "#565f89"
+comment_doc = "#737aa2"
+punctuation = "#a9b1d6"
+operator = "#ff9e64"
+keyword = "#f7768e"
+keyword_control = "#ff7a93"
+label = "#f7768e"
+attribute = "#7dcfff"
+function = "#b9f27c"
+function_macro = "#89ddff"
+type = "#e0af68"
+type_builtin = "#ffc777"
+constructor = "#e0af68"
+namespace = "#7aa2f7"
+tag = "#2ac3de"
+property = "#7aa2f7"
+string = "#9ece6a"
+string_escape = "#ffb489"
+number = "#bb9af7"
+boolean = "#c8a9ff"
+constant = "#bb9af7"
+variable = "#c0caf5"
+variable_builtin = "#c8a9ff"
+error = "#ff7a93"

@@ -1,0 +1,94 @@
+# Nord — a port of arcticicestudio/nord.
+#
+# An arctic, north-bluish palette. Deliberately low-contrast and
+# low-saturation — the quietest of these ports, and the closest in
+# temperament to stele's own Lichen.
+#
+# Every colour below is a value published by the upstream theme, with two
+# exceptions, both forced by things stele has and an editor does not:
+#
+#   - The six heading rungs are interpolated between two of the theme's own
+#     colours. No editor theme defines a six-level markdown ramp, and a
+#     rainbow of six unrelated accents would break the one thing the ramp is
+#     for — saying "these are all headings" while the marker count says how
+#     deep. See docs/theming.md.
+#   - Where the upstream palette offers one tier and stele wants two, the
+#     second is derived from the first and said so above.
+#
+# Contrast is measured against stele's reference background rather than the
+# upstream theme's own, because stele does not set your terminal background.
+#
+# This port is faithful rather than corrected, so it inherits the roles
+# upstream ships below WCAG AA. stele will say so in the status line every
+# time you load it. Brightening them would make this a theme that merely
+# resembles Nord rather than one that is it. The roles are
+# listed below so you can edit them if you would rather have the contrast.
+#
+# under-aa: syntax.keyword, syntax.label
+name = "Nord"
+appearance = "dark"
+
+[colors]
+text = "#d8dee9"
+emphasis = "#e5e9f0"
+strong = "#eceff4"
+strikethrough = "#7b88a1"
+heading1 = "#88c0d0"
+heading2 = "#87bacd"
+heading3 = "#85b4ca"
+heading4 = "#84adc7"
+heading5 = "#82a7c4"
+heading6 = "#81a1c1"
+code_inline = "#8fbcbb"
+code_block = "#e5e9f0"
+link = "#88c0d0"
+image_alt = "#8f9ab5"
+math = "#b48ead"
+list_marker = "#d08770"
+task_marker = "#b5cf9f"
+blockquote = "#8f9ab5"
+alert_note = "#88c0d0"
+alert_tip = "#b5cf9f"
+alert_important = "#c8a5c1"
+alert_warning = "#f0d9a8"
+alert_caution = "#d08770"
+rule = "#8f9ab5"
+table_border = "#8f9ab5"
+table_header = "#ebcb8b"
+footnote_ref = "#8fbcbb"
+footnote_label = "#8f9ab5"
+html = "#8f9ab5"
+front_matter = "#8f9ab5"
+overflow = "#8f9ab5"
+search_match = "#f0d9a8"
+search_current = "#e0a08c"
+
+# Naming any of these hands the theme the whole code block — see
+# docs/theming.md. Mapped the way the upstream theme maps its own
+# TextMate and tree-sitter scopes.
+[syntax]
+plain = "#d8dee9"
+comment = "#7b88a1"
+comment_doc = "#8f9ab5"
+punctuation = "#e5e9f0"
+operator = "#d08770"
+keyword = "#bf616a"
+keyword_control = "#d08770"
+label = "#bf616a"
+attribute = "#8fbcbb"
+function = "#b5cf9f"
+function_macro = "#a3cdcc"
+type = "#ebcb8b"
+type_builtin = "#f0d9a8"
+constructor = "#ebcb8b"
+namespace = "#81a1c1"
+tag = "#88c0d0"
+property = "#81a1c1"
+string = "#a3be8c"
+string_escape = "#e0a08c"
+number = "#b48ead"
+boolean = "#c8a5c1"
+constant = "#b48ead"
+variable = "#d8dee9"
+variable_builtin = "#c8a5c1"
+error = "#d08770"

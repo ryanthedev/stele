@@ -1,0 +1,90 @@
+# Catppuccin Mocha — a port of catppuccin/catppuccin (Mocha flavour).
+#
+# Pastel on a soft charcoal base. Every accent is deliberately held at a
+# similar lightness, which is why its code blocks read as calm even with
+# twelve hues in play.
+#
+# Every colour below is a value published by the upstream theme, with two
+# exceptions, both forced by things stele has and an editor does not:
+#
+#   - The six heading rungs are interpolated between two of the theme's own
+#     colours. No editor theme defines a six-level markdown ramp, and a
+#     rainbow of six unrelated accents would break the one thing the ramp is
+#     for — saying "these are all headings" while the marker count says how
+#     deep. See docs/theming.md.
+#   - Where the upstream palette offers one tier and stele wants two, the
+#     second is derived from the first and said so above.
+#
+# Contrast is measured against stele's reference background rather than the
+# upstream theme's own, because stele does not set your terminal background.
+#
+# Every role here clears WCAG AA against that reference.
+#
+# under-aa:
+name = "Catppuccin Mocha"
+appearance = "dark"
+
+[colors]
+text = "#cdd6f4"
+emphasis = "#bac2de"
+strong = "#f5e0dc"
+strikethrough = "#7f849c"
+heading1 = "#cba6f7"
+heading2 = "#bea9f8"
+heading3 = "#b1acf8"
+heading4 = "#a3aef9"
+heading5 = "#96b1f9"
+heading6 = "#89b4fa"
+code_inline = "#94e2d5"
+code_block = "#bac2de"
+link = "#74c7ec"
+image_alt = "#9399b2"
+math = "#cba6f7"
+list_marker = "#fab387"
+task_marker = "#94e2d5"
+blockquote = "#9399b2"
+alert_note = "#74c7ec"
+alert_tip = "#94e2d5"
+alert_important = "#b4befe"
+alert_warning = "#fab387"
+alert_caution = "#eba0ac"
+rule = "#9399b2"
+table_border = "#9399b2"
+table_header = "#f9e2af"
+footnote_ref = "#94e2d5"
+footnote_label = "#9399b2"
+html = "#9399b2"
+front_matter = "#9399b2"
+overflow = "#9399b2"
+search_match = "#fab387"
+search_current = "#f5c2e7"
+
+# Naming any of these hands the theme the whole code block — see
+# docs/theming.md. Mapped the way the upstream theme maps its own
+# TextMate and tree-sitter scopes.
+[syntax]
+plain = "#cdd6f4"
+comment = "#7f849c"
+comment_doc = "#9399b2"
+punctuation = "#bac2de"
+operator = "#fab387"
+keyword = "#f38ba8"
+keyword_control = "#eba0ac"
+label = "#f38ba8"
+attribute = "#94e2d5"
+function = "#94e2d5"
+function_macro = "#89dceb"
+type = "#f9e2af"
+type_builtin = "#fab387"
+constructor = "#f9e2af"
+namespace = "#89b4fa"
+tag = "#74c7ec"
+property = "#89b4fa"
+string = "#a6e3a1"
+string_escape = "#f5c2e7"
+number = "#cba6f7"
+boolean = "#b4befe"
+constant = "#cba6f7"
+variable = "#cdd6f4"
+variable_builtin = "#b4befe"
+error = "#eba0ac"

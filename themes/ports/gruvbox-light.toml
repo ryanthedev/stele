@@ -1,0 +1,95 @@
+# Gruvbox Light — a port of morhetz/gruvbox.
+#
+# The same retro groove inverted for paper. Gruvbox's `faded_*` accents do
+# the work here — the `neutral_*` set is tuned for a dark page and washes
+# out on a white one, which is why `*_bright` below is a darkened faded
+# rather than a neutral: on paper, louder means closer to the ink.
+#
+# Every colour below is a value published by the upstream theme, with two
+# exceptions, both forced by things stele has and an editor does not:
+#
+#   - The six heading rungs are interpolated between two of the theme's own
+#     colours. No editor theme defines a six-level markdown ramp, and a
+#     rainbow of six unrelated accents would break the one thing the ramp is
+#     for — saying "these are all headings" while the marker count says how
+#     deep. See docs/theming.md.
+#   - Where the upstream palette offers one tier and stele wants two, the
+#     second is derived from the first and said so above.
+#
+# Contrast is measured against stele's reference background rather than the
+# upstream theme's own, because stele does not set your terminal background.
+#
+# This port is faithful rather than corrected, so it inherits the roles
+# upstream ships below WCAG AA. stele will say so in the status line every
+# time you load it. Brightening them would make this a theme that merely
+# resembles Gruvbox Light rather than one that is it. The roles are
+# listed below so you can edit them if you would rather have the contrast.
+#
+# under-aa: syntax.constructor, syntax.type, table_header
+name = "Gruvbox Light"
+appearance = "light"
+
+[colors]
+text = "#3c3836"
+emphasis = "#504945"
+strong = "#282828"
+strikethrough = "#7c6f64"
+heading1 = "#af3a03"
+heading2 = "#ab2e04"
+heading3 = "#a82304"
+heading4 = "#a41705"
+heading5 = "#a10c05"
+heading6 = "#9d0006"
+code_inline = "#427b58"
+code_block = "#504945"
+link = "#065766"
+image_alt = "#665c54"
+math = "#8f3f71"
+list_marker = "#af3a03"
+task_marker = "#67630c"
+blockquote = "#665c54"
+alert_note = "#065766"
+alert_tip = "#67630c"
+alert_important = "#7a3660"
+alert_warning = "#88580f"
+alert_caution = "#850005"
+rule = "#665c54"
+table_border = "#665c54"
+table_header = "#b57614"
+footnote_ref = "#427b58"
+footnote_label = "#665c54"
+html = "#665c54"
+front_matter = "#665c54"
+overflow = "#665c54"
+search_match = "#88580f"
+search_current = "#953103"
+
+# Naming any of these hands the theme the whole code block — see
+# docs/theming.md. Mapped the way the upstream theme maps its own
+# TextMate and tree-sitter scopes.
+[syntax]
+plain = "#3c3836"
+comment = "#7c6f64"
+comment_doc = "#665c54"
+punctuation = "#504945"
+operator = "#af3a03"
+keyword = "#9d0006"
+keyword_control = "#850005"
+label = "#9d0006"
+attribute = "#427b58"
+function = "#67630c"
+function_macro = "#38694b"
+type = "#b57614"
+type_builtin = "#88580f"
+constructor = "#b57614"
+namespace = "#076678"
+tag = "#065766"
+property = "#076678"
+string = "#79740e"
+string_escape = "#953103"
+number = "#8f3f71"
+boolean = "#7a3660"
+constant = "#8f3f71"
+variable = "#3c3836"
+variable_builtin = "#7a3660"
+error = "#850005"

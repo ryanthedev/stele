@@ -210,3 +210,44 @@ Where it does matter, the warning names the pair so you can decide.
 | `lichen.toml` | dark | Quiet, low-saturation green-grey. Headings separate by lightness alone. |
 
 Copy one and edit it — they are the fastest way to see what every role does.
+
+## Ports of editor themes
+
+`themes/ports/` holds faithful ports of palettes you probably already run in
+your editor:
+
+| | Appearance | Upstream |
+|---|---|---|
+| `gruvbox-dark.toml` | dark | `morhetz/gruvbox` |
+| `gruvbox-light.toml` | light | `morhetz/gruvbox` |
+| `nord.toml` | dark | `arcticicestudio/nord` |
+| `dracula.toml` | dark | `dracula/dracula-theme` |
+| `catppuccin-mocha.toml` | dark | `catppuccin/catppuccin` |
+| `tokyo-night.toml` | dark | `folke/tokyonight.nvim` |
+
+```
+stele --theme themes/ports/gruvbox-dark.toml notes.md
+```
+
+Two things are worth knowing before you use one.
+
+**They set colours, not a background.** stele paints foregrounds onto whatever
+your terminal already is. A port looks like its editor when your terminal is
+already set to that theme's background, and looks like that theme's colours on
+your own background otherwise. Tokyo Night is the exception and a coincidence:
+stele's dark reference background is `#1a1b26`, which *is* Tokyo Night's.
+
+**They are faithful, which means they inherit their flaws.** Several of these
+themes ship colours below WCAG AA — Dracula's comment blue, Nord's red, Tokyo
+Night's comment grey, Gruvbox's faded yellow — on their own backgrounds as much
+as on stele's. The ports keep them, so stele will warn you in the status line
+every time you load one. Each file lists its own offenders in an `under-aa:`
+header line, and a test holds that line to what the lint actually finds, so a
+port cannot go illegible quietly. If you would rather have the contrast than the
+fidelity, those lines are the ones to edit.
+
+The three themes in `themes/` proper are held to the stricter bar: they must be
+legible, and a test enforces it.
+
+`themes/ports/generate.py` is what produced them, if you want to add another —
+the palette-to-role mapping is the only part worth writing by hand.

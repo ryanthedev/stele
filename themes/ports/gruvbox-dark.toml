@@ -1,0 +1,89 @@
+# Gruvbox Dark — a port of morhetz/gruvbox.
+#
+# Retro groove: warm, low-blue, high-contrast. The most-ported terminal
+# palette there is, and the one that reads best on a warm-white terminal.
+#
+# Every colour below is a value published by the upstream theme, with two
+# exceptions, both forced by things stele has and an editor does not:
+#
+#   - The six heading rungs are interpolated between two of the theme's own
+#     colours. No editor theme defines a six-level markdown ramp, and a
+#     rainbow of six unrelated accents would break the one thing the ramp is
+#     for — saying "these are all headings" while the marker count says how
+#     deep. See docs/theming.md.
+#   - Where the upstream palette offers one tier and stele wants two, the
+#     second is derived from the first and said so above.
+#
+# Contrast is measured against stele's reference background rather than the
+# upstream theme's own, because stele does not set your terminal background.
+#
+# Every role here clears WCAG AA against that reference.
+#
+# under-aa:
+name = "Gruvbox Dark"
+appearance = "dark"
+
+[colors]
+text = "#ebdbb2"
+emphasis = "#d5c4a1"
+strong = "#fbf1c7"
+strikethrough = "#928374"
+heading1 = "#fe8019"
+heading2 = "#fd8c1d"
+heading3 = "#fc9822"
+heading4 = "#fca526"
+heading5 = "#fbb12b"
+heading6 = "#fabd2f"
+code_inline = "#8ec07c"
+code_block = "#d5c4a1"
+link = "#83a598"
+image_alt = "#a89984"
+math = "#d3869b"
+list_marker = "#fe8019"
+task_marker = "#b8bb26"
+blockquote = "#a89984"
+alert_note = "#83a598"
+alert_tip = "#b8bb26"
+alert_important = "#d3869b"
+alert_warning = "#fabd2f"
+alert_caution = "#fb4934"
+rule = "#a89984"
+table_border = "#a89984"
+table_header = "#fabd2f"
+footnote_ref = "#8ec07c"
+footnote_label = "#a89984"
+html = "#a89984"
+front_matter = "#a89984"
+overflow = "#a89984"
+search_match = "#fabd2f"
+search_current = "#fe8019"
+
+# Naming any of these hands the theme the whole code block — see
+# docs/theming.md. Mapped the way the upstream theme maps its own
+# TextMate and tree-sitter scopes.
+[syntax]
+plain = "#ebdbb2"
+comment = "#928374"
+comment_doc = "#a89984"
+punctuation = "#d5c4a1"
+operator = "#fe8019"
+keyword = "#fb4934"
+keyword_control = "#fb4934"
+label = "#fb4934"
+attribute = "#8ec07c"
+function = "#b8bb26"
+function_macro = "#8ec07c"
+type = "#fabd2f"
+type_builtin = "#fabd2f"
+constructor = "#fabd2f"
+namespace = "#83a598"
+tag = "#83a598"
+property = "#83a598"
+string = "#b8bb26"
+string_escape = "#fe8019"
+number = "#d3869b"
+boolean = "#d3869b"
+constant = "#d3869b"
+variable = "#ebdbb2"
+variable_builtin = "#d3869b"
+error = "#fb4934"

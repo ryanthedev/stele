@@ -1,0 +1,93 @@
+# Dracula — a port of dracula/dracula-theme.
+#
+# High-saturation neon on near-black. The loudest of these ports, and the
+# one that most rewards a truecolor terminal.
+#
+# Every colour below is a value published by the upstream theme, with two
+# exceptions, both forced by things stele has and an editor does not:
+#
+#   - The six heading rungs are interpolated between two of the theme's own
+#     colours. No editor theme defines a six-level markdown ramp, and a
+#     rainbow of six unrelated accents would break the one thing the ramp is
+#     for — saying "these are all headings" while the marker count says how
+#     deep. See docs/theming.md.
+#   - Where the upstream palette offers one tier and stele wants two, the
+#     second is derived from the first and said so above.
+#
+# Contrast is measured against stele's reference background rather than the
+# upstream theme's own, because stele does not set your terminal background.
+#
+# This port is faithful rather than corrected, so it inherits the roles
+# upstream ships below WCAG AA. stele will say so in the status line every
+# time you load it. Brightening them would make this a theme that merely
+# resembles Dracula rather than one that is it. The roles are
+# listed below so you can edit them if you would rather have the contrast.
+#
+# under-aa: strikethrough, syntax.comment
+name = "Dracula"
+appearance = "dark"
+
+[colors]
+text = "#f8f8f2"
+emphasis = "#c5c5c0"
+strong = "#ffffff"
+strikethrough = "#6272a4"
+heading1 = "#bd93f9"
+heading2 = "#ca8eef"
+heading3 = "#d789e5"
+heading4 = "#e583da"
+heading5 = "#f27ed0"
+heading6 = "#ff79c6"
+code_inline = "#ff79c6"
+code_block = "#c5c5c0"
+link = "#8be9fd"
+image_alt = "#8b9ac4"
+math = "#bd93f9"
+list_marker = "#ffb86c"
+task_marker = "#69ff96"
+blockquote = "#8b9ac4"
+alert_note = "#a4eeff"
+alert_tip = "#69ff96"
+alert_important = "#d6b3ff"
+alert_warning = "#f4fbaa"
+alert_caution = "#ff6e6e"
+rule = "#8b9ac4"
+table_border = "#8b9ac4"
+table_header = "#f1fa8c"
+footnote_ref = "#8be9fd"
+footnote_label = "#8b9ac4"
+html = "#8b9ac4"
+front_matter = "#8b9ac4"
+overflow = "#8b9ac4"
+search_match = "#f4fbaa"
+search_current = "#ffc98c"
+
+# Naming any of these hands the theme the whole code block — see
+# docs/theming.md. Mapped the way the upstream theme maps its own
+# TextMate and tree-sitter scopes.
+[syntax]
+plain = "#f8f8f2"
+comment = "#6272a4"
+comment_doc = "#8b9ac4"
+punctuation = "#c5c5c0"
+operator = "#ffb86c"
+keyword = "#ff79c6"
+keyword_control = "#ff92d0"
+label = "#ff79c6"
+attribute = "#8be9fd"
+function = "#50fa7b"
+function_macro = "#a4eeff"
+type = "#8be9fd"
+type_builtin = "#8be9fd"
+constructor = "#f1fa8c"
+namespace = "#8be9fd"
+tag = "#a4eeff"
+property = "#8be9fd"
+string = "#50fa7b"
+string_escape = "#ffc98c"
+number = "#bd93f9"
+boolean = "#d6b3ff"
+constant = "#bd93f9"
+variable = "#f8f8f2"
+variable_builtin = "#d6b3ff"
+error = "#ff6e6e"
