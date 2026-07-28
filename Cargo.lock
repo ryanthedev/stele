@@ -688,6 +688,7 @@ dependencies = [
  "ast",
  "layout",
  "lumis",
+ "toml",
 ]
 
 [[package]]

@@ -323,10 +323,9 @@ impl<'a> Ctx<'a> {
         for (i, &rung) in rungs.iter().enumerate() {
             // Cumulative division rather than `width / bands` per band, so
             // rounding loss cannot leave the rule short of the measure.
-            let upto = u16::try_from(
-                (u32::from(i as u16 + 1) * u32::from(width)) / u32::from(bands),
-            )
-            .unwrap_or(width);
+            let upto =
+                u16::try_from((u32::from(i as u16 + 1) * u32::from(width)) / u32::from(bands))
+                    .unwrap_or(width);
             let cells = upto.saturating_sub(filled);
             filled = upto;
             if cells == 0 {

@@ -114,9 +114,11 @@ pub(crate) fn recase(atoms: &mut [Atom], case: HeadingCase) {
                 // word, so "capitalise the first letter" means the first
                 // letter of the *word*, not of each fragment.
                 let whole: String = frags.iter().map(|f| f.text.as_str()).collect();
-                let small = TITLE_SMALL_WORDS
-                    .iter()
-                    .any(|w| whole.trim_matches(|c: char| !c.is_alphanumeric()).eq_ignore_ascii_case(w));
+                let small = TITLE_SMALL_WORDS.iter().any(|w| {
+                    whole
+                        .trim_matches(|c: char| !c.is_alphanumeric())
+                        .eq_ignore_ascii_case(w)
+                });
                 let keep_lower = small && idx != first && idx != last;
                 let mut seen_alpha = false;
                 for frag in frags.iter_mut() {

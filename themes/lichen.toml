@@ -1,0 +1,67 @@
+# Lichen — dark, low-saturation, green-grey. Deliberately the quietest of the
+# three: nothing shouts, and headings separate by lightness rather than hue.
+# For long documents where the built-in cyan starts to feel loud.
+#
+# A nearly monochrome heading ramp works here, and only works at all, because
+# heading depth is carried by the *count* of block markers rather than by
+# colour. Rungs that sit close together cost a reader nothing they need.
+name = "Lichen"
+appearance = "dark"
+
+
+# Every role stele can colour is set below, so this file doubles as the
+# reference for what a theme may name. Delete any line to inherit the
+# built-in dark colour for that role instead.
+#
+# Some roles here merge into one another in a 256-colour terminal, and
+# `stele --theme` will say which.
+# That is expected and not a defect: the xterm cube offers 6 steps per
+# channel, so a palette coherent enough to look like one theme cannot also
+# be 33-ways distinct once quantized. Truecolor terminals — which is what
+# stele targets — show every colour here exactly as written.
+
+[colors]
+text = "#bdc7ba"
+emphasis = "#acb7a8"
+strong = "#d5dfd2"
+strikethrough = "#808b7c"
+
+heading1 = "#c9d7c5"
+heading2 = "#bacbb5"
+heading3 = "#acbda6"
+heading4 = "#9caf96"
+heading5 = "#8ea088"
+heading6 = "#7f9079"
+
+code_inline = "#8eb98e"
+code_block = "#b5c0b1"
+
+link = "#73b1a1"
+image_alt = "#8a9683"
+math = "#929dbc"
+
+list_marker = "#869d7e"
+task_marker = "#90c490"
+blockquote = "#667063"
+
+# The one place saturation is allowed. An alert that blended in would not be
+# an alert — the theme's quietness yielding to the thing it would hide.
+alert_note = "#78a7c8"
+alert_tip = "#78c269"
+alert_important = "#b189c5"
+alert_warning = "#d2bd7e"
+alert_caution = "#c77c69"
+
+# Furniture, at WCAG 1.4.11's 3:1 rather than the 4.5:1 asked of words.
+rule = "#5e6a5b"
+table_border = "#6e7b6a"
+table_header = "#dfe8dc"
+
+footnote_ref = "#81b2a6"
+footnote_label = "#9ca597"
+html = "#7e887b"
+front_matter = "#949c91"
+overflow = "#677660"
+
+search_match = "#ddcb93"
+search_current = "#50b43c"

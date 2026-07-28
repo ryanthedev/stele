@@ -55,6 +55,15 @@ pub struct Cli {
     /// `main.rs` passes this to `decor::frontmatter::apply` before the parse.
     #[arg(long)]
     pub frontmatter: bool,
+
+    /// Uses the theme in this file instead of the built-in colors, and
+    /// instead of `~/.config/stele/theme.toml` if one is there.
+    ///
+    /// Unlike the config path, a file named here must exist and load: you
+    /// asked for these colors specifically, so being quietly given different
+    /// ones would be the wrong kindness. See `crate::theme_source`.
+    #[arg(long, value_name = "FILE")]
+    pub theme: Option<PathBuf>,
 }
 
 /// A combination of flags that parse individually but cannot mean anything

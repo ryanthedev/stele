@@ -27,6 +27,7 @@ use stele::painter::{FrameOverlays, Painter, Size};
 use stele::terminal::{
     CellQuery, PanicGuardedWriter, TerminalGuard, install_panic_hook, osc52_copy,
 };
+use stele::theme_source::ThemeSource;
 
 /// How long a resize burst is drained for before committing to one
 /// relayout — long enough to coalesce a storm of SIGWINCH-driven `Resize`
@@ -81,6 +82,23 @@ fn main() -> ExitCode {
     };
     let options = LoadOptions {
         show_frontmatter: cli.frontmatter,
+    };
+
+    // Resolved here, alongside `--watch -` and before the terminal is touched,
+    // for the same reason: a `--theme` path that does not load should fail on
+    // a plain terminal with a readable message, not after an alt-screen
+    // switch that wipes it.
+    let mut theme = match ThemeSource::load(
+        cli.theme.as_deref(),
+        stele::theme_source::default_config_path().as_deref(),
+        highlight::Variant::Dark,
+        highlight::ColorMode::from_env(),
+    ) {
+        Ok(theme) => theme,
+        Err(err) => {
+            eprintln!("stele: {err}");
+            return ExitCode::FAILURE;
+        }
     };
 
     // Load and validate *before* touching the terminal at all: a bad path
@@ -200,18 +218,18 @@ fn main() -> ExitCode {
     }
     // The themed decor provides real syntax highlighting and theme colors.
     // Background is not OSC 11-probed here (that needs a pre-alt-screen query
-    // round-trip); the fallback is the dark variant, and `T` (DW-1.5) flips
-    // between it and light from here on. Kept as an explicit `ThemeState`
-    // rather than `ThemedDecor::detect(None)` (equivalent for this initial
-    // frame) so `run_session` has the variant/color-mode pair to flip.
-    let mut theme = ThemeState {
-        variant: highlight::Variant::Dark,
-        color_mode: highlight::ColorMode::from_env(),
-    };
-    painter.register_decor(Box::new(ThemedDecor::new(highlight::Theme::new(
-        theme.variant,
-        theme.color_mode,
-    ))));
+    // round-trip); the fallback is the dark variant, which a theme file's own
+    // `appearance` overrides. `T` (DW-1.5) flips from here on — see
+    // `ThemeSource::toggle` for what it means once a user theme is loaded.
+    painter.register_decor(Box::new(ThemedDecor::new(theme.theme())));
+
+    // A theme's complaints reach the reader the same way every other
+    // transient does. Loading already succeeded by here — these are the
+    // things that were wrong but survivable, and saying nothing about them
+    // would leave a mistyped role looking like a stele bug.
+    if let Some(summary) = theme.status_summary() {
+        state.set_status(StatusMessage::new(summary));
+    }
 
     // stdout, wrapped for two reasons (DW-1.6): `BufWriter` so a frame's many
     // small writes cost one syscall instead of dozens, and
@@ -251,14 +269,6 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
-}
-
-/// The running theme toggle state (DW-1.5): which built-in variant is
-/// active, and the color mode resolved once at startup (`NO_COLOR`,
-/// truecolor vs. 256-color) that stays fixed across a `T` press.
-struct ThemeState {
-    variant: highlight::Variant,
-    color_mode: highlight::ColorMode,
 }
 
 /// Everything a relayout needs that outlives one document, plus what
@@ -553,7 +563,7 @@ fn run_session(
     session: &mut Session,
     state: &mut AppState,
     painter: &mut Painter,
-    theme: &mut ThemeState,
+    theme: &mut ThemeSource,
     guard: &mut TerminalGuard,
     out: &mut dyn Write,
 ) -> io::Result<()> {
@@ -756,7 +766,7 @@ fn handle_chrome_key(
     session: &Session,
     state: &mut AppState,
     painter: &mut Painter,
-    theme: &mut ThemeState,
+    theme: &mut ThemeSource,
 ) -> bool {
     let Some(action) = state.chrome_action(key) else {
         return false;
@@ -766,11 +776,8 @@ fn handle_chrome_key(
         ChromeAction::Widen => state.widen(&ctx),
         ChromeAction::Narrow => state.narrow(&ctx),
         ChromeAction::ToggleTheme => {
-            theme.variant = toggled_variant(theme.variant);
-            painter.register_decor(Box::new(ThemedDecor::new(highlight::Theme::new(
-                theme.variant,
-                theme.color_mode,
-            ))));
+            theme.toggle();
+            painter.register_decor(Box::new(ThemedDecor::new(theme.theme())));
             state.relayout_preserving_anchor(&ctx, *ctx.config);
         }
         // Zero-arg by design (Phase 5's `Produces`): each of these only
@@ -792,16 +799,6 @@ fn handle_chrome_key(
         }
     }
     true
-}
-
-/// The pure half of `T`'s action. Exhaustive match — no wildcard arm — so a
-/// third built-in `Variant` fails to compile here instead of silently
-/// leaving `T` a no-op.
-fn toggled_variant(variant: highlight::Variant) -> highlight::Variant {
-    match variant {
-        highlight::Variant::Dark => highlight::Variant::Light,
-        highlight::Variant::Light => highlight::Variant::Dark,
-    }
 }
 
 /// Test-only fault injection (DW-1.6): a writer that panics once
@@ -837,23 +834,9 @@ fn test_panic_after_bytes() -> Option<usize> {
         .and_then(|s| s.parse().ok())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_toggled_variant_swaps_dark_and_light_and_is_its_own_inverse() {
-        assert_eq!(
-            toggled_variant(highlight::Variant::Dark),
-            highlight::Variant::Light
-        );
-        assert_eq!(
-            toggled_variant(highlight::Variant::Light),
-            highlight::Variant::Dark
-        );
-        assert_eq!(
-            toggled_variant(toggled_variant(highlight::Variant::Dark)),
-            highlight::Variant::Dark
-        );
-    }
-}
+// `T`'s dark/light flip moved into `stele::theme_source`, which now owns what
+// the key means once a user theme is loaded — with no theme it is the same
+// flip it always was, with one it reaches the built-in at the opposite end.
+// DW-1.5's assertion lives there as
+// `test_toggling_without_a_theme_is_the_original_dark_light_flip`, alongside
+// `test_toggling_a_user_theme_reaches_the_opposite_built_in_and_back`.

@@ -1,0 +1,70 @@
+# Ember — warm dark. Coal and firelight: the page recedes to charcoal and the
+# structure glows on top of it.
+#
+# The heading ramp fades by *saturation* at a nearly constant contrast rather
+# than by getting darker. That is not a style choice — a ramp that fades toward
+# the page walks its deep end under WCAG AA, which is the exact regression the
+# built-in ramp was rebuilt to fix. Every rung here clears 4.5:1.
+name = "Ember"
+appearance = "dark"
+
+
+# Every role stele can colour is set below, so this file doubles as the
+# reference for what a theme may name. Delete any line to inherit the
+# built-in dark colour for that role instead.
+#
+# Some roles here merge into one another in a 256-colour terminal, and
+# `stele --theme` will say which.
+# That is expected and not a defect: the xterm cube offers 6 steps per
+# channel, so a palette coherent enough to look like one theme cannot also
+# be 33-ways distinct once quantized. Truecolor terminals — which is what
+# stele targets — show every colour here exactly as written.
+
+[colors]
+# Warm rather than neutral: paper held near a fire, not under a tube.
+text = "#dbcec0"
+emphasis = "#dbb783"
+strong = "#fa9f36"
+strikethrough = "#978776"
+
+# H1 down to H6: same hue, draining saturation.
+heading1 = "#ff9147"
+heading2 = "#f18b46"
+heading3 = "#e38444"
+heading4 = "#d57e44"
+heading5 = "#c67a46"
+heading6 = "#b9774a"
+
+# Code runs cool against the warm prose, so a fenced block reads as a
+# different material rather than more of the same page.
+code_inline = "#7dc2bd"
+code_block = "#bacccd"
+
+link = "#69b2d3"
+image_alt = "#b29b86"
+math = "#c392d2"
+
+list_marker = "#d6784f"
+task_marker = "#f3ba1b"
+blockquote = "#816b59"
+
+alert_note = "#5fa9d9"
+alert_tip = "#80c055"
+alert_important = "#b686d7"
+alert_warning = "#e5b32a"
+alert_caution = "#e57760"
+
+# Furniture. Held to WCAG 1.4.11's 3:1 for non-text, not the 4.5:1 asked of
+# words — a table border painted as loudly as a paragraph fights it.
+rule = "#7f644e"
+table_border = "#897565"
+table_header = "#e39d0f"
+
+footnote_ref = "#66b4a1"
+footnote_label = "#a28a74"
+html = "#908378"
+front_matter = "#a1968c"
+overflow = "#a46346"
+
+search_match = "#efcb39"
+search_current = "#f87c56"

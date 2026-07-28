@@ -1,0 +1,67 @@
+# Foundry — light, and built for a bright room rather than a dimmed one. Ink on
+# cold-pressed paper: near-black prose, structure carried by one blue that never
+# competes with the words.
+#
+# On paper "quieter" means closer to the page, so this ramp descends toward
+# white — the opposite direction from a dark theme's.
+name = "Foundry"
+appearance = "light"
+
+
+# Every role stele can colour is set below, so this file doubles as the
+# reference for what a theme may name. Delete any line to inherit the
+# built-in light colour for that role instead.
+#
+# Some roles here merge into one another in a 256-colour terminal, and
+# `stele --theme` will say which.
+# That is expected and not a defect: the xterm cube offers 6 steps per
+# channel, so a palette coherent enough to look like one theme cannot also
+# be 33-ways distinct once quantized. Truecolor terminals — which is what
+# stele targets — show every colour here exactly as written.
+
+[colors]
+# Not pure black: past every contrast bar while dodging the hard glare of
+# #000 that makes long reading tiring.
+text = "#252525"
+emphasis = "#3f3f3f"
+strong = "#101010"
+strikethrough = "#737373"
+
+# H1 is nearly navy and H6 is nearly sky, descending toward the paper.
+heading1 = "#0c3968"
+heading2 = "#174778"
+heading3 = "#245688"
+heading4 = "#336394"
+heading5 = "#416d9a"
+heading6 = "#4e779f"
+
+code_inline = "#8d294b"
+code_block = "#313131"
+
+link = "#0d59b1"
+image_alt = "#656565"
+math = "#6f3e99"
+
+list_marker = "#134272"
+task_marker = "#1b7241"
+blockquote = "#8f8f8f"
+
+alert_note = "#106ad2"
+alert_tip = "#1b8147"
+alert_important = "#8344b9"
+alert_warning = "#a46802"
+alert_caution = "#b32222"
+
+# Furniture, at WCAG 1.4.11's 3:1 rather than the 4.5:1 asked of words.
+rule = "#868686"
+table_border = "#7b7b7b"
+table_header = "#0f4b88"
+
+footnote_ref = "#9a3356"
+footnote_label = "#5e5e5e"
+html = "#6f6f6f"
+front_matter = "#575757"
+overflow = "#4674a2"
+
+search_match = "#8f5d08"
+search_current = "#9e1a1a"

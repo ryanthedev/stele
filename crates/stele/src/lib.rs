@@ -26,6 +26,7 @@ pub mod loader;
 pub mod media;
 pub mod painter;
 pub mod terminal;
+pub mod theme_source;
 
 pub use ast::NodeId;
 pub use layout::{CellSize, Reserved, Run, Semantic, StyleId};
