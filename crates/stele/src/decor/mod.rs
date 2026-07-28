@@ -98,6 +98,11 @@ fn structural_style(semantic: Semantic) -> Style {
     };
     match semantic {
         Semantic::Heading(level) => heading_style(level),
+        // Plain, and that is the whole point of the themeless path: the depth
+        // markers and the rule are glyphs, and the *count* of them is what
+        // carries heading level once color is gone. Giving them an attribute
+        // here would decorate the signal without adding to it.
+        Semantic::HeadingRung(_) => Style::default(),
         Semantic::Strong
         | Semantic::TableHeader
         | Semantic::FootnoteLabel
@@ -331,6 +336,11 @@ mod tests {
                 | Semantic::OverflowIndicator
                 | Semantic::SearchMatch
                 | Semantic::SearchCurrent => {}
+                // Deliberately absent from the list below, for the reason
+                // given in `highlight::theme`'s matching guard: it is defined
+                // to resolve like `Heading(n)` minus the wash, so a
+                // distinctness sweep would assert the opposite.
+                Semantic::HeadingRung(_) => {}
             }
         }
 

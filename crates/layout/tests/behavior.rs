@@ -1123,3 +1123,56 @@ fn test_a_setext_heading_reaches_the_outline() {
     assert_eq!(tree.outline().entries[0].level, 1);
     assert_eq!(tree.outline().entries[0].text, "Underlined");
 }
+
+/// The wash is not a line property — it is `Heading(1)`'s *background*, which
+/// `wash_heading_lines` spreads by padding the line with `Heading(level)`
+/// runs. So every other emitter that reaches for rung 1's colour through
+/// `Heading(1)` inherits the band too, and two of them do exactly that: the
+/// depth markers and the ember rule both index the ramp by *position in the
+/// run*, so both start at rung 1 regardless of the heading's own level.
+///
+/// Shipped, that put a one-cell chip of wash under the first marker of every
+/// H2–H6, and a sixth-of-the-measure block under the left end of every H1
+/// rule. Neither is visible in the golden fixtures, which record text and not
+/// colour, so this asserts on the style ids instead: a decoration takes
+/// `HeadingRung`, which resolves to the same palette slot with no background.
+///
+/// H1 is the deliberate exception. Its marker sits *inside* its own band, so
+/// it keeps the full `Heading` style — `HeadingRung` there would open a hole
+/// at the left edge of the wash.
+#[test]
+fn test_heading_decorations_never_borrow_the_h1_wash() {
+    for level in 2..=6u8 {
+        let src = format!("{} Title\n", "#".repeat(usize::from(level)));
+        let tree = lay(&Document::parse(&src), 60);
+        let marker_styles: Vec<StyleId> = all_runs(&tree)
+            .iter()
+            .filter(|run| run.text.contains('\u{258c}') || run.text.contains('\u{2500}'))
+            .map(|run| run.style_id)
+            .collect();
+        assert!(
+            !marker_styles.is_empty(),
+            "H{level} emitted no marker or rule runs to check"
+        );
+        assert!(
+            !marker_styles.contains(&StyleId::Semantic(Semantic::Heading(1))),
+            "H{level}'s decorations reach rung 1 through Heading(1), which carries the \
+             H1 wash background: {marker_styles:?}"
+        );
+    }
+
+    // The H1 rule is a separate line *below* the band, so it must not be
+    // washed either — even though its own heading is the washed level.
+    let tree = lay(&Document::parse("# Title\n"), 60);
+    let rule_styles: Vec<StyleId> = all_runs(&tree)
+        .iter()
+        .filter(|run| run.text.contains('\u{2500}'))
+        .map(|run| run.style_id)
+        .collect();
+    assert!(!rule_styles.is_empty(), "H1 emitted no rule to check");
+    assert!(
+        !rule_styles.contains(&StyleId::Semantic(Semantic::Heading(1))),
+        "the H1 rule's first band carries the wash, painting a block under the \
+         rule instead of only under the title: {rule_styles:?}"
+    );
+}

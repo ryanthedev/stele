@@ -125,6 +125,19 @@ pub enum Semantic {
     Text,
     /// Heading content; the level is 1–6.
     Heading(u8),
+    /// One rung of the heading ramp, borrowed by a heading *decoration* —
+    /// the depth markers and the ember rule's bands — which index the ramp by
+    /// position rather than by the heading's own level.
+    ///
+    /// It exists because `Heading(1)` is not only a color: it also carries
+    /// the H1 wash background. A decoration that reached for rung 1's color
+    /// through `Heading(1)` dragged the band along with it, which put a
+    /// one-cell chip under the first marker of every H2–H6 and a
+    /// sixth-of-the-measure block under the left end of every H1 rule.
+    /// Resolving to the same palette slot as `Heading(n)` but to no
+    /// background and no attributes keeps the fade and drops the leak, and
+    /// costs no new palette slot — so no capture role repaints.
+    HeadingRung(u8),
     Emph,
     Strong,
     Strikethrough,

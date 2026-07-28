@@ -195,6 +195,10 @@ fn semantic_attrs(semantic: Semantic) -> Style {
         // `heading_attrs` with the monochrome flag this function cannot see.
         // The arm exists so the match stays exhaustive without a wildcard.
         Semantic::Heading(level) => heading_attrs(level, true),
+        // The ramp color and nothing else. A marker is a block glyph and a
+        // rule band is a line glyph; bold or italic on either is at best
+        // invisible and at worst a font-dependent thickening of the fade.
+        Semantic::HeadingRung(_) => Style::default(),
         Semantic::Strong | Semantic::TableHeader | Semantic::FootnoteLabel => bold,
         Semantic::AlertTitle(_) => bold,
         Semantic::Emph | Semantic::ImageAlt | Semantic::MathTex => italic,
@@ -284,7 +288,10 @@ fn semantic_role_index(semantic: Semantic) -> Option<usize> {
         // indexing past the ramp. Every index below is `HEADING_RUNGS + n`
         // rather than a bare literal, so growing or shrinking the ramp again
         // moves them together instead of silently overlapping it.
-        Semantic::Heading(level) => heading_rung(level),
+        // Both spellings land on the same rung. `HeadingRung` is the ramp
+        // color without `Heading`'s wash or attributes — see its doc in
+        // `layout` — so it must not consume a slot of its own.
+        Semantic::Heading(level) | Semantic::HeadingRung(level) => heading_rung(level),
         Semantic::CodeInline => HEADING_RUNGS,
         Semantic::Link => HEADING_RUNGS + 1,
         Semantic::ImageAlt => HEADING_RUNGS + 2,
@@ -694,6 +701,12 @@ mod tests {
                 | Semantic::OverflowIndicator
                 | Semantic::SearchMatch
                 | Semantic::SearchCurrent => {}
+                // Deliberately absent from the list below. `HeadingRung(n)`
+                // resolves to the same palette slot as `Heading(n)` on
+                // purpose — it is that rung's color minus the wash — so
+                // feeding it to a distinctness test would assert it must
+                // differ from the thing it is defined to match.
+                Semantic::HeadingRung(_) => {}
             }
         }
 
@@ -1119,6 +1132,41 @@ mod tests {
                     level - 1
                 );
             }
+        }
+    }
+
+    /// `HeadingRung(n)` is the ramp's rung `n` with nothing else attached —
+    /// same color as `Heading(n)`, no background, no attributes. Heading
+    /// *decorations* (the depth markers, the ember rule's bands) index the
+    /// ramp by position rather than by their heading's level, so they all
+    /// reach rung 1; taking that rung through `Heading(1)` handed them the H1
+    /// wash as well. The two halves of this test are what make the separation
+    /// real: same fg keeps the fade, absent bg keeps the band on H1's line.
+    #[test]
+    fn test_a_heading_rung_is_the_ramp_color_without_the_wash() {
+        for variant in [Variant::Dark, Variant::Light] {
+            let theme = Theme::new(variant, ColorMode::Truecolor);
+            for rung in 1..=HEADING_LEVELS {
+                let decoration = theme.resolve(StyleId::Semantic(Semantic::HeadingRung(rung)));
+                let heading = theme.resolve(StyleId::Semantic(Semantic::Heading(rung)));
+                assert_eq!(
+                    decoration.fg, heading.fg,
+                    "HeadingRung({rung}) must share Heading({rung})'s rung in {variant:?}, \
+                     or the run fade breaks and it costs a palette slot"
+                );
+                assert!(
+                    decoration.bg.is_none(),
+                    "HeadingRung({rung}) carries a background in {variant:?} — that is the \
+                     wash leaking onto markers and rule bands: {decoration:?}"
+                );
+            }
+            assert!(
+                theme
+                    .resolve(StyleId::Semantic(Semantic::Heading(1)))
+                    .bg
+                    .is_some(),
+                "Heading(1) lost its wash in {variant:?}, so this test proves nothing"
+            );
         }
     }
 

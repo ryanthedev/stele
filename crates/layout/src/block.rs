@@ -336,7 +336,7 @@ impl<'a> Ctx<'a> {
             let measured = inline::cells(self.engine, &text);
             runs.push(Run {
                 text,
-                style_id: StyleId::Semantic(Semantic::Heading(rung)),
+                style_id: StyleId::Semantic(Semantic::HeadingRung(rung)),
                 width: measured,
                 aux: None,
             });
@@ -367,12 +367,18 @@ impl<'a> Ctx<'a> {
     /// markers keep the author's text with no blocks in it.
     fn push_heading_marker(&mut self, level: u8) -> usize {
         let level = level.clamp(1, 6);
+        // A washed heading's markers sit *inside* its band, so they take the
+        // full `Heading` style — background included — or the band opens with
+        // a hole where the blocks are. Every other level's markers want the
+        // rung's color alone; `Heading(1)` would hand them H1's background.
+        let washed = level <= HEADING_WASH_MAX_LEVEL;
         for rung in 1..=level {
-            self.push_prefix(
-                HEADING_MARKER.to_string(),
-                " ".to_string(),
-                Semantic::Heading(rung),
-            );
+            let semantic = if washed {
+                Semantic::Heading(rung)
+            } else {
+                Semantic::HeadingRung(rung)
+            };
+            self.push_prefix(HEADING_MARKER.to_string(), " ".to_string(), semantic);
         }
         self.push_prefix(" ".to_string(), " ".to_string(), Semantic::Heading(level));
         usize::from(level) + 1
