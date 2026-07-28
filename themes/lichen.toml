@@ -66,6 +66,14 @@ overflow = "#677660"
 search_match = "#ddcb93"
 search_current = "#50b43c"
 
+# The slab a fenced code block sits on, so a reader can see where the code
+# stops. the same green-grey, taken almost to black.
+#
+# No contrast floor applies to this colour itself — what has to stay legible
+# is everything painted on it, which is what stele measures the [syntax]
+# table against once this is set.
+code_block_bg = "#212420"
+
 # Syntax colours, for fenced blocks a highlighter claims. Setting even one of
 # these hands stele the whole block: anything left unset falls back to `text`
 # rather than to stele's generated palette, so this table is all-or-nothing on
@@ -80,7 +88,7 @@ search_current = "#50b43c"
 plain = "#b5c0b1"
 
 # The floor of the block.
-comment = "#78877a"
+comment = "#7f8e81"
 comment_doc = "#8a9a8b"
 punctuation = "#94a091"
 operator = "#a9b5a3"

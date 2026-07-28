@@ -66,13 +66,42 @@ fn paint_with(source: &ThemeSource) -> String {
 /// Found by position rather than by searching for a colour, because the point
 /// of every caller is to discover which colour won — a search would only ever
 /// confirm the colour it was handed.
-fn keyword_colour(wire: &str) -> &str {
+fn keyword_colour(wire: &str) -> String {
     let keyword_at = wire.find("fn").expect("the rust block is painted");
     let before = &wire[..keyword_at];
     let last_fg = before.rfind("38;2;").expect("the keyword carries a colour");
-    let tail = &before[last_fg..];
-    let end = tail.find('m').unwrap_or(tail.len());
-    &tail[..end]
+    // Exactly `38;2;R;G;B`. Code now paints on a background, so the same SGR
+    // carries a `48;2;…` after this — taking the whole parameter string up to
+    // `m` would fold the slab into what is meant to be a foreground check.
+    before[last_fg..]
+        .split(';')
+        .take(5)
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+/// `text` with every escape sequence removed, leaving only painted cells.
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\u{1b}' {
+            out.push(ch);
+            continue;
+        }
+        // Consume the introducer (`[` for CSI) before scanning, because `[`
+        // itself falls inside the `@`..=`~` final-byte range and would end the
+        // sequence before it began.
+        if chars.next().is_none() {
+            break;
+        }
+        for esc in chars.by_ref() {
+            if ('@'..='~').contains(&esc) {
+                break;
+            }
+        }
+    }
+    out
 }
 
 fn write_theme(dir: &Path, body: &str) -> PathBuf {
@@ -306,5 +335,80 @@ fn test_a_colors_only_theme_leaves_a_highlighted_block_untouched() {
         keyword_colour(&paint_doc(&source, CODE_DOC, 20)),
         keyword_colour(&paint_doc(&built_in, CODE_DOC, 20)),
         "a theme with no [syntax] table repainted a syntax capture"
+    );
+}
+
+/// The slab reaches the wire, and it reaches the whole line.
+///
+/// A code block's *extent* is information — it is how a reader sees where the
+/// code stops — so the background has to run to the measure rather than to the
+/// end of each line's text. That means the background SGR must appear on a
+/// line whose code is far shorter than the column.
+#[test]
+fn test_a_code_block_paints_a_background_across_the_whole_measure() {
+    let built_in = ThemeSource::built_in(Variant::Dark, ColorMode::Truecolor);
+    let wire = paint_doc(&built_in, CODE_DOC, 20);
+
+    // The built-in dark slab, #22232e.
+    let slab = "48;2;34;35;46";
+    assert!(
+        wire.contains(slab),
+        "no code background reached the wire: {wire:?}"
+    );
+
+    // `no language here` is 16 cells inside an 80-cell measure, so a slab that
+    // stopped at the text would leave 64 cells bare.
+    let line_at = wire
+        .find("no language here")
+        .expect("the plain fence paints");
+    // Two escape sequences sit between the text and its pad — a reset and the
+    // background — so the spaces are found by stripping escapes rather than by
+    // seeking one terminator.
+    let after = strip_ansi(&wire[line_at + "no language here".len()..]);
+    let pad = after.chars().take_while(|c| *c == ' ').count();
+    assert!(
+        pad > 40,
+        "the slab stopped where the text did — only {pad} cells of pad"
+    );
+}
+
+/// A theme's own `code_block_bg` replaces the built-in slab.
+#[test]
+fn test_a_theme_can_set_the_code_block_background() {
+    let dir = scratch("slab");
+    let path = write_theme(
+        &dir,
+        "appearance = \"dark\"\n\n[colors]\ncode_block_bg = \"#282828\"\n",
+    );
+    let source = ThemeSource::load(Some(&path), None, Variant::Dark, ColorMode::Truecolor)
+        .expect("theme loads");
+    let wire = paint_doc(&source, CODE_DOC, 20);
+
+    assert!(
+        wire.contains("48;2;40;40;40"),
+        "the theme's slab never reached the wire: {wire:?}"
+    );
+    assert!(
+        !wire.contains("48;2;34;35;46"),
+        "the built-in slab is still being painted under the theme's"
+    );
+}
+
+/// `NO_COLOR` takes the slab with everything else. A background is a colour,
+/// and a theme file must not be a way to smuggle one past a reader who asked
+/// for none.
+#[test]
+fn test_no_color_paints_no_code_background() {
+    let dir = scratch("slab-nocolor");
+    let path = write_theme(
+        &dir,
+        "appearance = \"dark\"\n\n[colors]\ncode_block_bg = \"#282828\"\n",
+    );
+    let source = ThemeSource::load(Some(&path), None, Variant::Dark, ColorMode::NoColor)
+        .expect("theme loads");
+
+    assert!(
+        !paint_doc(&source, CODE_DOC, 20).contains("48;2;"),
+        "NO_COLOR emitted a background"
     );
 }

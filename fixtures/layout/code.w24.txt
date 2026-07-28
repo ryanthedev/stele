@@ -1,13 +1,13 @@
-fn main() {
+fn main() {             
     println!("fenced wi…
-}
+}                       
 
-`backticks` inside
+`backticks` inside      
 
-indented code block
-second line
+indented code block     
+second line             
 
-no info string
+no info string          
 
 Inline code span, double
 `tick span, and

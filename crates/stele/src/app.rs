@@ -2482,11 +2482,45 @@ pub(crate) fn append_line_text(tree: &LayoutTree, index: usize, out: &mut String
     let Some(Line::Items(items)) = tree.lines(index..index + 1).next() else {
         return;
     };
-    for item in items {
+    for item in searchable(items) {
         if let LineItem::Run(run) = item {
             out.push_str(&run.text);
         }
     }
+}
+
+/// A line's items with its trailing blank runs dropped.
+///
+/// Layout pads two kinds of line out to the measure so a background reads as a
+/// band rather than stopping where the words do: a top-level heading (the H1
+/// wash) and every line of a code block (the code slab). Those cells are
+/// scenery. Letting them into the searchable text put real whitespace between
+/// things a reader sees as adjacent — a search for `{}` across
+///
+/// ```text
+/// fn foo() {
+///
+/// }
+/// ```
+///
+/// stopped matching, because the blank line between the braces had become a
+/// full measure of pad. Trailing blanks are dropped rather than all blanks
+/// because a code block's *indentation* is content: `    println!` has to stay
+/// findable by its leading spaces.
+///
+/// Dropping only from the end is also what keeps this compatible with the
+/// painter, which walks byte offsets across every run including the pad. Every
+/// offset before the pad is unchanged by definition, so a match's range still
+/// lands on the same bytes.
+fn searchable(items: &[LineItem]) -> &[LineItem] {
+    let end = items
+        .iter()
+        .rposition(|item| match item {
+            LineItem::Run(run) => !run.text.chars().all(char::is_whitespace),
+            LineItem::Box(_) => true,
+        })
+        .map_or(0, |last| last + 1);
+    &items[..end]
 }
 
 /// Byte length of [`append_line_text`]'s output for one line, without
@@ -2496,7 +2530,9 @@ pub(crate) fn line_text_len(tree: &LayoutTree, index: usize) -> usize {
     let Some(Line::Items(items)) = tree.lines(index..index + 1).next() else {
         return 0;
     };
-    items
+    // Must agree with `append_line_text` item for item, or a match's range
+    // projects onto bytes nobody searched.
+    searchable(items)
         .iter()
         .filter_map(|item| match item {
             LineItem::Run(run) => Some(run.text.len()),

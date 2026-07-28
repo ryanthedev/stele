@@ -40,9 +40,9 @@ use crate::color::Color;
 use crate::hazard::strip_display_hazards;
 use crate::role;
 use crate::theme::{
-    AA_NON_TEXT, AA_NORMAL_TEXT, SYNTAX_ROLES, THEMEABLE_ROLES, ThemeOverrides, Variant,
-    capture_from_name, capture_name, contrast_ratio, is_structural, reference_background,
-    role_name, semantic_from_name,
+    AA_NON_TEXT, AA_NORMAL_TEXT, BACKGROUND_ROLES, SYNTAX_ROLES, THEMEABLE_ROLES, ThemeOverrides,
+    Variant, background_from_name, capture_from_name, capture_name, contrast_ratio, is_structural,
+    reference_background, role_name, semantic_from_name,
 };
 
 /// The largest theme file worth reading. A theme is a few dozen short lines;
@@ -239,14 +239,22 @@ impl ThemeFile {
         };
 
         let mut overrides = ThemeOverrides::new();
-        for (semantic, color) in color_table(
+        // Backgrounds share the `[colors]` table with foregrounds, so one pass
+        // resolves both and the entry decides which channel it lands in. A
+        // name that is neither is where `UnknownRole` comes from, which is why
+        // the suggestion list is both vocabularies concatenated: someone who
+        // typed `code_block_bh` wants to hear about `code_block_bg`.
+        for (role, color) in color_table(
             &table,
             "colors",
-            semantic_from_name,
-            THEMEABLE_ROLES,
+            colors_from_name,
+            &colors_vocabulary(),
             &mut warnings,
         ) {
-            overrides.insert(semantic, color);
+            match role {
+                ColorRole::Foreground(semantic) => overrides.insert(semantic, color),
+                ColorRole::Background(semantic) => overrides.insert_background(semantic, color),
+            };
         }
         for (capture, color) in color_table(
             &table,
@@ -375,7 +383,20 @@ impl ThemeFile {
     /// the ones inside a code block that do matter.
     fn lint_syntax(&self) -> Vec<ThemeWarning> {
         let mut warnings = Vec::new();
-        let page = reference_background(self.appearance);
+        // Syntax colours are not measured against the page — they are measured
+        // against whatever the code block is sitting on. A theme that sets
+        // `code_block_bg` has moved the ground under every token in the block,
+        // and reporting a keyword's contrast against the page after that would
+        // be arithmetic about a pair of colours the reader never sees adjacent.
+        //
+        // Falling back to the page when no slab is set is not quite right
+        // either — there is still the built-in wash — but the built-in is
+        // within 1.2:1 of the reference by construction, so the two answers
+        // differ by less than the rounding in the message.
+        let page = self
+            .overrides
+            .background(layout::Semantic::CodeBlock)
+            .unwrap_or_else(|| reference_background(self.appearance));
 
         let mut named: Vec<(&'static str, Color)> = self
             .overrides
@@ -447,6 +468,35 @@ fn parse_hex(text: &str) -> Option<Color> {
         }
         _ => None,
     }
+}
+
+/// Which channel a `[colors]` entry paints into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColorRole {
+    Foreground(layout::Semantic),
+    Background(layout::Semantic),
+}
+
+/// Resolves a `[colors]` key, foreground names first.
+///
+/// The two vocabularies are disjoint — `background_from_name` answers only for
+/// names ending `_bg`, which no foreground role uses — so the order is for
+/// readability rather than precedence, and
+/// `test_no_name_is_both_a_foreground_and_a_background` keeps it that way.
+fn colors_from_name(name: &str) -> Option<ColorRole> {
+    if let Some(semantic) = semantic_from_name(name) {
+        return Some(ColorRole::Foreground(semantic));
+    }
+    background_from_name(name).map(ColorRole::Background)
+}
+
+/// Every name legal under `[colors]`, for the did-you-mean suggestion.
+fn colors_vocabulary() -> Vec<&'static str> {
+    THEMEABLE_ROLES
+        .iter()
+        .chain(BACKGROUND_ROLES.iter())
+        .copied()
+        .collect()
 }
 
 /// Reads one `name = "#rrggbb"` table into resolved roles, warning about

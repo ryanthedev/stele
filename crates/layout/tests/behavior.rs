@@ -126,7 +126,16 @@ fn test_code_block_clips_never_wraps() {
         "clipped code line carries the indicator: {:?}",
         lines[0]
     );
-    assert_eq!(lines[1], "short");
+    // Padded to the measure so the block's background reads as a slab with a
+    // straight edge — the code itself is unchanged, and copying a block reads
+    // the AST literal rather than these lines, so the pad never leaves stele.
+    assert_eq!(lines[1].trim_end(), "short");
+    assert_eq!(
+        lines[1].chars().count(),
+        24,
+        "a code line should fill the measure: {:?}",
+        lines[1]
+    );
     let has_indicator_style = all_runs(&tree)
         .iter()
         .any(|r| r.style_id == StyleId::Semantic(Semantic::OverflowIndicator));
@@ -1174,5 +1183,80 @@ fn test_heading_decorations_never_borrow_the_h1_wash() {
         !rule_styles.contains(&StyleId::Semantic(Semantic::Heading(1))),
         "the H1 rule's first band carries the wash, painting a block under the \
          rule instead of only under the title: {rule_styles:?}"
+    );
+}
+
+/// A space next to a link is not part of the link.
+///
+/// `Link` carries an underline, so a space that wrongly took the link's style
+/// drew a line under a cell the reader never clicks — the link looked one cell
+/// wider than the text it points at, starting in the gap before it. The bug
+/// was invisible for `Emph` and `Strong`, which do nothing to a blank cell,
+/// which is why it survived: only the two roles that draw through a space
+/// (`Link`, `Strikethrough`) ever showed it.
+#[test]
+fn test_the_space_before_a_link_is_not_part_of_the_link() {
+    let doc = Document::parse("a [link](https://example.com) b\n");
+    let tree = lay(&doc, 100);
+    let runs = all_runs(&tree);
+
+    let link_at = runs
+        .iter()
+        .position(|r| r.style_id == StyleId::Semantic(Semantic::Link))
+        .expect("the link is laid out");
+    assert!(
+        runs[link_at].text.starts_with("link"),
+        "the link run leads with a space: {:?}",
+        runs[link_at].text
+    );
+    for run in &runs {
+        assert!(
+            !(run.style_id == StyleId::Semantic(Semantic::Link) && run.text.trim().is_empty()),
+            "a blank run took the link's style: {run:?}"
+        );
+    }
+}
+
+/// The other half: a space *inside* a link label stays inside it, and carries
+/// the same URL so the whole label is one OSC 8 hyperlink rather than two with
+/// a styled gap between them.
+#[test]
+fn test_a_space_inside_a_link_label_stays_in_the_link() {
+    let doc = Document::parse("[a link](https://example.com)\n");
+    let tree = lay(&doc, 100);
+    let link: Vec<_> = all_runs(&tree)
+        .into_iter()
+        .filter(|r| r.style_id == StyleId::Semantic(Semantic::Link))
+        .collect();
+
+    assert_eq!(
+        link.len(),
+        1,
+        "a link label should be one run, not split at its space: {link:?}"
+    );
+    assert_eq!(link[0].text, "a link");
+    assert_eq!(
+        link[0].aux.as_deref(),
+        Some("https://example.com"),
+        "the merged run lost its destination"
+    );
+}
+
+/// Strikethrough is the other role that draws through a blank cell, and it
+/// wants the opposite answer from `Link`: the space between two struck words
+/// is struck, because both sides are inside the span.
+#[test]
+fn test_a_space_inside_strikethrough_stays_struck() {
+    let doc = Document::parse("keep ~~drop this~~ keep\n");
+    let tree = lay(&doc, 100);
+    let struck: Vec<_> = all_runs(&tree)
+        .into_iter()
+        .filter(|r| r.style_id == StyleId::Semantic(Semantic::Strikethrough))
+        .collect();
+
+    assert_eq!(struck.len(), 1, "expected one struck run: {struck:?}");
+    assert_eq!(
+        struck[0].text, "drop this",
+        "the space inside the span should be struck with it"
     );
 }

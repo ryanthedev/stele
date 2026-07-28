@@ -72,6 +72,7 @@ WCAG's 3:1 non-text floor instead of the 4.5:1 asked of text.
 | `heading1`–`heading6` | The six heading levels. Setting one also moves that heading's depth markers and its ember rule — they are the same colour by definition, and a theme cannot separate them. |
 | `code_inline` | `` `code spans` `` |
 | `code_block` | Fenced block text that no syntax highlighter claimed |
+| `code_block_bg` | **A background, not a foreground.** The slab a fenced block sits on, painted the full width of every line so the block has an edge and you can see where the code stops. Setting it also moves what `[syntax]` colours are measured against — see below. |
 | `link` | Link labels |
 | `image_alt` | Alt text shown in place of an image |
 | `math` | TeX source shown in place of a formula |
@@ -159,6 +160,23 @@ generated colours, exactly as they were.
 
 `plain` is worth setting. It is the filler between tokens, and on a theme that
 leaves it out it takes `text` — which is usually right, and occasionally not.
+
+### The slab under it
+
+Every code block is painted on a background, so its extent is visible: a reader
+can see where the code stops without inferring it from where the colour changes
+on the last line. There is a built-in one; `code_block_bg` replaces it.
+
+This is the one place stele can honestly reproduce an editor theme's *page*. A
+terminal owns its own background and stele never sets it — but a code block is a
+surface stele actually paints, so `code_block_bg = "#282828"` really does put
+gruvbox's page under your code. Every ported theme in `themes/ports/` sets its
+upstream's real background for exactly this reason.
+
+Setting it also changes what the contrast warnings mean, and for the better:
+once a theme names a slab, `[syntax]` colours are measured against *that*
+instead of against the page. A keyword's contrast with a background it never
+touches was never the useful number.
 
 Two attributes are not yours to set: `keyword` and `keyword_control` render
 bold, `comment` and `comment_doc` render italic. Comments also render *dim* on

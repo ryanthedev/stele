@@ -60,6 +60,7 @@ front_matter = "#9399b2"
 overflow = "#9399b2"
 search_match = "#fab387"
 search_current = "#f5c2e7"
+code_block_bg = "#1e1e2e"
 
 # Naming any of these hands the theme the whole code block — see
 # docs/theming.md.

@@ -28,7 +28,7 @@
 # resembles Nord rather than one that is it. They are listed
 # here so you can edit them if you would rather have the contrast.
 #
-# under-aa: alert_caution, syntax.comment, syntax.error
+# under-aa: alert_caution, syntax.attribute, syntax.boolean, syntax.comment, syntax.comment_doc, syntax.error, syntax.number
 # upstream: arcticicestudio/nord
 name = "Nord"
 appearance = "dark"
@@ -67,6 +67,7 @@ front_matter = "#8f9ab5"
 overflow = "#8f9ab5"
 search_match = "#ebcb8b"
 search_current = "#d08770"
+code_block_bg = "#2e3440"
 
 # Naming any of these hands the theme the whole code block — see
 # docs/theming.md.

@@ -520,7 +520,48 @@ impl<'a> Ctx<'a> {
                 aux: aux.clone(),
             }];
             let runs = inline::clip_runs(runs, cw, true, self.engine);
+            let from = self.lines.len();
             self.emit_runs(runs);
+            if style == Semantic::CodeBlock {
+                self.slab_code_lines(from);
+            }
+        }
+    }
+
+    /// Extend a code block's lines to the full measure with blank cells
+    /// carrying `CodeBlock`'s style, so the theme's background reads as a slab
+    /// with an edge rather than stopping where each line's text does.
+    ///
+    /// The same trick as [`Ctx::wash_heading_lines`] and for the same reason —
+    /// layout is the only place that knows the measure *and* what the
+    /// container prefix already took — but it earns its keep differently. A
+    /// heading band is decoration. A code block's extent is *information*: it
+    /// is how a reader sees where the code stops, which on a ragged block they
+    /// otherwise have to infer from a colour change partway along the last
+    /// line.
+    ///
+    /// The pad carries no `aux`, so it never reaches the highlighter with a
+    /// language attached, and `Painter::expand` skips whitespace-only runs in
+    /// any case — a slab of spaces is not code and there is nothing in it to
+    /// parse.
+    fn slab_code_lines(&mut self, from: usize) {
+        let measure = self.width;
+        for idx in from..self.lines.len() {
+            let Some(Line::Items(items)) = self.lines.get_mut(idx) else {
+                continue;
+            };
+            let used: u16 = items
+                .iter()
+                .fold(0u16, |acc, it| acc.saturating_add(it.width()));
+            let Some(pad) = measure.checked_sub(used).filter(|p| *p > 0) else {
+                continue;
+            };
+            items.push(LineItem::Run(Run {
+                text: " ".repeat(usize::from(pad)),
+                style_id: StyleId::Semantic(Semantic::CodeBlock),
+                width: pad,
+                aux: None,
+            }));
         }
     }
 }

@@ -90,7 +90,7 @@ COLOR_ORDER = ["text", "emphasis", "strong", "strikethrough",
                "alert_note", "alert_tip", "alert_important", "alert_warning",
                "alert_caution", "rule", "table_border", "table_header",
                "footnote_ref", "footnote_label", "html", "front_matter", "overflow",
-               "search_match", "search_current"]
+               "search_match", "search_current", "code_block_bg"]
 
 SYNTAX_ORDER = ["plain", "comment", "comment_doc", "punctuation", "operator",
                 "keyword", "keyword_control", "label", "attribute",
@@ -102,11 +102,19 @@ SYNTAX_ORDER = ["plain", "comment", "comment_doc", "punctuation", "operator",
 PALETTES = {}
 
 
+# Each project's own editor background, which is what `code_block_bg` is for:
+# it is the one place stele can honestly reproduce the theme's page, because a
+# code block is a surface stele actually paints rather than one the terminal
+# owns.
+BACKGROUNDS = {'gruvbox-dark': '#282828', 'gruvbox-light': '#fbf1c7', 'nord': '#2e3440', 'dracula': '#282a36', 'catppuccin-mocha': '#1e1e2e', 'tokyo-night': '#1a1b26'}
+
+
 def theme(slug, name, appearance, upstream, source, blurb, ramp_ends, palette, syntax,
           notes=()):
     PALETTES[slug] = dict(name=name, appearance=appearance, upstream=upstream,
                           source=source, blurb=blurb, ramp=ramp(*ramp_ends),
-                          palette=palette, syntax=syntax, notes=list(notes))
+                          palette=palette, syntax=syntax, notes=list(notes),
+                          code_bg=BACKGROUNDS[slug])
 
 
 # ---------------------------------------------------------------- gruvbox ---
@@ -358,6 +366,7 @@ theme(
 def render(slug, spec):
     p = spec["palette"]
     colors = {r: p[s] for r, s in COLORS.items()}
+    colors["code_block_bg"] = spec["code_bg"]
     for i, stop in enumerate(spec["ramp"], start=1):
         colors[f"heading{i}"] = stop
     # A syntax value is either a literal hex or a name in this theme's palette.
@@ -368,12 +377,22 @@ def render(slug, spec):
     bg = DARK_BG if spec["appearance"] == "dark" else LIGHT_BG
     bad = []
     for role, hx in colors.items():
+        # A background answers to no contrast floor of its own — what must
+        # clear AA is everything painted *on* it, which is exactly what the
+        # syntax loop below now measures against it. Same rule the H1 wash
+        # follows in crates/highlight.
+        if role.endswith("_bg"):
+            continue
         floor = AA_NONTEXT if role in STRUCTURAL else AA_TEXT
         r = ratio(rgb(hx), bg)
         if r < floor:
             bad.append((role, hx, r, floor))
+    # Syntax sits on the slab, not on the page — that is what the theme's own
+    # background is for, and measuring against anything else describes a pair
+    # of colours the reader never sees touching.
+    slab = rgb(spec["code_bg"])
     for role, hx in syntax.items():
-        r = ratio(rgb(hx), bg)
+        r = ratio(rgb(hx), slab)
         if r < AA_TEXT:
             bad.append((f"syntax.{role}", hx, r, AA_TEXT))
 

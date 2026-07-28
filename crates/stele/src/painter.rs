@@ -711,6 +711,9 @@ impl Painter {
         reverse: bool,
         out: &mut dyn Write,
     ) -> io::Result<PaintedRun> {
+        if let Some(painted) = self.paint_slab_pad(run, remaining, reverse, out)? {
+            return Ok(painted);
+        }
         let expanded = self.expand(run);
         // Search highlighting is applied *after* syntax highlighting and
         // overrides it, which is the phase's stated precedence: a match
@@ -774,6 +777,59 @@ impl Painter {
         Ok(painted)
     }
 
+    /// The code slab's trailing pad, painted without measuring it.
+    ///
+    /// Layout ends every code line with a run of ASCII spaces so the block's
+    /// background reaches the measure. Sending that through the general path
+    /// costs far more than painting it: `sanitize` allocates, and
+    /// `clip_to_width` walks the width engine cluster by cluster to discover
+    /// what a space is worth. Measured on the DW-4.7 fixture — 40 code lines,
+    /// 20 frames — the general path put cached frames at 2.68 ms against a
+    /// 1.59 ms baseline, dropping the cache's measured speedup from 4.2x to
+    /// 2.9x and through DW-4.7's 3x floor. This path restores it.
+    ///
+    /// It is safe to skip the machinery precisely because the run is known: N
+    /// ASCII spaces are N cells, no grapheme can hide in them, and nothing
+    /// sanitizing could remove. A search span cannot land here either —
+    /// `app::searchable` drops trailing blanks before the text is ever
+    /// searched — so only `reverse` still has to be honoured.
+    ///
+    /// Returns `None` for any run this does not recognise, leaving it to the
+    /// general path.
+    fn paint_slab_pad(
+        &self,
+        run: &Run,
+        remaining: u16,
+        reverse: bool,
+        out: &mut dyn Write,
+    ) -> io::Result<Option<PaintedRun>> {
+        const SPACES: &[u8; 256] = &[b' '; 256];
+        let blank_code = run.style_id == StyleId::Semantic(Semantic::CodeBlock)
+            && !run.text.is_empty()
+            && run.text.bytes().all(|b| b == b' ');
+        if !blank_code {
+            return Ok(None);
+        }
+        let want = run.text.len();
+        let cells = want.min(usize::from(remaining));
+        let style = self.decor.resolve(run.style_id);
+        write_sgr(out, &style)?;
+        if reverse {
+            out.write_all(SGR_REVERSE)?;
+        }
+        let mut left = cells;
+        while left > 0 {
+            let chunk = left.min(SPACES.len());
+            out.write_all(&SPACES[..chunk])?;
+            left -= chunk;
+        }
+        Ok(Some(PaintedRun {
+            line_full: cells < want,
+            width: u16::try_from(cells).unwrap_or(u16::MAX),
+            wrote_text: true,
+        }))
+    }
+
     /// The runs one tree run paints as: a code-block run's syntax-highlighted
     /// partition, memoized across frames, or the run itself for everything
     /// else.
@@ -789,7 +845,15 @@ impl Painter {
     fn expand(&mut self, run: &Run) -> Rc<[Run]> {
         // `Decor::highlight` is code-block-specific (see the decor module
         // docs): every other run passes through unchanged.
-        if run.style_id != StyleId::Semantic(Semantic::CodeBlock) {
+        //
+        // Whitespace-only runs pass through too, and that is not just an
+        // optimisation. Layout pads every code line to the measure so the
+        // block's background reads as a slab, and handing those spaces to
+        // tree-sitter would re-tag them as `Capture::Plain` — which resolves
+        // through a different arm of `Theme::resolve` and would put the pad on
+        // a different footing from the code beside it. A blank line inside a
+        // block is the same case and wants the same answer.
+        if run.style_id != StyleId::Semantic(Semantic::CodeBlock) || run.text.trim().is_empty() {
             return Rc::from(vec![run.clone()]);
         }
         // `run.aux` carries the code fence's language (threaded from
@@ -2584,10 +2648,23 @@ impl<'a, W: Write + 'a> Iterator for FrameSweep<'a, W> {
             .position(|item| matches!(item, LineItem::Run(run) if run.text.contains('漢')))
             .expect("a CJK run");
         let (start, end) = columns[cjk];
+        let LineItem::Run(run) = &items[cjk] else {
+            panic!("a run");
+        };
+        // The run is `漢字 ` — the space after it belongs to the preceding text
+        // rather than to the link that follows, so it merges here. What is
+        // under test is that the two CJK clusters measure two cells each and
+        // not one, which is the whole run's width minus the ASCII space.
+        assert_eq!(
+            usize::from(end - start),
+            engine().display_width(&run.text),
+            "columns must follow measurement, not character count: {:?}",
+            run.text
+        );
         assert_eq!(
             end - start,
-            4,
-            "two double-width clusters occupy four cells, not two"
+            5,
+            "two double-width clusters plus a space occupy five cells, not three"
         );
     }
 

@@ -186,9 +186,23 @@ impl Theme {
             Semantic::Heading(level) if fg.is_some() && level.clamp(1, HEADING_LEVELS) == 1 => {
                 Some(heading_wash(self.variant))
             }
+            // The code slab. Gated on the colour mode rather than on `fg`,
+            // which is what the heading wash gates on — `CodeBlock` has no
+            // palette slot, so its `fg` is `None` on an unthemed build and a
+            // gate on `fg` would mean the slab only ever appeared for someone
+            // who had already themed the text on it.
+            Semantic::CodeBlock => self.background_for(semantic, code_wash(self.variant)),
             _ => None,
         };
         Style { fg, bg, ..attrs }
+    }
+
+    /// A role's background: the theme's if it named one, else `built_in`, and
+    /// `None` under `NO_COLOR` either way. A file is a set of colours, and a
+    /// background is a colour.
+    fn background_for(&self, semantic: Semantic, built_in: Color) -> Option<Color> {
+        let color = self.overrides.background(semantic).unwrap_or(built_in);
+        color::apply_mode(color, self.color_mode)
     }
 
     /// Syntax colours, and the one place a theme file reaches inside a
@@ -215,6 +229,12 @@ impl Theme {
         };
         Style {
             fg,
+            // A capture is text *inside* a fenced block, so it sits on the same
+            // slab the block does. Resolved through `Semantic::CodeBlock` on
+            // purpose rather than given a background of its own: a highlighted
+            // line and an unhighlighted one are the same block to a reader, and
+            // two sources for one colour is how they would drift apart.
+            bg: self.background_for(Semantic::CodeBlock, code_wash(self.variant)),
             bold,
             // `dim` is dropped for a capture the theme named, and only for
             // that one. SGR faint is not a colour, it is an instruction to
@@ -658,6 +678,41 @@ pub fn semantic_from_name(name: &str) -> Option<Semantic> {
     })
 }
 
+/// Names in `[colors]` that set a *background* rather than a foreground.
+///
+/// One today, and the suffix is load-bearing: `code_block` is the colour of
+/// code the highlighter did not claim, `code_block_bg` is the slab both it and
+/// every syntax colour sit on. A theme sets them independently, so they cannot
+/// be one name.
+///
+/// These live in `[colors]` alongside the foregrounds rather than in a table of
+/// their own. A third table would be a third thing to explain for one key, and
+/// a theme author asking "what colour is the code block" is not thinking about
+/// which channel it lands in.
+pub const BACKGROUND_ROLES: &[&str] = &["code_block_bg"];
+
+/// The role a `[colors]` background name refers to, or `None` if none does.
+pub fn background_from_name(name: &str) -> Option<Semantic> {
+    match name {
+        "code_block_bg" => Some(Semantic::CodeBlock),
+        _ => None,
+    }
+}
+
+/// The name a theme file uses for `semantic`'s background, or `None` when the
+/// role has no themeable background.
+///
+/// Exhaustive over the names rather than over `Semantic`, because the mapping
+/// is deliberately sparse — most roles paint no background at all, and the H1
+/// wash is not themeable (it is derived from the heading ramp, so a theme that
+/// moved it independently could put the title's own colour on top of it).
+pub fn background_name(semantic: Semantic) -> Option<&'static str> {
+    BACKGROUND_ROLES
+        .iter()
+        .copied()
+        .find(|name| background_from_name(name) == Some(canonical_role(semantic)))
+}
+
 /// Every name a theme file's `[syntax]` table may use, in the order
 /// [`docs/theming.md`] lists them. Public surface, exactly like
 /// [`THEMEABLE_ROLES`] — the difference is which half of the page it governs.
@@ -777,6 +832,11 @@ fn canonical_role(semantic: Semantic) -> Semantic {
 pub struct ThemeOverrides {
     by_role: std::collections::HashMap<Semantic, Color>,
     by_capture: std::collections::HashMap<Capture, Color>,
+    /// Backgrounds, which are a third map and not a flag on the first because
+    /// a role can carry both — `code_block` is the colour of unhighlighted
+    /// code and `code_block_bg` is the slab behind it, and a theme sets them
+    /// independently.
+    by_background: std::collections::HashMap<Semantic, Color>,
 }
 
 impl ThemeOverrides {
@@ -804,6 +864,20 @@ impl ThemeOverrides {
         self.by_capture.insert(capture, color)
     }
 
+    /// The background set for `semantic`, before [`ColorMode`] is applied.
+    pub fn background(&self, semantic: Semantic) -> Option<Color> {
+        self.by_background.get(&canonical_role(semantic)).copied()
+    }
+
+    pub fn insert_background(&mut self, semantic: Semantic, color: Color) -> Option<Color> {
+        self.by_background.insert(canonical_role(semantic), color)
+    }
+
+    /// Every background override, for the lint and the tests.
+    pub fn background_iter(&self) -> impl Iterator<Item = (Semantic, Color)> + '_ {
+        self.by_background.iter().map(|(k, v)| (*k, *v))
+    }
+
     /// Whether this theme has taken ownership of syntax colours.
     ///
     /// One named capture is the whole switch, and it flips the *entire* code
@@ -825,7 +899,7 @@ impl ThemeOverrides {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.by_role.is_empty() && self.by_capture.is_empty()
+        self.by_role.is_empty() && self.by_capture.is_empty() && self.by_background.is_empty()
     }
 
     /// How many `[colors]` roles the theme set.
@@ -952,6 +1026,34 @@ fn heading_wash(variant: Variant) -> Color {
         Variant::Light => 0.945,
     };
     color::hsl_to_rgb(hue, saturation, lightness)
+}
+
+/// The slab laid behind a fenced code block.
+///
+/// A code block is the one thing in a document whose *extent* is information:
+/// a reader needs to know where the code stops and the prose starts again, and
+/// until now the only thing saying so was a change of colour partway along the
+/// last line. Every other renderer solves this with a background and so does
+/// this.
+///
+/// Neutral rather than hued, unlike [`heading_wash`]. The heading band sits
+/// under one line of one colour and can afford to lean into the ramp's hue; a
+/// code slab sits under twenty lines of a dozen syntax colours, and a tint
+/// under all of them shifts every one. Grey moves nothing.
+///
+/// Quieter than the heading band, too — 1.16:1 against the dark reference,
+/// 1.08:1 against the light. It is a boundary, not a highlight, and it is
+/// competing with far more text than the title band ever does.
+///
+/// No contrast floor applies to the slab itself. What must clear AA is
+/// everything painted *on* it, which is why `ThemeFile::lint` measures a
+/// theme's syntax colours against this rather than against the page whenever
+/// a theme sets `code_block_bg`.
+fn code_wash(variant: Variant) -> Color {
+    match variant {
+        Variant::Dark => Color::new(0x22, 0x23, 0x2e),
+        Variant::Light => Color::new(0xf2, 0xf2, 0xf4),
+    }
 }
 
 /// One rung of the heading color ramp.

@@ -359,8 +359,36 @@ pub(crate) fn wrap(atoms: Vec<Atom>, content_width: u16, engine: &WidthEngine) -
                 if !cur.is_empty() && cur_w.saturating_add(space_w).saturating_add(word_w) > cw {
                     flush(&mut out, &mut cur, &mut cur_w);
                 } else if space_w == 1 {
-                    let style = StyleId::Semantic(frags[0].style);
-                    append(&mut cur, " ", style, 1);
+                    // A space between two words is *inside* a span only when
+                    // both sides are, so it takes the style the words agree on
+                    // and `Text` when they disagree.
+                    //
+                    // This used to take the following word's style
+                    // unconditionally, which is right exactly half the time and
+                    // invisible for most roles: bold and italic do nothing to a
+                    // blank cell. `Link` and `Strikethrough` are the two that
+                    // draw a line through one, so `a [link](u)` underlined the
+                    // space before the label — a link that looked one cell
+                    // wider than the text it points at.
+                    //
+                    // Matching on `aux` as well as style is what keeps an
+                    // interior space *inside* the hyperlink rather than beside
+                    // it: a `Link` space carrying no URL emits no OSC 8 of its
+                    // own, so the terminal would see `[a](u) [link](u)` — two
+                    // hyperlinks with a styled gap — instead of one.
+                    let next_style = StyleId::Semantic(frags[0].style);
+                    let next_link = frags[0].link_box();
+                    let interior = match cur.last() {
+                        Some(LineItem::Run(prev)) => {
+                            prev.style_id == next_style && prev.aux == next_link
+                        }
+                        _ => false,
+                    };
+                    if interior {
+                        append_aux(&mut cur, " ", next_style, 1, next_link);
+                    } else {
+                        append(&mut cur, " ", StyleId::Semantic(Semantic::Text), 1);
+                    }
                     cur_w += 1;
                 }
                 if word_w > cw {

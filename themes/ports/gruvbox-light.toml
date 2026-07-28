@@ -26,7 +26,7 @@
 # resembles Gruvbox Light rather than one that is it. They are listed
 # here so you can edit them if you would rather have the contrast.
 #
-# under-aa: syntax.constructor, syntax.type, syntax.type_builtin, table_header
+# under-aa: syntax.attribute, syntax.comment, syntax.constructor, syntax.function, syntax.function_macro, syntax.namespace, syntax.string, syntax.type, syntax.type_builtin, table_header
 # upstream: morhetz/gruvbox
 name = "Gruvbox Light"
 appearance = "light"
@@ -65,6 +65,7 @@ front_matter = "#665c54"
 overflow = "#665c54"
 search_match = "#88580f"
 search_current = "#953103"
+code_block_bg = "#fbf1c7"
 
 # Naming any of these hands the theme the whole code block — see
 # docs/theming.md.

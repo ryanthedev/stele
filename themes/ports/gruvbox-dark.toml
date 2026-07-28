@@ -21,9 +21,13 @@
 # Contrast is measured against stele's reference background rather than the
 # upstream theme's own, because stele does not set your terminal background.
 #
-# Every role here clears WCAG AA against that reference.
+# This port is faithful rather than corrected, so it inherits the roles
+# upstream ships below WCAG AA. stele says so in the status line every
+# time you load it. Brightening them would make this a theme that merely
+# resembles Gruvbox Dark rather than one that is it. They are listed
+# here so you can edit them if you would rather have the contrast.
 #
-# under-aa:
+# under-aa: syntax.comment, syntax.error, syntax.keyword, syntax.keyword_control, syntax.label
 # upstream: morhetz/gruvbox
 name = "Gruvbox Dark"
 appearance = "dark"
@@ -62,6 +66,7 @@ front_matter = "#a89984"
 overflow = "#a89984"
 search_match = "#fabd2f"
 search_current = "#fe8019"
+code_block_bg = "#282828"
 
 # Naming any of these hands the theme the whole code block — see
 # docs/theming.md.
