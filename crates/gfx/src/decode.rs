@@ -8,15 +8,25 @@
 //! Every input here is hostile until proven otherwise (DW-6.3): a malformed
 //! file, a truncated file, or a valid-looking header claiming a
 //! decompression-bomb-scale dimension must all fail cleanly — never panic,
-//! never allocate unboundedly. The `image` crate's own PNG/JPEG decoders
-//! already call `Limits::check_dimensions` inside `set_limits` (verified by
-//! reading `image-0.25.10`'s `codecs/png.rs` / `codecs/jpeg/decoder.rs`
-//! source directly, not assumed), which is why `reader.limits(..)` is set
-//! *before* `into_dimensions`/`decode` below — that ordering is what makes
-//! the library reject a bomb header itself. This module's own
-//! [`Limits::accepts`] check is kept anyway as defense-in-depth on a
-//! hostile-input path (the cc-defensive-programming barricade rule:
-//! validate again at security-critical boundaries even inside a barricade).
+//! never allocate unboundedly. Every codec this crate enables calls
+//! `Limits::check_dimensions` inside `set_limits`, which is why
+//! `reader.limits(..)` is set *before* `into_dimensions`/`decode` below —
+//! that ordering is what makes the library reject a bomb header itself.
+//!
+//! That claim is verified against `image-0.25.10`'s own source rather than
+//! assumed, and it holds two different ways. PNG, JPEG, GIF and TIFF override
+//! `set_limits` and call `check_dimensions` themselves (`codecs/png.rs:55`,
+//! `codecs/jpeg/decoder.rs:171`, `codecs/gif.rs:106`, `codecs/tiff.rs:353`).
+//! WebP, BMP and ICO do not override it at all, and inherit the
+//! `ImageDecoder` trait's default — which checks dimensions too
+//! (`io/decoder.rs:118`). Either way the header is refused before a pixel
+//! buffer is sized from it. `test_a_bomb_header_is_refused_in_every_format`
+//! is what stops that going stale when a codec is added or `image` is bumped.
+//!
+//! This module's own [`Limits::accepts`] check is kept anyway as
+//! defense-in-depth on a hostile-input path (the cc-defensive-programming
+//! barricade rule: validate again at security-critical boundaries even
+//! inside a barricade).
 
 use std::io::Cursor;
 use std::path::Path;
@@ -205,9 +215,14 @@ pub fn probe_dimensions(path: &Path, limits: Limits) -> Result<(u32, u32), Decod
 /// Full, `limits`-bounded decode of `path`, scaled to `target_px` (the
 /// caller's resolved cell-pixel target) and re-encoded as PNG. Every
 /// allocation this performs is bounded: `reader.limits(..)` is set before
-/// decoding, so the underlying PNG/JPEG decoder itself rejects a
-/// bomb-dimension header (verified against `image`'s own source; see the
-/// module doc comment) before allocating a pixel buffer for it.
+/// decoding, so the underlying decoder itself rejects a bomb-dimension
+/// header (verified against `image`'s own source; see the module doc
+/// comment) before allocating a pixel buffer for it.
+///
+/// The output is PNG whatever went in — the kitty protocol wants one format
+/// and this is where every input becomes it, so a GIF and a TIFF reach
+/// `protocol.rs` indistinguishable from a PNG. An animated GIF arrives as its
+/// first frame; nothing here holds a frame clock.
 pub fn decode_and_scale(
     path: &Path,
     target_px: (u32, u32),
@@ -912,5 +927,145 @@ mod tests {
             matches!(err, DecodeError::Io(_)),
             "a missing file must stay the Io error callers already handle: {err:?}"
         );
+    }
+
+    /// Every format this crate enables, encoded by `image` itself and read
+    /// back through the *real* entry points rather than through a decoder
+    /// picked by hand.
+    ///
+    /// The point is the round trip, not the encoder: `probe_dimensions` and
+    /// `decode_and_scale` both begin with `with_guessed_format`, so a format
+    /// that is compiled in but not sniffable — or sniffable but not compiled
+    /// in — fails here. That is the whole failure mode of adding a format by
+    /// Cargo feature, and it is invisible to a test that constructs a decoder
+    /// directly.
+    fn encoded(format: image::ImageFormat, w: u32, h: u32) -> Vec<u8> {
+        let img = image::DynamicImage::new_rgba8(w, h);
+        let mut bytes = Cursor::new(Vec::new());
+        img.write_to(&mut bytes, format).expect("encode");
+        bytes.into_inner()
+    }
+
+    /// The formats `Cargo.toml` claims, and the extension each is written
+    /// with. The extension is cosmetic — detection is by content — but a real
+    /// document names its files this way, so the fixtures do too.
+    const FORMATS: &[(image::ImageFormat, &str)] = &[
+        (image::ImageFormat::Png, "png"),
+        (image::ImageFormat::Jpeg, "jpg"),
+        (image::ImageFormat::Gif, "gif"),
+        (image::ImageFormat::WebP, "webp"),
+        (image::ImageFormat::Bmp, "bmp"),
+        (image::ImageFormat::Ico, "ico"),
+        (image::ImageFormat::Tiff, "tiff"),
+    ];
+
+    #[test]
+    fn test_every_enabled_format_probes_and_decodes() {
+        for (format, ext) in FORMATS {
+            // ICO caps a directory entry at 256 px per side, so every fixture
+            // stays inside the smallest format's ceiling.
+            let bytes = encoded(*format, 32, 16);
+            let path = write_file(&format!("fmt-ok.{ext}"), &bytes);
+
+            let dims = probe_dimensions(&path, Limits::default())
+                .unwrap_or_else(|e| panic!("{format:?} did not probe: {e:?}"));
+            assert_eq!(dims, (32, 16), "{format:?} probed the wrong size");
+
+            let decoded = decode_and_scale(&path, (8, 8), Limits::default())
+                .unwrap_or_else(|e| panic!("{format:?} did not decode: {e:?}"));
+            assert_eq!(
+                (decoded.source_width, decoded.source_height),
+                (32, 16),
+                "{format:?} reported the wrong source size"
+            );
+            // The emitted raster is always PNG and always exactly the target
+            // box, whatever went in — that is the guarantee `protocol.rs`
+            // downstream is written against.
+            let raster = image::load_from_memory(&decoded.png)
+                .unwrap_or_else(|e| panic!("{format:?} emitted an unreadable png: {e:?}"));
+            assert_eq!(
+                (raster.width(), raster.height()),
+                (8, 8),
+                "{format:?} did not land on the target box"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    /// The bomb guard, per format.
+    ///
+    /// `decode.rs` claims every enabled codec refuses an over-limit header
+    /// before sizing a buffer from it — some by overriding `set_limits`, the
+    /// rest by inheriting the trait default. That is a claim about a
+    /// dependency's internals, so it is worth an assertion rather than a
+    /// comment: bump `image`, or add a format whose decoder ignores limits,
+    /// and this is what says so.
+    ///
+    /// A real bomb file is not needed and would be the wrong test anyway —
+    /// what must hold is that a *header* claiming more than `max_dim` is
+    /// refused, which a small header with a tight limit states exactly.
+    #[test]
+    fn test_a_bomb_header_is_refused_in_every_format() {
+        let tight = Limits {
+            max_dim: 8,
+            max_alloc: 1024,
+        };
+        for (format, ext) in FORMATS {
+            let bytes = encoded(*format, 64, 64);
+            let path = write_file(&format!("fmt-bomb.{ext}"), &bytes);
+
+            let err = probe_dimensions(&path, tight)
+                .expect_err("a header over the limit must be refused");
+            assert!(
+                matches!(err, DecodeError::ExceedsLimits { .. }),
+                "{format:?} refused a bomb header for the wrong reason: {err:?}"
+            );
+            let err = decode_and_scale(&path, (4, 4), tight)
+                .expect_err("a decode over the limit must be refused");
+            assert!(
+                matches!(err, DecodeError::ExceedsLimits { .. }),
+                "{format:?} decoded past its limit: {err:?}"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    /// An animated GIF is its first frame, and that is a decision rather than
+    /// an accident — nothing in stele holds a frame clock, and a silently
+    /// still animation is a better surprise than a document that repaints
+    /// forever. Asserted on a two-frame GIF whose frames differ, so a change
+    /// that started returning the last frame would fail rather than pass by
+    /// looking similar.
+    #[test]
+    fn test_an_animated_gif_decodes_to_its_first_frame() {
+        use image::codecs::gif::GifEncoder;
+        use image::{Delay, Frame, Rgba, RgbaImage};
+
+        let red = RgbaImage::from_pixel(8, 8, Rgba([255, 0, 0, 255]));
+        let blue = RgbaImage::from_pixel(8, 8, Rgba([0, 0, 255, 255]));
+        let mut bytes = Vec::new();
+        {
+            let mut enc = GifEncoder::new(&mut bytes);
+            for frame in [red, blue] {
+                enc.encode_frame(Frame::from_parts(
+                    frame,
+                    0,
+                    0,
+                    Delay::from_numer_denom_ms(100, 1),
+                ))
+                .expect("encode frame");
+            }
+        }
+        let path = write_file("animated.gif", &bytes);
+
+        let decoded = decode_and_scale(&path, (8, 8), Limits::default()).expect("decodes");
+        let img = image::load_from_memory(&decoded.png).expect("re-read the emitted png");
+        let px = img.to_rgba8();
+        let pixel = px.get_pixel(4, 4).0;
+        assert!(
+            pixel[0] > 200 && pixel[2] < 60,
+            "expected the first (red) frame, got {pixel:?}"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

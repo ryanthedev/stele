@@ -11,8 +11,28 @@ description = "Owned kitty graphics-protocol emission and bounded image decode"
 # each chunk at 4096 base64 bytes).
 base64 = "0.22"
 # Decode + header-only dimension probe for local image files. Pure Rust
-# codecs only (no dynamic C library linkage — CI's linkage job forbids it).
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# codecs only (no dynamic C library linkage — CI's linkage job forbids it),
+# which is what rules out AVIF and HEIC: `image`'s AVIF *decoder* is
+# `avif-native`, a binding to libdav1d, and there is no pure-Rust decoder for
+# either format worth depending on yet. Everything below is pure Rust.
+#
+# Format selection is content-sniffed (`with_guessed_format` in `decode.rs`),
+# never taken from the file extension, so this list *is* the supported set —
+# there is no second place that agrees or disagrees with it.
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "jpeg",
+    # A README's other two staples. GIF decodes to its first frame; stele has
+    # no animation loop and inventing one behind an `![]()` would be a
+    # surprise, not a feature.
+    "gif",
+    "webp",
+    # Rarer in prose but free, and each is somebody's normal: BMP and ICO turn
+    # up in Windows-facing docs, TIFF in anything that came off a scanner.
+    "bmp",
+    "ico",
+    "tiff",
+] }
 
 [dev-dependencies]
 # Live-Ghostty test only (crates/gfx/tests/live_ghostty.rs); not linked into
