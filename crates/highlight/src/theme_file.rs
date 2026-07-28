@@ -38,9 +38,11 @@ use std::fmt;
 
 use crate::color::Color;
 use crate::hazard::strip_display_hazards;
+use crate::role;
 use crate::theme::{
-    AA_NON_TEXT, AA_NORMAL_TEXT, THEMEABLE_ROLES, ThemeOverrides, Variant, contrast_ratio,
-    is_structural, reference_background, role_name, semantic_from_name,
+    AA_NON_TEXT, AA_NORMAL_TEXT, SYNTAX_ROLES, THEMEABLE_ROLES, ThemeOverrides, Variant,
+    capture_from_name, capture_name, contrast_ratio, is_structural, reference_background,
+    role_name, semantic_from_name,
 };
 
 /// The largest theme file worth reading. A theme is a few dozen short lines;
@@ -123,6 +125,21 @@ pub enum ThemeWarning {
         first: &'static str,
         second: &'static str,
     },
+    /// A `[syntax]` table that names some captures and not others.
+    ///
+    /// Not an error, and the distinction matters: naming one capture hands the
+    /// theme the whole code block (see `ThemeOverrides::owns_syntax`), so the
+    /// ones left out do not keep their old colours — they take `text`. That is
+    /// a legible outcome and sometimes the intended one, but it is never what
+    /// someone who simply hasn't finished typing expects to see, so it is said
+    /// out loud.
+    IncompleteSyntax {
+        named: usize,
+        total: usize,
+        /// The first unnamed capture, in the order `SYNTAX_ROLES` lists them,
+        /// to make the message actionable rather than merely accurate.
+        first_missing: &'static str,
+    },
 }
 
 impl fmt::Display for ThemeWarning {
@@ -159,6 +176,15 @@ impl fmt::Display for ThemeWarning {
             ThemeWarning::Downsample256Collision { first, second } => write!(
                 f,
                 "`{first}` and `{second}` are identical in a 256-colour terminal"
+            ),
+            ThemeWarning::IncompleteSyntax {
+                named,
+                total,
+                first_missing,
+            } => write!(
+                f,
+                "`[syntax]` sets {named} of {total} roles — the rest (`{first_missing}`, …) \
+                 fall back to `text`"
             ),
         }
     }
@@ -213,41 +239,38 @@ impl ThemeFile {
         };
 
         let mut overrides = ThemeOverrides::new();
-        match table.get("colors") {
-            Some(toml::Value::Table(colors)) => {
-                for (key, value) in colors {
-                    let Some(semantic) = semantic_from_name(key) else {
-                        warnings.push(ThemeWarning::UnknownRole {
-                            name: key.clone(),
-                            suggestion: closest_role(key),
-                        });
-                        continue;
-                    };
-                    let toml::Value::String(text) = value else {
-                        warnings.push(ThemeWarning::WrongType {
-                            key: key.clone(),
-                            expected: "a colour string like \"#c8d0e0\"",
-                        });
-                        continue;
-                    };
-                    match parse_hex(text) {
-                        Some(color) => {
-                            overrides.insert(semantic, color);
-                        }
-                        None => warnings.push(ThemeWarning::BadColor {
-                            role: key.clone(),
-                            value: text.clone(),
-                        }),
-                    }
-                }
-            }
-            Some(_) => warnings.push(ThemeWarning::WrongType {
-                key: "colors".to_string(),
-                expected: "a table",
-            }),
-            // A theme with no `[colors]` is inert but not wrong — it is what
-            // you get halfway through writing one.
-            None => {}
+        for (semantic, color) in color_table(
+            &table,
+            "colors",
+            semantic_from_name,
+            THEMEABLE_ROLES,
+            &mut warnings,
+        ) {
+            overrides.insert(semantic, color);
+        }
+        for (capture, color) in color_table(
+            &table,
+            "syntax",
+            capture_from_name,
+            SYNTAX_ROLES,
+            &mut warnings,
+        ) {
+            overrides.insert_capture(capture, color);
+        }
+
+        // Said once for the whole table rather than once per unnamed capture:
+        // a theme that sets three of twenty-five would otherwise bury the
+        // status row under twenty-two warnings that are all the same fact.
+        if overrides.owns_syntax()
+            && let Some(missing) = role::ALL
+                .iter()
+                .find(|&&capture| overrides.capture(capture).is_none())
+        {
+            warnings.push(ThemeWarning::IncompleteSyntax {
+                named: overrides.capture_len(),
+                total: role::ALL.len(),
+                first_missing: capture_name(*missing),
+            });
         }
 
         Ok((
@@ -331,6 +354,62 @@ impl ThemeFile {
             }
         }
 
+        warnings.extend(self.lint_syntax());
+        warnings
+    }
+
+    /// The same two checks over `[syntax]`, run as a separate pass rather than
+    /// folded into the semantic one.
+    ///
+    /// Contrast is asked of every capture at the text floor — a keyword is
+    /// read, and `is_structural` has no answer for a token because none of
+    /// them are furniture.
+    ///
+    /// The 256-colour check deliberately does **not** cross the two sets. It
+    /// asks "will these two look like one colour", and that question only has
+    /// teeth for colours a reader sees side by side: two captures share a code
+    /// block, and two semantic roles share a page, but a `keyword` quantizing
+    /// onto the same cell as `table_border` costs nobody anything — they never
+    /// appear in the same place. Crossing them would emit dozens of warnings
+    /// for a full theme and train the reader to ignore all of them, including
+    /// the ones inside a code block that do matter.
+    fn lint_syntax(&self) -> Vec<ThemeWarning> {
+        let mut warnings = Vec::new();
+        let page = reference_background(self.appearance);
+
+        let mut named: Vec<(&'static str, Color)> = self
+            .overrides
+            .capture_iter()
+            .map(|(capture, color)| (capture_name(capture), color))
+            .collect();
+        named.sort_by_key(|(name, _)| *name);
+
+        for (name, color) in &named {
+            let ratio = contrast_ratio(*color, page);
+            if ratio < AA_NORMAL_TEXT {
+                warnings.push(ThemeWarning::LowContrast {
+                    role: name,
+                    ratio,
+                    floor: AA_NORMAL_TEXT,
+                });
+            }
+        }
+
+        let mut seen: Vec<(&'static str, Color, Color)> = Vec::new();
+        for (name, color) in &named {
+            let cell = crate::color::downsample_256(*color);
+            let collision = seen
+                .iter()
+                .find(|(_, truecolor, quantized)| *quantized == cell && *truecolor != *color);
+            match collision {
+                Some((first, _, _)) => warnings.push(ThemeWarning::Downsample256Collision {
+                    first,
+                    second: name,
+                }),
+                None => seen.push((name, *color, cell)),
+            }
+        }
+
         warnings
     }
 }
@@ -370,13 +449,73 @@ fn parse_hex(text: &str) -> Option<Color> {
     }
 }
 
-/// The closest themeable role to `name`, when one is close enough to be worth
-/// suggesting. A typo in a theme file is silent by nature — the colour simply
-/// does not appear — so naming the near miss is most of the fix.
-fn closest_role(name: &str) -> Option<&'static str> {
+/// Reads one `name = "#rrggbb"` table into resolved roles, warning about
+/// every entry it could not use and returning the ones it could.
+///
+/// Shared by `[colors]` and `[syntax]`, which differ only in which names are
+/// legal: the type checking, the hex grammar, the suggestion on a typo and the
+/// one-bad-value-costs-one-colour rule are identical in both, and two copies
+/// of them would be two places for the rules to drift. `resolve` is what makes
+/// them different, and `candidates` is the list a near miss is measured
+/// against — pass the same pair or a typo in `[syntax]` will suggest a
+/// semantic role.
+fn color_table<R>(
+    table: &toml::Table,
+    section: &'static str,
+    resolve: impl Fn(&str) -> Option<R>,
+    candidates: &[&'static str],
+    warnings: &mut Vec<ThemeWarning>,
+) -> Vec<(R, Color)> {
+    let entries = match table.get(section) {
+        Some(toml::Value::Table(entries)) => entries,
+        Some(_) => {
+            warnings.push(ThemeWarning::WrongType {
+                key: section.to_string(),
+                expected: "a table",
+            });
+            return Vec::new();
+        }
+        // A theme with no `[colors]` — or no `[syntax]` — is inert but not
+        // wrong. It is what you get halfway through writing one, and for
+        // `[syntax]` it is also what every theme written before the table
+        // existed looks like.
+        None => return Vec::new(),
+    };
+
+    let mut resolved = Vec::new();
+    for (key, value) in entries {
+        let Some(role) = resolve(key) else {
+            warnings.push(ThemeWarning::UnknownRole {
+                name: key.clone(),
+                suggestion: closest(key, candidates),
+            });
+            continue;
+        };
+        let toml::Value::String(text) = value else {
+            warnings.push(ThemeWarning::WrongType {
+                key: key.clone(),
+                expected: "a colour string like \"#c8d0e0\"",
+            });
+            continue;
+        };
+        match parse_hex(text) {
+            Some(color) => resolved.push((role, color)),
+            None => warnings.push(ThemeWarning::BadColor {
+                role: key.clone(),
+                value: text.clone(),
+            }),
+        }
+    }
+    resolved
+}
+
+/// The closest name in `candidates` to `name`, when one is close enough to be
+/// worth suggesting. A typo in a theme file is silent by nature — the colour
+/// simply does not appear — so naming the near miss is most of the fix.
+fn closest(name: &str, candidates: &[&'static str]) -> Option<&'static str> {
     let lowered = name.to_ascii_lowercase();
     let mut best: Option<(usize, &'static str)> = None;
-    for candidate in THEMEABLE_ROLES {
+    for candidate in candidates {
         let distance = edit_distance(&lowered, candidate);
         // Two edits on a short name is a typo; on a long one it still is.
         // Three starts suggesting unrelated roles at each other.
@@ -406,15 +545,22 @@ fn edit_distance(a: &str, b: &str) -> usize {
     previous[b_chars.len()]
 }
 
-/// Every role name a theme may set, sorted — for `docs/theming.md` and for
-/// error messages that want to list the alternatives.
+/// Every `[colors]` role name a theme may set, sorted — for
+/// `docs/theming.md` and for error messages that want to list the
+/// alternatives.
 pub fn themeable_role_names() -> BTreeSet<&'static str> {
     THEMEABLE_ROLES.iter().copied().collect()
+}
+
+/// Every `[syntax]` role name a theme may set, sorted.
+pub fn syntax_role_names() -> BTreeSet<&'static str> {
+    SYNTAX_ROLES.iter().copied().collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::role::Capture;
     use layout::Semantic;
 
     /// The shape the whole design is for: name one role, inherit the rest.
@@ -429,7 +575,7 @@ mod tests {
         .expect("parses");
         assert_eq!(theme.name, "Minimal");
         assert_eq!(theme.appearance, Variant::Dark);
-        assert_eq!(theme.overrides.len(), 1);
+        assert_eq!(theme.overrides.semantic_len(), 1);
         assert_eq!(
             theme.overrides.get(Semantic::Text),
             Some(Color::new(0xc8, 0xd0, 0xe0))
@@ -449,10 +595,204 @@ mod tests {
         let (theme, warnings) = ThemeFile::parse(&source).expect("parses");
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
         assert_eq!(
-            theme.overrides.len(),
+            theme.overrides.semantic_len(),
             THEMEABLE_ROLES.len(),
             "every name in THEMEABLE_ROLES must reach a distinct role"
         );
+    }
+
+    /// A `[syntax]` table naming every capture is complete and silent. The
+    /// same promise `[colors]` makes, for the other half of the format.
+    #[test]
+    fn test_every_syntax_role_name_can_be_set_from_a_file() {
+        let (theme, warnings) = ThemeFile::parse(&full_syntax_theme()).expect("parses");
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert_eq!(
+            theme.overrides.capture_len(),
+            SYNTAX_ROLES.len(),
+            "every name in SYNTAX_ROLES must reach a distinct capture"
+        );
+        assert!(theme.overrides.owns_syntax());
+    }
+
+    /// The one thing about `[syntax]` a user cannot guess: naming one capture
+    /// takes the whole block, so the rest fall back to `text` rather than
+    /// keeping the colours they had. Warned once for the table, not once per
+    /// missing role — twenty-two lines of the same fact is not a status row.
+    #[test]
+    fn test_a_partial_syntax_table_warns_once_and_names_what_it_left_out() {
+        let (theme, warnings) =
+            ThemeFile::parse("appearance = \"dark\"\n[syntax]\nkeyword = \"#ff88aa\"\n")
+                .expect("parses");
+        assert!(theme.overrides.owns_syntax());
+
+        let incomplete: Vec<&ThemeWarning> = warnings
+            .iter()
+            .filter(|w| matches!(w, ThemeWarning::IncompleteSyntax { .. }))
+            .collect();
+        assert_eq!(
+            incomplete.len(),
+            1,
+            "expected exactly one incompleteness warning: {warnings:?}"
+        );
+        assert_eq!(
+            *incomplete[0],
+            ThemeWarning::IncompleteSyntax {
+                named: 1,
+                total: SYNTAX_ROLES.len(),
+                // The first name in `role::ALL`, which `keyword` is not.
+                first_missing: "attribute",
+            }
+        );
+    }
+
+    /// No `[syntax]` at all is the pre-existing world and must stay silent —
+    /// every theme written before the table existed is this shape.
+    #[test]
+    fn test_a_theme_with_no_syntax_table_says_nothing_about_syntax() {
+        let (theme, warnings) =
+            ThemeFile::parse("appearance = \"dark\"\n[colors]\ntext = \"#c8d0e0\"\n")
+                .expect("parses");
+        assert!(!theme.overrides.owns_syntax());
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
+
+    /// An empty `[syntax]` header is halfway through typing one, not a request
+    /// to blank every syntax colour. It leaves the generated palette alone.
+    #[test]
+    fn test_an_empty_syntax_table_does_not_take_over_the_block() {
+        let (theme, warnings) =
+            ThemeFile::parse("appearance = \"dark\"\n[syntax]\n").expect("parses");
+        assert!(!theme.overrides.owns_syntax());
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
+
+    /// A typo under `[syntax]` must be measured against the capture names. If
+    /// the suggestion came from `THEMEABLE_ROLES`, a mistyped `strng` would be
+    /// answered with `strong` — a real role, in the wrong table, which is a
+    /// worse hint than none.
+    #[test]
+    fn test_a_typo_under_syntax_suggests_a_capture_not_a_semantic_role() {
+        let (_, warnings) =
+            ThemeFile::parse("appearance = \"dark\"\n[syntax]\nstrng = \"#ff88aa\"\n")
+                .expect("parses");
+        let suggestion = warnings.iter().find_map(|w| match w {
+            ThemeWarning::UnknownRole { name, suggestion } if name == "strng" => Some(*suggestion),
+            _ => None,
+        });
+        assert_eq!(
+            suggestion,
+            Some(Some("string")),
+            "expected `string` from the syntax vocabulary: {warnings:?}"
+        );
+    }
+
+    /// And the reverse, so the two vocabularies cannot quietly become one:
+    /// `keyword` is a real capture and means nothing under `[colors]`.
+    #[test]
+    fn test_a_capture_name_under_colors_is_an_unknown_role() {
+        let (theme, warnings) =
+            ThemeFile::parse("appearance = \"dark\"\n[colors]\nkeyword = \"#ff88aa\"\n")
+                .expect("parses");
+        assert_eq!(theme.overrides.semantic_len(), 0);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| matches!(w, ThemeWarning::UnknownRole { name, .. } if name == "keyword")),
+            "expected `keyword` to be unknown under [colors]: {warnings:?}"
+        );
+    }
+
+    /// One bad hex under `[syntax]` costs that capture and nothing else —
+    /// the same rule `[colors]` follows, proven separately because it is a
+    /// separate code path's worth of nothing going wrong.
+    #[test]
+    fn test_a_bad_colour_under_syntax_costs_one_capture() {
+        let (theme, warnings) = ThemeFile::parse(
+            "appearance = \"dark\"\n[syntax]\nkeyword = \"crimson\"\nstring = \"#88ff88\"\n",
+        )
+        .expect("parses");
+        assert_eq!(theme.overrides.capture_len(), 1);
+        assert_eq!(
+            theme.overrides.capture(Capture::String),
+            Some(Color::new(0x88, 0xff, 0x88))
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| matches!(w, ThemeWarning::BadColor { role, .. } if role == "keyword")),
+            "expected a BadColor for keyword: {warnings:?}"
+        );
+    }
+
+    /// Syntax colours are read, so they answer to the text floor. A theme that
+    /// paints comments almost into the page is legal and gets said out loud.
+    #[test]
+    fn test_lint_flags_an_illegible_capture() {
+        let (theme, _) =
+            ThemeFile::parse("appearance = \"dark\"\n[syntax]\ncomment = \"#1b1c27\"\n")
+                .expect("parses");
+        assert!(
+            theme.lint().iter().any(|w| matches!(
+                w,
+                ThemeWarning::LowContrast {
+                    role: "comment",
+                    floor,
+                    ..
+                } if *floor == AA_NORMAL_TEXT
+            )),
+            "a near-background comment must be reported: {:?}",
+            theme.lint()
+        );
+    }
+
+    /// The 256-colour check runs inside the capture set, where two colours
+    /// really do sit side by side in one block.
+    #[test]
+    fn test_lint_flags_two_captures_that_quantize_together() {
+        let (theme, _) = ThemeFile::parse(
+            "appearance = \"dark\"\n[syntax]\nkeyword = \"#ff0000\"\nstring = \"#fe0101\"\n",
+        )
+        .expect("parses");
+        assert!(
+            theme
+                .lint()
+                .iter()
+                .any(|w| matches!(w, ThemeWarning::Downsample256Collision { .. })),
+            "two near-identical captures must be reported: {:?}",
+            theme.lint()
+        );
+    }
+
+    /// But it does not cross into `[colors]`. A `keyword` and a `table_border`
+    /// never appear in the same place, so warning about them would be noise —
+    /// and noise here trains the reader past the collisions that do matter.
+    #[test]
+    fn test_lint_does_not_compare_captures_against_semantic_roles() {
+        let (theme, _) = ThemeFile::parse(
+            "appearance = \"dark\"\n[colors]\ntable_border = \"#ff0000\"\n\
+             [syntax]\nkeyword = \"#fe0101\"\n",
+        )
+        .expect("parses");
+        assert!(
+            !theme
+                .lint()
+                .iter()
+                .any(|w| matches!(w, ThemeWarning::Downsample256Collision { .. })),
+            "a capture and a semantic role must not be compared: {:?}",
+            theme.lint()
+        );
+    }
+
+    /// A theme naming every capture, for tests that need `[syntax]` complete
+    /// and silent. Colours are irrelevant and deliberately uniform — the
+    /// lint's opinion of them is a different test's business.
+    fn full_syntax_theme() -> String {
+        let mut source = String::from("appearance = \"dark\"\n[syntax]\n");
+        for role in SYNTAX_ROLES {
+            source.push_str(&format!("{role} = \"#123456\"\n"));
+        }
+        source
     }
 
     /// One bad value costs you that value, never the file. This is the

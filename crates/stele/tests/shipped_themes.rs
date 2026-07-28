@@ -9,7 +9,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use highlight::{THEMEABLE_ROLES, ThemeFile, ThemeWarning};
+use highlight::{SYNTAX_ROLES, THEMEABLE_ROLES, ThemeFile, ThemeWarning};
 
 fn themes_dir() -> PathBuf {
     // `CARGO_MANIFEST_DIR` is `crates/stele`; the themes live at the root.
@@ -96,12 +96,31 @@ fn test_every_shipped_theme_sets_every_role() {
     for (name, source) in shipped_themes() {
         let (theme, _) = ThemeFile::parse(&source).expect("parses");
         assert_eq!(
-            theme.overrides.len(),
+            theme.overrides.semantic_len(),
             THEMEABLE_ROLES.len(),
             "themes/{name} sets {} of {} roles — a shipped theme is also the \
              documentation, so it should show all of them",
-            theme.overrides.len(),
+            theme.overrides.semantic_len(),
             THEMEABLE_ROLES.len()
+        );
+    }
+}
+
+/// The same completeness rule for `[syntax]`, and here it is more than
+/// documentation: naming one capture hands the theme the whole code block, so
+/// a shipped theme that set half the table would paint the other half in
+/// `text` and look broken in exactly the place people judge a theme.
+#[test]
+fn test_every_shipped_theme_sets_every_syntax_role() {
+    for (name, source) in shipped_themes() {
+        let (theme, _) = ThemeFile::parse(&source).expect("parses");
+        assert_eq!(
+            theme.overrides.capture_len(),
+            SYNTAX_ROLES.len(),
+            "themes/{name} sets {} of {} syntax roles — a partial [syntax] table \
+             paints the rest in `text`",
+            theme.overrides.capture_len(),
+            SYNTAX_ROLES.len()
         );
     }
 }
@@ -150,6 +169,14 @@ fn test_the_theming_doc_lists_exactly_the_themeable_roles() {
         assert!(
             listed,
             "docs/theming.md never mentions `{role}` — a role nobody knows they can set"
+        );
+    }
+
+    for role in SYNTAX_ROLES {
+        assert!(
+            doc.contains(&format!("`{role}`")),
+            "docs/theming.md never mentions `{role}` — a syntax colour nobody \
+             knows they can set"
         );
     }
 }

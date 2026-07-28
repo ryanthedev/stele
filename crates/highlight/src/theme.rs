@@ -191,14 +191,40 @@ impl Theme {
         Style { fg, bg, ..attrs }
     }
 
+    /// Syntax colours, and the one place a theme file reaches inside a
+    /// highlighted code block.
+    ///
+    /// The two branches never mix, which is [`ThemeOverrides::owns_syntax`]'s
+    /// whole point: either the generated palette paints the block or the theme
+    /// does. Inside the themed branch an unnamed capture takes `text` — the
+    /// same colour the prose around the block wears — and if the theme did not
+    /// set `text` either, `None`, which is the terminal's own foreground. That
+    /// chain is what makes a partial `[syntax]` table legible rather than
+    /// arbitrary: the tokens you named stand out from the ones you didn't,
+    /// instead of every token you skipped drawing a random hue.
     fn resolve_capture(&self, capture: Capture) -> Style {
         let bold = matches!(capture, Capture::Keyword | Capture::KeywordControl);
         let italic_dim = matches!(capture, Capture::Comment | Capture::CommentDoc);
-        let fg = capture_role_index(capture).and_then(|idx| self.color_for(idx));
+        let named = self.overrides.capture(capture);
+        let fg = if self.overrides.owns_syntax() {
+            named
+                .or_else(|| self.overrides.get(Semantic::Text))
+                .and_then(|c| color::apply_mode(c, self.color_mode))
+        } else {
+            capture_role_index(capture).and_then(|idx| self.color_for(idx))
+        };
         Style {
             fg,
             bold,
-            dim: italic_dim,
+            // `dim` is dropped for a capture the theme named, and only for
+            // that one. SGR faint is not a colour, it is an instruction to
+            // blend toward the background, so it lands on top of whatever hex
+            // the author wrote and moves it — the built-in comment grey can
+            // afford that because it was picked knowing it would be dimmed,
+            // and `comment = "#5a6272"` cannot, because it was picked to be
+            // exactly `#5a6272`. Italic survives: it is a shape, not a colour,
+            // and it is what tells a comment from a string at a glance.
+            dim: italic_dim && named.is_none(),
             italic: italic_dim,
             ..Style::default()
         }
@@ -632,6 +658,90 @@ pub fn semantic_from_name(name: &str) -> Option<Semantic> {
     })
 }
 
+/// Every name a theme file's `[syntax]` table may use, in the order
+/// [`docs/theming.md`] lists them. Public surface, exactly like
+/// [`THEMEABLE_ROLES`] — the difference is which half of the page it governs.
+///
+/// Unlike the semantic list this one has no omissions: every [`Capture`] is
+/// nameable, `Plain` included. `Plain` is the text inside a highlighted block
+/// that matched no scope, and a theme that could colour twenty-four kinds of
+/// token but not the gaps between them would leave those gaps at the terminal
+/// foreground while everything around them moved.
+pub const SYNTAX_ROLES: &[&str] = &[
+    "attribute",
+    "boolean",
+    "comment",
+    "comment_doc",
+    "constant",
+    "constructor",
+    "error",
+    "function",
+    "function_macro",
+    "keyword",
+    "keyword_control",
+    "label",
+    "namespace",
+    "number",
+    "operator",
+    "property",
+    "punctuation",
+    "string",
+    "string_escape",
+    "tag",
+    "type",
+    "type_builtin",
+    "variable",
+    "variable_builtin",
+    "plain",
+];
+
+/// The name a theme file uses for `capture`.
+///
+/// Total rather than `Option`, unlike [`role_name`]: there is no capture a
+/// theme may not name. Still exhaustive with no wildcard arm, so a new
+/// [`Capture`] variant is a compile error here until someone spells it — a
+/// variant that silently inherited a neighbour's name would hand one role's
+/// colour to another.
+pub fn capture_name(capture: Capture) -> &'static str {
+    match capture {
+        Capture::Attribute => "attribute",
+        Capture::Boolean => "boolean",
+        Capture::Comment => "comment",
+        Capture::CommentDoc => "comment_doc",
+        Capture::Constant => "constant",
+        Capture::Constructor => "constructor",
+        Capture::Error => "error",
+        Capture::Function => "function",
+        Capture::FunctionMacro => "function_macro",
+        Capture::Keyword => "keyword",
+        Capture::KeywordControl => "keyword_control",
+        Capture::Label => "label",
+        Capture::Namespace => "namespace",
+        Capture::Number => "number",
+        Capture::Operator => "operator",
+        Capture::Property => "property",
+        Capture::Punctuation => "punctuation",
+        Capture::String => "string",
+        Capture::StringEscape => "string_escape",
+        Capture::Tag => "tag",
+        Capture::Type => "type",
+        Capture::TypeBuiltin => "type_builtin",
+        Capture::Variable => "variable",
+        Capture::VariableBuiltin => "variable_builtin",
+        Capture::Plain => "plain",
+    }
+}
+
+/// The capture a theme file's `name` refers to, or `None` if no capture does.
+///
+/// The inverse of [`capture_name`] over [`SYNTAX_ROLES`], held to it by
+/// `test_every_syntax_role_name_round_trips` for the same reason the semantic
+/// pair is: a table that disagreed with its own inverse would paint the wrong
+/// token.
+pub fn capture_from_name(name: &str) -> Option<Capture> {
+    role::ALL.iter().copied().find(|&c| capture_name(c) == name)
+}
+
 /// The single spelling of a role for override lookup.
 ///
 /// Two normalisations, and both exist so a lookup cannot miss a colour the
@@ -654,10 +764,19 @@ fn canonical_role(semantic: Semantic) -> Semantic {
 /// whole design. A role nobody named is not in here, so it falls through to
 /// the generated palette and a five-line theme is a complete theme.
 ///
-/// Keyed by [`canonical_role`], never by the raw `Semantic`.
+/// The two maps are not one map, and the split is the format's `[colors]` /
+/// `[syntax]` split made structural. They fall back differently — an unnamed
+/// semantic role takes the built-in variant's colour, an unnamed capture takes
+/// `text` once *any* capture is named (see [`ThemeOverrides::owns_syntax`]) —
+/// and a single map keyed by some merged role type would have to re-derive
+/// which half a key came from on every lookup to know which rule applies.
+///
+/// Semantic entries are keyed by [`canonical_role`], never by the raw
+/// `Semantic`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ThemeOverrides {
     by_role: std::collections::HashMap<Semantic, Color>,
+    by_capture: std::collections::HashMap<Capture, Color>,
 }
 
 impl ThemeOverrides {
@@ -676,18 +795,58 @@ impl ThemeOverrides {
         self.by_role.insert(canonical_role(semantic), color)
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.by_role.is_empty()
+    /// The colour set for `capture`, before [`ColorMode`] is applied.
+    pub fn capture(&self, capture: Capture) -> Option<Color> {
+        self.by_capture.get(&capture).copied()
     }
 
-    pub fn len(&self) -> usize {
+    pub fn insert_capture(&mut self, capture: Capture, color: Color) -> Option<Color> {
+        self.by_capture.insert(capture, color)
+    }
+
+    /// Whether this theme has taken ownership of syntax colours.
+    ///
+    /// One named capture is the whole switch, and it flips the *entire* code
+    /// block rather than one token: past here the generated palette is out of
+    /// the picture and every capture the theme didn't name falls back to
+    /// `text`. That is deliberate, and it is the difference between a theme
+    /// and a patch. The generated palette is a golden-angle sweep through hue
+    /// space — colours chosen to be maximally unlike each other, not to be
+    /// like anything in particular. Leaving the unnamed captures on it would
+    /// mean half a code block wearing hand-picked colours and the other half
+    /// wearing a machine's, which reads as a rendering fault rather than as a
+    /// half-finished theme.
+    ///
+    /// An *absent* `[syntax]` table leaves this false, and nothing about the
+    /// generated palette changes. That is the path every theme written before
+    /// this existed is on.
+    pub fn owns_syntax(&self) -> bool {
+        !self.by_capture.is_empty()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_role.is_empty() && self.by_capture.is_empty()
+    }
+
+    /// How many `[colors]` roles the theme set.
+    pub fn semantic_len(&self) -> usize {
         self.by_role.len()
     }
 
-    /// Every override, for a caller that must inspect them all — the lint
-    /// pass that checks a user theme's contrast, and the tests.
+    /// How many `[syntax]` roles the theme set.
+    pub fn capture_len(&self) -> usize {
+        self.by_capture.len()
+    }
+
+    /// Every semantic override, for a caller that must inspect them all — the
+    /// lint pass that checks a user theme's contrast, and the tests.
     pub fn iter(&self) -> impl Iterator<Item = (Semantic, Color)> + '_ {
         self.by_role.iter().map(|(k, v)| (*k, *v))
+    }
+
+    /// Every capture override, for the same callers.
+    pub fn capture_iter(&self) -> impl Iterator<Item = (Capture, Color)> + '_ {
+        self.by_capture.iter().map(|(k, v)| (*k, *v))
     }
 }
 
@@ -1662,6 +1821,34 @@ mod tests {
         }
     }
 
+    /// The `[syntax]` half of the same promise. A table that disagreed with
+    /// its own inverse would hand `keyword`'s colour to `string`, which is
+    /// worse than refusing the name — the theme would look like it worked.
+    #[test]
+    fn test_every_syntax_role_name_round_trips() {
+        for &capture in &role::ALL {
+            let name = capture_name(capture);
+            assert_eq!(
+                capture_from_name(name),
+                Some(capture),
+                "{capture:?} names itself {name:?}, which resolves elsewhere"
+            );
+        }
+    }
+
+    /// `SYNTAX_ROLES` is the public list, `role::ALL` is the real one, and the
+    /// parser's "first unnamed capture" message walks `role::ALL` while the
+    /// docs list `SYNTAX_ROLES`. Same names, same order, or one of those two
+    /// is lying.
+    #[test]
+    fn test_syntax_roles_is_exactly_the_capture_set_in_order() {
+        let from_roles: Vec<&'static str> = role::ALL.iter().map(|&c| capture_name(c)).collect();
+        assert_eq!(
+            SYNTAX_ROLES, from_roles,
+            "SYNTAX_ROLES and role::ALL disagree about the syntax vocabulary"
+        );
+    }
+
     /// The other direction: a role that has a name must be reachable by it.
     /// Without this, a role could be silently un-themeable — `role_name`
     /// would answer, `THEMEABLE_ROLES` would omit it, and no file could ever
@@ -1822,5 +2009,144 @@ mod tests {
             );
         }
         assert!(!THEMEABLE_ROLES.contains(&"heading_rung"));
+    }
+
+    /// A theme with `[syntax]` and one capture named repaints that capture and
+    /// nothing else in the block wears a generated colour.
+    #[test]
+    fn test_a_named_capture_takes_the_theme() {
+        let wanted = Color::new(0xff, 0x00, 0xaa);
+        let mut overrides = ThemeOverrides::new();
+        overrides.insert_capture(Capture::Keyword, wanted);
+        let theme = Theme::with_overrides(Variant::Dark, ColorMode::Truecolor, overrides);
+
+        assert_eq!(
+            theme.resolve(StyleId::Capture(Capture::Keyword.id())).fg,
+            Some(wanted)
+        );
+    }
+
+    /// The fallback that makes a partial `[syntax]` table legible: a capture
+    /// the theme did not name takes `text`, not the golden-angle colour it
+    /// would have had. Half a code block in hand-picked colours and half in
+    /// generated ones is the outcome this rules out.
+    #[test]
+    fn test_an_unnamed_capture_falls_back_to_text_not_the_palette() {
+        let text = Color::new(0xc8, 0xd0, 0xe0);
+        let mut overrides = ThemeOverrides::new();
+        overrides.insert(Semantic::Text, text);
+        overrides.insert_capture(Capture::Keyword, Color::new(0xff, 0x00, 0xaa));
+        let theme = Theme::with_overrides(Variant::Dark, ColorMode::Truecolor, overrides);
+
+        for &capture in &role::ALL {
+            if capture == Capture::Keyword {
+                continue;
+            }
+            assert_eq!(
+                theme.resolve(StyleId::Capture(capture.id())).fg,
+                Some(text),
+                "{capture:?} should have fallen back to text"
+            );
+        }
+    }
+
+    /// And with no `text` either, the end of the chain is the terminal's own
+    /// foreground rather than a generated colour — `None`, the same answer
+    /// body prose gives on an unthemed build.
+    #[test]
+    fn test_an_unnamed_capture_with_no_text_resolves_to_no_colour() {
+        let mut overrides = ThemeOverrides::new();
+        overrides.insert_capture(Capture::Keyword, Color::new(0xff, 0x00, 0xaa));
+        let theme = Theme::with_overrides(Variant::Dark, ColorMode::Truecolor, overrides);
+
+        assert_eq!(
+            theme.resolve(StyleId::Capture(Capture::String.id())).fg,
+            None
+        );
+    }
+
+    /// The promise to every theme written before `[syntax]` existed: no
+    /// `[syntax]` table means the generated palette, unchanged, for all 25
+    /// captures — including with a full `[colors]` table laid over the page.
+    #[test]
+    fn test_no_syntax_table_leaves_every_capture_on_the_generated_palette() {
+        let built_in = Theme::new(Variant::Dark, ColorMode::Truecolor);
+        let mut overrides = ThemeOverrides::new();
+        overrides.insert(Semantic::Text, Color::new(0xc8, 0xd0, 0xe0));
+        overrides.insert(Semantic::CodeBlock, Color::new(0xba, 0xcc, 0xcd));
+        let themed = Theme::with_overrides(Variant::Dark, ColorMode::Truecolor, overrides);
+
+        assert!(!themed.overrides.owns_syntax());
+        for &capture in &role::ALL {
+            let id = StyleId::Capture(capture.id());
+            assert_eq!(
+                themed.resolve(id),
+                built_in.resolve(id),
+                "{capture:?} moved without a [syntax] table"
+            );
+        }
+    }
+
+    /// `NO_COLOR` outranks a `[syntax]` table exactly as it outranks
+    /// `[colors]`. A file is a set of colours and must not be a way to smuggle
+    /// one past a reader who asked for none.
+    #[test]
+    fn test_no_color_strips_a_syntax_override() {
+        let mut overrides = ThemeOverrides::new();
+        overrides.insert(Semantic::Text, Color::new(0xc8, 0xd0, 0xe0));
+        overrides.insert_capture(Capture::Keyword, Color::new(0xff, 0x00, 0xaa));
+        let theme = Theme::with_overrides(Variant::Dark, ColorMode::NoColor, overrides);
+
+        for &capture in &role::ALL {
+            assert_eq!(
+                theme.resolve(StyleId::Capture(capture.id())).fg,
+                None,
+                "{capture:?} carried colour under NO_COLOR"
+            );
+        }
+    }
+
+    /// SGR faint blends toward the background, so it moves whatever hex the
+    /// author wrote. A named comment keeps its colour exactly; an unnamed one
+    /// keeps the built-in's dim, which was picked knowing it would be dimmed.
+    /// Italic survives either way — it is a shape, not a colour.
+    #[test]
+    fn test_dim_is_dropped_only_for_a_comment_the_theme_named() {
+        let built_in = Theme::new(Variant::Dark, ColorMode::Truecolor);
+        let comment = StyleId::Capture(Capture::Comment.id());
+        assert!(built_in.resolve(comment).dim, "the built-in comment is dim");
+
+        let mut overrides = ThemeOverrides::new();
+        overrides.insert_capture(Capture::Comment, Color::new(0x5a, 0x62, 0x72));
+        let named = Theme::with_overrides(Variant::Dark, ColorMode::Truecolor, overrides);
+        let style = named.resolve(comment);
+        assert!(
+            !style.dim,
+            "a named comment must keep the colour it was given"
+        );
+        assert!(style.italic, "italic is a shape and must survive");
+        assert_eq!(style.fg, Some(Color::new(0x5a, 0x62, 0x72)));
+
+        // A `[syntax]` table that names something *else* leaves comment on the
+        // text fallback, where dim still applies — the author never chose that
+        // colour, so there is nothing to protect.
+        let mut other = ThemeOverrides::new();
+        other.insert_capture(Capture::Keyword, Color::new(0xff, 0x00, 0xaa));
+        let elsewhere = Theme::with_overrides(Variant::Dark, ColorMode::Truecolor, other);
+        assert!(elsewhere.resolve(comment).dim);
+    }
+
+    /// A theme that sets only `[syntax]` is still a theme. `is_themed` drives
+    /// the status line and the `T` toggle's meaning, and answering "no" here
+    /// would make a syntax-only theme invisible to both.
+    #[test]
+    fn test_a_syntax_only_theme_counts_as_themed() {
+        let mut overrides = ThemeOverrides::new();
+        overrides.insert_capture(Capture::Keyword, Color::new(0xff, 0x00, 0xaa));
+        assert!(!overrides.is_empty());
+        assert!(
+            Theme::with_overrides(Variant::Dark, ColorMode::Truecolor, overrides).is_themed(),
+            "a [syntax]-only theme must report as themed"
+        );
     }
 }

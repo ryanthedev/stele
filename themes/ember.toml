@@ -68,3 +68,54 @@ overflow = "#a46346"
 
 search_match = "#efcb39"
 search_current = "#f87c56"
+
+# Syntax colours, for fenced blocks a highlighter claims. Setting even one of
+# these hands stele the whole block: anything left unset falls back to `text`
+# rather than to stele's generated palette, so this table is all-or-nothing on
+# purpose and every role below is filled in.
+#
+# Ember's code runs cool while its prose runs warm — `code_inline` and
+# `code_block` above already make that choice, and this table continues it. The
+# warm end is spent deliberately and sparingly: keywords and operators, the
+# words that make code do something.
+[syntax]
+# The gaps — text inside a highlighted block that matched no scope. Kept equal
+# to `code_block` so claimed and unclaimed fences look like the same material.
+plain = "#bacccd"
+
+# Structure the eye skips over. Quietest things here that still clear AA.
+comment = "#8b9c9a"
+comment_doc = "#a8bfb8"
+punctuation = "#b0a89e"
+operator = "#e0a878"
+
+# The warm end: what the code *does*.
+keyword = "#f0885f"
+keyword_control = "#ff7a5c"
+label = "#e8a050"
+attribute = "#d4c060"
+
+# The cool end: what the code *is*.
+function = "#6fc3d9"
+function_macro = "#9ad6e8"
+type = "#5fd0b4"
+type_builtin = "#a8ded0"
+constructor = "#7fd8c0"
+namespace = "#b0b6e0"
+tag = "#5cb8e8"
+property = "#8fc9ee"
+
+# Literals, held together in one violet-green band so a value reads as a value
+# whatever its type.
+string = "#7fc070"
+string_escape = "#c2e0a8"
+number = "#d9a5e8"
+boolean = "#c99adb"
+constant = "#e0b3f5"
+
+# Names.
+variable = "#e0d8cc"
+variable_builtin = "#e8b98f"
+
+# The one loud colour in the file, and it should be.
+error = "#ff4040"

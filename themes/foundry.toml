@@ -65,3 +65,51 @@ overflow = "#4674a2"
 
 search_match = "#8f5d08"
 search_current = "#9e1a1a"
+
+# Syntax colours, for fenced blocks a highlighter claims. Setting even one of
+# these hands stele the whole block: anything left unset falls back to `text`
+# rather than to stele's generated palette, so this table is all-or-nothing on
+# purpose and every role below is filled in.
+#
+# On paper the danger is the opposite of a dark theme's — it is not illegibility
+# but *noise*, a printed page with eight highlighter pens on it. So this table
+# spends one hue per idea and lets everything else sit near the ink.
+[syntax]
+# The gaps. Near `code_block`, so a claimed fence and an unclaimed one look
+# like the same block of type.
+plain = "#313131"
+
+comment = "#61705f"
+comment_doc = "#4d6b4b"
+punctuation = "#5f5f5f"
+operator = "#7a3a10"
+
+# Structure words, in the same blue that carries structure everywhere else in
+# this theme.
+keyword = "#0c3968"
+keyword_control = "#1a4f8f"
+label = "#2a5f7a"
+attribute = "#5c4a8f"
+
+# Names of things.
+function = "#7a2f6e"
+function_macro = "#96407f"
+type = "#0f5c5c"
+type_builtin = "#2a6f6a"
+constructor = "#3d6b3d"
+namespace = "#41566e"
+tag = "#0d59b1"
+property = "#3f5a7d"
+
+# Literals, in the same wine `code_inline` already uses — a value looks like a
+# value, and like this theme.
+string = "#8d294b"
+string_escape = "#a83e26"
+number = "#6f3e99"
+boolean = "#7d4aa8"
+constant = "#5c3d8f"
+
+variable = "#252525"
+variable_builtin = "#4a4a4a"
+
+error = "#b32222"

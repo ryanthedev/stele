@@ -35,13 +35,14 @@ costs nothing and says nothing.
 There is no runtime theme switcher. To change themes, change the file or the
 flag and start stele again.
 
-## The three keys
+## The four keys
 
 | Key | Meaning |
 |---|---|
 | `name` | Shown in the status line. Optional. |
 | `appearance` | `"dark"` or `"light"`. Decides which built-in your theme lays over, and therefore every colour you did *not* set. Defaults to `dark` with a warning. |
-| `[colors]` | Role name → `#rrggbb` or `#rgb`. All optional. |
+| `[colors]` | Markdown role name → `#rrggbb` or `#rgb`. All optional. |
+| `[syntax]` | Syntax role name → colour. All optional, but see [Syntax colours](#syntax-colours) — this table is all-or-nothing in practice. |
 
 `appearance` is the one people skip and shouldn't. A theme that sets six
 colours inherits twenty-seven, and they have to come from the right end of the
@@ -89,8 +90,81 @@ WCAG's 3:1 non-text floor instead of the 4.5:1 asked of text.
 | `search_match` | Text matching the active search |
 | `search_current` | The match you are currently on |
 
-Syntax-highlighting colours (keywords, strings, comments) are **not** themeable.
-They are generated rather than chosen, and naming them is a separate job.
+## Syntax colours
+
+`[colors]` stops at the edge of a highlighted code block. A fenced block with a
+language stele can highlight is re-tagged token by token, and those tokens
+answer to `[syntax]` instead:
+
+```toml
+[syntax]
+keyword = "#f0885f"
+string = "#7fc070"
+comment = "#8b9c9a"
+```
+
+The two tables never overlap. `code_inline` and `code_block` under `[colors]`
+still cover inline spans and *unhighlighted* fences — a block with no language,
+an unknown language, or one where highlighting timed out.
+
+### Naming one syntax colour claims all of them
+
+This is the one rule here that will surprise you, so it is worth stating
+plainly. The moment `[syntax]` contains a single usable colour, stele stops
+using its generated syntax palette for that block entirely. Every capture you
+did **not** name falls back to `text` — not to the colour it had before.
+
+That is deliberate. The generated palette is a golden-angle sweep through hue
+space: colours chosen to be maximally unlike each other, not to be like
+anything in particular. Leaving your unnamed tokens on it would put half a code
+block in colours you picked and half in colours a machine picked, which reads
+as a rendering fault rather than as a theme you haven't finished.
+
+So a partial `[syntax]` table is legal, warns, and gives you a two-colour code
+block — your keywords, and everything else in body-text colour. That is a real
+thing to want. But if you want a full palette, fill the table in.
+
+Leaving `[syntax]` out entirely changes nothing: your code blocks keep the
+generated colours, exactly as they were.
+
+### Every syntax colour you can set
+
+| Role | Colours |
+|---|---|
+| `keyword` | `fn`, `let`, `class`, `def` |
+| `keyword_control` | `if`, `return`, `import`, `try` — the ones that move execution |
+| `function` | Function names, at definition and at call |
+| `function_macro` | Macro invocations |
+| `type` | Type names |
+| `type_builtin` | `int`, `str`, `bool` |
+| `constructor` | Constructors and enum variants |
+| `namespace` | Module and namespace names |
+| `variable` | Ordinary identifiers and parameters |
+| `variable_builtin` | `self`, `this`, `super` |
+| `property` | Struct fields and object members |
+| `constant` | Named constants |
+| `string` | String and character literals |
+| `string_escape` | `\n`, and regex literals |
+| `number` | Numeric literals |
+| `boolean` | `true` / `false` |
+| `comment` | Line and block comments |
+| `comment_doc` | Doc comments |
+| `operator` | `+`, `=`, `&&` |
+| `punctuation` | Brackets, delimiters, separators |
+| `attribute` | Annotations and decorators |
+| `label` | Loop and goto labels |
+| `tag` | HTML and JSX tag names |
+| `error` | Text the parser could not make sense of |
+| `plain` | Everything inside a highlighted block that matched none of the above |
+
+`plain` is worth setting. It is the filler between tokens, and on a theme that
+leaves it out it takes `text` — which is usually right, and occasionally not.
+
+Two attributes are not yours to set: `keyword` and `keyword_control` render
+bold, `comment` and `comment_doc` render italic. Comments also render *dim* on
+the built-in palette, but stele drops the dim for any comment colour you name —
+faint blends a colour toward the background, and you picked that hex to be that
+hex.
 
 ## When something is wrong
 
@@ -103,6 +177,12 @@ stele will also tell you, and then do it anyway, when:
 
 - a colour is under its contrast floor against the page
 - two roles merge into one colour in a 256-colour terminal
+- `[syntax]` names some captures and not others
+
+The 256-colour check compares `[colors]` against `[colors]` and `[syntax]`
+against `[syntax]`, never across the two. Colours only collide in a way you
+care about when a reader sees them side by side, and a `keyword` never appears
+next to a `table_border`.
 
 Both are advice. They are hard requirements for stele's *built-in* themes and
 deliberately not for yours — it is your terminal.
@@ -121,7 +201,7 @@ Where it does matter, the warning names the pair so you can decide.
 
 ## Worked examples
 
-`themes/` holds three complete themes, each setting every role:
+`themes/` holds three complete themes, each setting every role in both tables:
 
 | | Appearance | Character |
 |---|---|---|

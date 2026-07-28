@@ -32,9 +32,14 @@ fn scratch(tag: &str) -> PathBuf {
     dir
 }
 
-/// Paints one frame through a real `Painter` and returns the wire bytes.
-fn paint_with(source: &ThemeSource) -> String {
-    let doc = Document::parse(DOC);
+/// A document with all three kinds of code in it: an inline span, a fence the
+/// highlighter claims, and a fence it does not.
+const CODE_DOC: &str = "Prose with `a span`.\n\n```rust\nfn main() { let x = 1; }\n```\n\n```\nno language here\n```\n";
+
+/// Paints one frame of `markdown` through a real `Painter` and returns the
+/// wire bytes.
+fn paint_doc(source: &ThemeSource, markdown: &str, height: u16) -> String {
+    let doc = Document::parse(markdown);
     let engine = engine();
     let config = LayoutConfig {
         min_width: 24,
@@ -47,17 +52,27 @@ fn paint_with(source: &ThemeSource) -> String {
 
     let mut frame = Vec::new();
     painter
-        .frame(
-            &tree,
-            0,
-            Size {
-                width: 80,
-                height: 12,
-            },
-            &mut frame,
-        )
+        .frame(&tree, 0, Size { width: 80, height }, &mut frame)
         .expect("paint");
     String::from_utf8_lossy(&frame).into_owned()
+}
+
+fn paint_with(source: &ThemeSource) -> String {
+    paint_doc(source, DOC, 12)
+}
+
+/// The SGR foreground the Rust fence's `fn` keyword is actually painted in.
+///
+/// Found by position rather than by searching for a colour, because the point
+/// of every caller is to discover which colour won — a search would only ever
+/// confirm the colour it was handed.
+fn keyword_colour(wire: &str) -> &str {
+    let keyword_at = wire.find("fn").expect("the rust block is painted");
+    let before = &wire[..keyword_at];
+    let last_fg = before.rfind("38;2;").expect("the keyword carries a colour");
+    let tail = &before[last_fg..];
+    let end = tail.find('m').unwrap_or(tail.len());
+    &tail[..end]
 }
 
 fn write_theme(dir: &Path, body: &str) -> PathBuf {
@@ -180,15 +195,17 @@ fn test_theming_a_heading_moves_its_markers_on_the_wire() {
     );
 }
 
-/// Where a theme stops: syntax highlighting.
+/// Where `[colors]` stops: the edge of the highlighter.
 ///
 /// A fenced block with a known language is re-tagged into `StyleId::Capture`
-/// runs by the highlighter, and `Theme::resolve` sends those to
-/// `resolve_capture`, which never consults the overlay. So `code_block` only
-/// reaches code the highlighter did *not* claim. This pins that boundary so a
-/// future change cannot quietly move it either way.
+/// runs by the highlighter, and `resolve_capture` does not consult the
+/// *semantic* overlay at all. So `code_block` reaches only code the
+/// highlighter did not claim, and `code_inline` reaches every inline span
+/// because those are never highlighted. A `[syntax]` table is the only way
+/// into a claimed block — this theme has none, so the keyword stays on the
+/// generated palette.
 #[test]
-fn test_a_theme_colours_unhighlighted_code_but_not_syntax_captures() {
+fn test_colors_reaches_unhighlighted_code_but_never_a_syntax_capture() {
     let dir = scratch("captures");
     let path = write_theme(
         &dir,
@@ -196,31 +213,7 @@ fn test_a_theme_colours_unhighlighted_code_but_not_syntax_captures() {
     );
     let source = ThemeSource::load(Some(&path), None, Variant::Dark, ColorMode::Truecolor)
         .expect("theme loads");
-
-    let doc = Document::parse(
-        "Prose with `a span`.\n\n```rust\nfn main() { let x = 1; }\n```\n\n```\nno language here\n```\n",
-    );
-    let engine = engine();
-    let config = LayoutConfig {
-        min_width: 24,
-        max_width: 80,
-    };
-    let tree = layout(&doc, 80, &config, &engine, &NullSizer);
-    let mut painter = Painter::new(engine);
-    painter.register_decor(Box::new(ThemedDecor::new(source.theme())));
-    let mut frame = Vec::new();
-    painter
-        .frame(
-            &tree,
-            0,
-            Size {
-                width: 80,
-                height: 20,
-            },
-            &mut frame,
-        )
-        .expect("paint");
-    let wire = String::from_utf8_lossy(&frame).into_owned();
+    let wire = paint_doc(&source, CODE_DOC, 20);
 
     assert!(
         wire.contains("38;2;0;255;0"),
@@ -231,15 +224,87 @@ fn test_a_theme_colours_unhighlighted_code_but_not_syntax_captures() {
         "a fenced block with no language stays Semantic::CodeBlock and must \
          take the theme: {wire:?}"
     );
-    // The Rust block's `fn` is a Keyword capture. It must NOT be the themed
-    // code_block colour — it comes from the generated palette.
-    let keyword_at = wire.find("fn").expect("the rust block is painted");
-    let before = &wire[..keyword_at];
-    let last_fg = before.rfind("38;2;").expect("the keyword carries a colour");
+    assert_ne!(
+        keyword_colour(&wire),
+        "38;2;255;0;255",
+        "a syntax capture took the theme's code_block colour — `[colors]` \
+         does not reach inside a highlighted block"
+    );
+}
+
+/// And where `[syntax]` starts. The same `fn` keyword, the same document, one
+/// extra table in the file — this is the whole feature, asserted on the bytes
+/// the terminal receives rather than on a resolved `Style`.
+#[test]
+fn test_a_syntax_tables_colour_reaches_a_highlighted_keyword() {
+    let dir = scratch("syntax-keyword");
+    let path = write_theme(
+        &dir,
+        "appearance = \"dark\"\n\n[colors]\ntext = \"#c8d0e0\"\n\n[syntax]\nkeyword = \"#ff00aa\"\n",
+    );
+    let source = ThemeSource::load(Some(&path), None, Variant::Dark, ColorMode::Truecolor)
+        .expect("theme loads");
+    let wire = paint_doc(&source, CODE_DOC, 20);
+
+    assert_eq!(
+        keyword_colour(&wire),
+        "38;2;255;0;170",
+        "the themed keyword colour never reached the wire"
+    );
+}
+
+/// The fallback on the wire: `main` is a `Function` capture this theme did not
+/// name, so it takes `text` — not the golden-angle colour it wears on an
+/// unthemed build, and not the keyword's colour either.
+#[test]
+fn test_an_unnamed_capture_paints_in_text_once_syntax_is_themed() {
+    let dir = scratch("syntax-fallback");
+    let path = write_theme(
+        &dir,
+        "appearance = \"dark\"\n\n[colors]\ntext = \"#c8d0e0\"\n\n[syntax]\nkeyword = \"#ff00aa\"\n",
+    );
+    let source = ThemeSource::load(Some(&path), None, Variant::Dark, ColorMode::Truecolor)
+        .expect("theme loads");
+    let wire = paint_doc(&source, CODE_DOC, 20);
+
+    let built_in = ThemeSource::built_in(Variant::Dark, ColorMode::Truecolor);
+    let built_in_wire = paint_doc(&built_in, CODE_DOC, 20);
+    let generated = keyword_colour(&built_in_wire);
+
+    let main_at = wire.find("main").expect("the rust block is painted");
+    let before = &wire[..main_at];
+    let last_fg = before
+        .rfind("38;2;")
+        .expect("the function carries a colour");
     assert!(
-        !before[last_fg..].starts_with("38;2;255;0;255"),
-        "a syntax capture took the theme's code_block colour — captures are \
-         not themeable: {:?}",
+        before[last_fg..].starts_with("38;2;200;208;224"),
+        "an unnamed capture must fall back to `text`, not the palette: {:?}",
         &before[last_fg..]
+    );
+    assert_ne!(
+        keyword_colour(&wire),
+        generated,
+        "the themed block is still wearing generated colours"
+    );
+}
+
+/// A theme with no `[syntax]` table paints a highlighted block byte-identically
+/// to the built-in, however much of the page it repaints. The promise to every
+/// theme that already exists.
+#[test]
+fn test_a_colors_only_theme_leaves_a_highlighted_block_untouched() {
+    let dir = scratch("syntax-absent");
+    let path = write_theme(
+        &dir,
+        "appearance = \"dark\"\n\n[colors]\ntext = \"#c8d0e0\"\nheading1 = \"#ff8800\"\n",
+    );
+    let source = ThemeSource::load(Some(&path), None, Variant::Dark, ColorMode::Truecolor)
+        .expect("theme loads");
+    let built_in = ThemeSource::built_in(Variant::Dark, ColorMode::Truecolor);
+
+    assert_eq!(
+        keyword_colour(&paint_doc(&source, CODE_DOC, 20)),
+        keyword_colour(&paint_doc(&built_in, CODE_DOC, 20)),
+        "a theme with no [syntax] table repainted a syntax capture"
     );
 }

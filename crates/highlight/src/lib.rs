@@ -40,9 +40,11 @@ pub use highlighter::{Highlighted, highlight_detailed, highlight_line};
 pub use hyperlink::{CLOSE as HYPERLINK_CLOSE, open as hyperlink_open, sanitize_url};
 pub use role::Capture;
 pub use theme::{
-    Style, THEMEABLE_ROLES, Theme, ThemeOverrides, Variant, role_count, role_name,
-    semantic_from_name, variant_from_osc11_reply,
+    SYNTAX_ROLES, Style, THEMEABLE_ROLES, Theme, ThemeOverrides, Variant, capture_from_name,
+    capture_name, role_count, role_name, semantic_from_name, variant_from_osc11_reply,
 };
-pub use theme_file::{ThemeError, ThemeFile, ThemeWarning, themeable_role_names};
+pub use theme_file::{
+    ThemeError, ThemeFile, ThemeWarning, syntax_role_names, themeable_role_names,
+};
 
 pub use layout::{HeadingCase, StyleId, heading_case};

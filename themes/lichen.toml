@@ -65,3 +65,54 @@ overflow = "#677660"
 
 search_match = "#ddcb93"
 search_current = "#50b43c"
+
+# Syntax colours, for fenced blocks a highlighter claims. Setting even one of
+# these hands stele the whole block: anything left unset falls back to `text`
+# rather than to stele's generated palette, so this table is all-or-nothing on
+# purpose and every role below is filled in.
+#
+# Lichen's whole argument is that a page can be quiet, and a code block is
+# where that argument is hardest to keep — a default highlighter puts six
+# saturated hues in one paragraph. This table separates tokens by *lightness*
+# first and hue second, the same trick the heading ramp uses.
+[syntax]
+# The gaps, at `code_block`.
+plain = "#b5c0b1"
+
+# The floor of the block.
+comment = "#78877a"
+comment_doc = "#8a9a8b"
+punctuation = "#94a091"
+operator = "#a9b5a3"
+
+# Lifted above the floor: the words that carry the shape of the code.
+keyword = "#d5dfd2"
+keyword_control = "#e2ebdf"
+label = "#c3cfbe"
+attribute = "#b6c9ae"
+
+# The one hue that gets to be a hue — the same teal `link` uses, for the names
+# of things.
+function = "#73b1a1"
+function_macro = "#8cc4b5"
+type = "#8eb98e"
+type_builtin = "#a3cba3"
+constructor = "#9dc4ae"
+namespace = "#929dbc"
+tag = "#7fa8c0"
+property = "#a6b3c6"
+
+# Literals lean warm, which in a green-grey theme is the quietest way to say
+# "this one is different".
+string = "#c2c095"
+string_escape = "#d5cfa6"
+number = "#c9b09a"
+boolean = "#bda78e"
+constant = "#d3bda6"
+
+variable = "#bdc7ba"
+variable_builtin = "#cdd6c9"
+
+# The exception, as with the alerts above. An error that blended in would be
+# the theme hiding the thing it most needs to show.
+error = "#c77c69"
