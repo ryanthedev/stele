@@ -30,6 +30,7 @@ mod highlighter;
 mod hyperlink;
 mod role;
 mod theme;
+mod theme_file;
 
 pub use cache::{DEFAULT_CACHE_CAPACITY, HighlightCache};
 pub use color::{Color, ColorMode};
@@ -38,6 +39,10 @@ pub use hazard::{is_display_hazard, strip_display_hazards};
 pub use highlighter::{Highlighted, highlight_detailed, highlight_line};
 pub use hyperlink::{CLOSE as HYPERLINK_CLOSE, open as hyperlink_open, sanitize_url};
 pub use role::Capture;
-pub use theme::{Style, Theme, Variant, role_count, variant_from_osc11_reply};
+pub use theme::{
+    Style, THEMEABLE_ROLES, Theme, ThemeOverrides, Variant, role_count, role_name,
+    semantic_from_name, variant_from_osc11_reply,
+};
+pub use theme_file::{ThemeError, ThemeFile, ThemeWarning, themeable_role_names};
 
 pub use layout::{HeadingCase, StyleId, heading_case};

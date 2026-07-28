@@ -35,5 +35,7 @@ lumis = { version = "=0.12.0", default-features = false, features = [
     "lang-sql",
 ] }
 
+toml = { version = "1", default-features = false, features = ["parse", "serde"] }
+
 [dev-dependencies]
 ast = { path = "../ast" }

@@ -94,15 +94,39 @@ pub struct Theme {
     /// recomputed per [`Theme::resolve`] call — `resolve` runs on every
     /// painted run, every frame.
     palette: Vec<Color>,
+    /// A user theme's colours, empty for a built-in. Consulted *ahead* of
+    /// `palette` — see [`Theme::resolve_semantic`].
+    overrides: ThemeOverrides,
 }
 
 impl Theme {
     pub fn new(variant: Variant, color_mode: ColorMode) -> Theme {
+        Theme::with_overrides(variant, color_mode, ThemeOverrides::new())
+    }
+
+    /// A built-in variant with a user theme laid over it.
+    ///
+    /// The variant is not decoration here: it is what every role the theme
+    /// *didn't* name resolves to. That is what makes a partial theme work at
+    /// all, and it is why a theme file declares an appearance — a theme that
+    /// sets six colours and inherits twenty-five needs those twenty-five to
+    /// come from the right end of the page.
+    pub fn with_overrides(
+        variant: Variant,
+        color_mode: ColorMode,
+        overrides: ThemeOverrides,
+    ) -> Theme {
         Theme {
             variant,
             color_mode,
             palette: build_palette(variant),
+            overrides,
         }
+    }
+
+    /// Whether any user override is in effect.
+    pub fn is_themed(&self) -> bool {
+        !self.overrides.is_empty()
     }
 
     /// Which built-in variant this theme resolves against.
@@ -124,7 +148,25 @@ impl Theme {
     }
 
     fn resolve_semantic(&self, semantic: Semantic) -> Style {
-        let fg = semantic_role_index(semantic).and_then(|idx| self.color_for(idx));
+        // The override is consulted *first*, and the order is load-bearing
+        // rather than stylistic. `Text`, `Strong`, `Emph`, `Strikethrough`,
+        // `CodeBlock` and `MathTex` have no palette slot at all — they return
+        // `None` from `semantic_role_index` so body prose inherits the
+        // terminal's own foreground, which is the right default and stays the
+        // default. Consulting the palette first and the override second would
+        // work for every role that has a slot and silently do nothing for the
+        // six that don't, i.e. it would fail exactly on "let me colour my
+        // body text", the request this whole path exists to serve.
+        //
+        // `apply_mode` runs on the override too, so `NO_COLOR` strips a user
+        // colour the same way it strips a built-in one. A theme file is a set
+        // of colours; `NO_COLOR` means no colours, and a file cannot be a way
+        // around that.
+        let fg = self
+            .overrides
+            .get(semantic)
+            .and_then(|c| color::apply_mode(c, self.color_mode))
+            .or_else(|| semantic_role_index(semantic).and_then(|idx| self.color_for(idx)));
         // Headings pick their ladder from whether a color actually came back,
         // not from the color *mode*: a role that resolves to `None` here is
         // monochrome in practice however it got that way.
@@ -362,6 +404,302 @@ pub fn role_count() -> usize {
 /// How many roles sit past the capture block: `SearchMatch` and
 /// `SearchCurrent`.
 const TRAILING_ROLES: usize = 2;
+
+/// WCAG 2.1's contrast floor for normal-size text (1.4.3).
+pub const AA_NORMAL_TEXT: f64 = 4.5;
+
+/// WCAG 2.1's contrast floor for non-text content (1.4.11) — the bar a
+/// graphical object has to clear to be *perceivable*, as opposed to readable.
+pub const AA_NON_TEXT: f64 = 3.0;
+
+/// Whether a role paints structure rather than language, and so answers to
+/// [`AA_NON_TEXT`] rather than [`AA_NORMAL_TEXT`].
+///
+/// The line is drawn at "does a reader read it". A table border, a rule, a
+/// blockquote's gutter bar and a list bullet are glyphs that *show* shape;
+/// nobody reads them, and holding a `─` to the same bar as a paragraph would
+/// force every theme to paint its furniture as loudly as its prose. Alt text,
+/// frontmatter and raw HTML go the other way — they look like decoration and
+/// are words.
+///
+/// Exhaustive with no wildcard arm, so a new role has to be classified rather
+/// than defaulting into whichever answer happens to be first.
+pub fn is_structural(semantic: Semantic) -> bool {
+    match semantic {
+        Semantic::Rule
+        | Semantic::TableBorder
+        | Semantic::BlockquoteMarker
+        | Semantic::ListMarker
+        | Semantic::TaskMarker
+        | Semantic::OverflowIndicator => true,
+        Semantic::Text
+        | Semantic::Heading(_)
+        | Semantic::HeadingRung(_)
+        | Semantic::Emph
+        | Semantic::Strong
+        | Semantic::Strikethrough
+        | Semantic::CodeInline
+        | Semantic::CodeBlock
+        | Semantic::Link
+        | Semantic::ImageAlt
+        | Semantic::MathTex
+        | Semantic::AlertTitle(_)
+        | Semantic::TableHeader
+        | Semantic::FootnoteRef
+        | Semantic::FootnoteLabel
+        | Semantic::Html
+        | Semantic::FrontMatter
+        | Semantic::SearchMatch
+        | Semantic::SearchCurrent => false,
+    }
+}
+
+/// The background each variant's colours are measured against.
+///
+/// A terminal's real background is whatever the user set, and stele only ever
+/// learns an approximation of it from the OSC 11 reply. These are the two
+/// references every contrast check in this crate uses instead: the Spike A
+/// dark reference, and plain white for light. Shared rather than repeated so
+/// a built-in's hard assertion and a user theme's warning cannot drift onto
+/// different numbers and disagree about the same colour.
+pub fn reference_background(variant: Variant) -> Color {
+    match variant {
+        Variant::Dark => Color::new(0x1a, 0x1b, 0x26),
+        Variant::Light => Color::new(0xff, 0xff, 0xff),
+    }
+}
+
+/// WCAG 2.1 relative luminance.
+fn relative_luminance(c: Color) -> f64 {
+    let channel = |v: u8| {
+        let v = f64::from(v) / 255.0;
+        if v <= 0.03928 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * channel(c.r) + 0.7152 * channel(c.g) + 0.0722 * channel(c.b)
+}
+
+/// WCAG 2.1 contrast ratio between two colours, from 1.0 (identical) to
+/// 21.0 (black on white). Symmetric — order does not matter.
+pub fn contrast_ratio(a: Color, b: Color) -> f64 {
+    let (x, y) = (relative_luminance(a), relative_luminance(b));
+    (x.max(y) + 0.05) / (x.min(y) + 0.05)
+}
+
+/// Every name a theme file may use, in the order [`docs/theming.md`] lists
+/// them. This is the *public* surface of the style system: a name here is a
+/// promise, because it appears in files people write and share.
+///
+/// Not every `Semantic` is here, and the omissions are deliberate — see
+/// [`role_name`], which returns `None` for each and says why.
+pub const THEMEABLE_ROLES: &[&str] = &[
+    "text",
+    "heading1",
+    "heading2",
+    "heading3",
+    "heading4",
+    "heading5",
+    "heading6",
+    "emphasis",
+    "strong",
+    "strikethrough",
+    "code_inline",
+    "code_block",
+    "link",
+    "image_alt",
+    "math",
+    "list_marker",
+    "task_marker",
+    "blockquote",
+    "alert_note",
+    "alert_tip",
+    "alert_important",
+    "alert_warning",
+    "alert_caution",
+    "rule",
+    "table_border",
+    "table_header",
+    "footnote_ref",
+    "footnote_label",
+    "html",
+    "front_matter",
+    "overflow",
+    "search_match",
+    "search_current",
+];
+
+/// The name a theme file uses for `semantic`, or `None` when the role is
+/// deliberately not themeable.
+///
+/// Exhaustive with no wildcard arm, like every other table over `Semantic`,
+/// so a new variant is a compile error until someone decides whether people
+/// may name it. That decision is the point of this function: a name in a file
+/// someone else wrote is a compatibility promise, and the cheapest time to
+/// refuse one is before it ships.
+///
+/// Two roles are refused today. `HeadingRung` is an internal spelling of a
+/// heading's own rung colour used by the depth markers and the ember rule;
+/// naming it separately would let a theme desynchronise a heading from its
+/// own markers, so it instead *follows* `Heading` through
+/// [`canonical_role`]. `Plain` capture text has never carried colour.
+pub fn role_name(semantic: Semantic) -> Option<&'static str> {
+    Some(match semantic {
+        Semantic::Text => "text",
+        Semantic::Heading(level) => match level.clamp(1, HEADING_LEVELS) {
+            1 => "heading1",
+            2 => "heading2",
+            3 => "heading3",
+            4 => "heading4",
+            5 => "heading5",
+            _ => "heading6",
+        },
+        Semantic::Emph => "emphasis",
+        Semantic::Strong => "strong",
+        Semantic::Strikethrough => "strikethrough",
+        Semantic::CodeInline => "code_inline",
+        Semantic::CodeBlock => "code_block",
+        Semantic::Link => "link",
+        Semantic::ImageAlt => "image_alt",
+        Semantic::MathTex => "math",
+        Semantic::ListMarker => "list_marker",
+        Semantic::TaskMarker => "task_marker",
+        Semantic::BlockquoteMarker => "blockquote",
+        Semantic::AlertTitle(AlertTone::Note) => "alert_note",
+        Semantic::AlertTitle(AlertTone::Tip) => "alert_tip",
+        Semantic::AlertTitle(AlertTone::Important) => "alert_important",
+        Semantic::AlertTitle(AlertTone::Warning) => "alert_warning",
+        Semantic::AlertTitle(AlertTone::Caution) => "alert_caution",
+        Semantic::Rule => "rule",
+        Semantic::TableBorder => "table_border",
+        Semantic::TableHeader => "table_header",
+        Semantic::FootnoteRef => "footnote_ref",
+        Semantic::FootnoteLabel => "footnote_label",
+        Semantic::Html => "html",
+        Semantic::FrontMatter => "front_matter",
+        Semantic::OverflowIndicator => "overflow",
+        Semantic::SearchMatch => "search_match",
+        Semantic::SearchCurrent => "search_current",
+        // Follows `Heading` rather than carrying a name of its own.
+        Semantic::HeadingRung(_) => return None,
+    })
+}
+
+/// The role a theme file's `name` refers to, or `None` if no role does.
+///
+/// The inverse of [`role_name`] over [`THEMEABLE_ROLES`], and
+/// `test_every_themeable_role_name_round_trips` is what holds the two
+/// together — a table that disagreed with its own inverse would hand a
+/// theme's colour to the wrong role, which is worse than refusing the name.
+pub fn semantic_from_name(name: &str) -> Option<Semantic> {
+    Some(match name {
+        "text" => Semantic::Text,
+        "heading1" => Semantic::Heading(1),
+        "heading2" => Semantic::Heading(2),
+        "heading3" => Semantic::Heading(3),
+        "heading4" => Semantic::Heading(4),
+        "heading5" => Semantic::Heading(5),
+        "heading6" => Semantic::Heading(6),
+        "emphasis" => Semantic::Emph,
+        "strong" => Semantic::Strong,
+        "strikethrough" => Semantic::Strikethrough,
+        "code_inline" => Semantic::CodeInline,
+        "code_block" => Semantic::CodeBlock,
+        "link" => Semantic::Link,
+        "image_alt" => Semantic::ImageAlt,
+        "math" => Semantic::MathTex,
+        "list_marker" => Semantic::ListMarker,
+        "task_marker" => Semantic::TaskMarker,
+        "blockquote" => Semantic::BlockquoteMarker,
+        "alert_note" => Semantic::AlertTitle(AlertTone::Note),
+        "alert_tip" => Semantic::AlertTitle(AlertTone::Tip),
+        "alert_important" => Semantic::AlertTitle(AlertTone::Important),
+        "alert_warning" => Semantic::AlertTitle(AlertTone::Warning),
+        "alert_caution" => Semantic::AlertTitle(AlertTone::Caution),
+        "rule" => Semantic::Rule,
+        "table_border" => Semantic::TableBorder,
+        "table_header" => Semantic::TableHeader,
+        "footnote_ref" => Semantic::FootnoteRef,
+        "footnote_label" => Semantic::FootnoteLabel,
+        "html" => Semantic::Html,
+        "front_matter" => Semantic::FrontMatter,
+        "overflow" => Semantic::OverflowIndicator,
+        "search_match" => Semantic::SearchMatch,
+        "search_current" => Semantic::SearchCurrent,
+        _ => return None,
+    })
+}
+
+/// The single spelling of a role for override lookup.
+///
+/// Two normalisations, and both exist so a lookup cannot miss a colour the
+/// user did set. Heading levels clamp, because `Heading(0)` and `Heading(9)`
+/// resolve to a real rung's colour everywhere else in this file and an
+/// override keyed on the literal level would be invisible to them. And
+/// `HeadingRung(n)` folds onto `Heading(n)`, so theming `heading2` moves that
+/// heading's depth markers and its ember rule band with it — a heading whose
+/// markers stayed the built-in colour would look like a rendering fault.
+fn canonical_role(semantic: Semantic) -> Semantic {
+    match semantic {
+        Semantic::Heading(level) | Semantic::HeadingRung(level) => {
+            Semantic::Heading(level.clamp(1, HEADING_LEVELS))
+        }
+        other => other,
+    }
+}
+
+/// A theme file's colours: sparse by construction, because *absent* is the
+/// whole design. A role nobody named is not in here, so it falls through to
+/// the generated palette and a five-line theme is a complete theme.
+///
+/// Keyed by [`canonical_role`], never by the raw `Semantic`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ThemeOverrides {
+    by_role: std::collections::HashMap<Semantic, Color>,
+}
+
+impl ThemeOverrides {
+    pub fn new() -> ThemeOverrides {
+        ThemeOverrides::default()
+    }
+
+    /// The colour set for `semantic`, before [`ColorMode`] is applied —
+    /// `Theme::resolve` owns that step, so `NO_COLOR` strips an override
+    /// exactly as it strips a built-in colour.
+    pub fn get(&self, semantic: Semantic) -> Option<Color> {
+        self.by_role.get(&canonical_role(semantic)).copied()
+    }
+
+    pub fn insert(&mut self, semantic: Semantic, color: Color) -> Option<Color> {
+        self.by_role.insert(canonical_role(semantic), color)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_role.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.by_role.len()
+    }
+
+    /// Every override, for a caller that must inspect them all — the lint
+    /// pass that checks a user theme's contrast, and the tests.
+    pub fn iter(&self) -> impl Iterator<Item = (Semantic, Color)> + '_ {
+        self.by_role.iter().map(|(k, v)| (*k, *v))
+    }
+}
+
+impl FromIterator<(Semantic, Color)> for ThemeOverrides {
+    fn from_iter<I: IntoIterator<Item = (Semantic, Color)>>(iter: I) -> ThemeOverrides {
+        let mut overrides = ThemeOverrides::new();
+        for (semantic, color) in iter {
+            overrides.insert(semantic, color);
+        }
+        overrides
+    }
+}
 
 /// A candidate truecolor for palette-generation `attempt` N: hue rotates by
 /// the golden angle per attempt (spreading hues with minimal clustering),
@@ -1108,11 +1446,7 @@ mod tests {
                     monochrome[idx],
                     "H{level}'s monochrome attributes in {variant:?}"
                 );
-                assert_eq!(
-                    heading_case(level),
-                    case[idx],
-                    "H{level}'s case transform"
-                );
+                assert_eq!(heading_case(level), case[idx], "H{level}'s case transform");
             }
 
             // ...and that every level now owns its own rung, rather than
@@ -1177,18 +1511,6 @@ mod tests {
     /// this file while making the title harder to read than before it existed.
     #[test]
     fn test_the_h1_wash_never_costs_the_title_its_contrast() {
-        fn luminance(c: Color) -> f64 {
-            let ch = |v: u8| {
-                let v = f64::from(v) / 255.0;
-                if v <= 0.03928 {
-                    v / 12.92
-                } else {
-                    ((v + 0.055) / 1.055).powf(2.4)
-                }
-            };
-            0.2126 * ch(c.r) + 0.7152 * ch(c.g) + 0.0722 * ch(c.b)
-        }
-        const AA_NORMAL_TEXT: f64 = 4.5;
         for variant in [Variant::Dark, Variant::Light] {
             // Both the truecolor values and the 256-color cells they snap to:
             // a terminal in 256-color mode paints the cells, not the ideals.
@@ -1199,8 +1521,7 @@ mod tests {
                     h1.fg.expect("H1 carries a rung color"),
                     h1.bg.expect("H1 carries the wash"),
                 );
-                let (x, y) = (luminance(fg), luminance(bg));
-                let ratio = (x.max(y) + 0.05) / (x.min(y) + 0.05);
+                let ratio = contrast_ratio(fg, bg);
                 assert!(
                     ratio >= AA_NORMAL_TEXT,
                     "H1 title on its own wash is {ratio:.2}:1 in {variant:?}/{mode:?} — \
@@ -1255,27 +1576,12 @@ mod tests {
     /// [`variant_from_osc11_reply`] classifies each variant.
     #[test]
     fn test_heading_rungs_clear_wcag_aa_against_the_reference_backgrounds() {
-        fn relative_luminance(c: Color) -> f64 {
-            let channel = |v: u8| {
-                let v = f64::from(v) / 255.0;
-                if v <= 0.03928 {
-                    v / 12.92
-                } else {
-                    ((v + 0.055) / 1.055).powf(2.4)
-                }
-            };
-            0.2126 * channel(c.r) + 0.7152 * channel(c.g) + 0.0722 * channel(c.b)
-        }
-        fn contrast(a: Color, b: Color) -> f64 {
-            let (x, y) = (relative_luminance(a), relative_luminance(b));
-            (x.max(y) + 0.05) / (x.min(y) + 0.05)
-        }
-
-        const AA_NORMAL_TEXT: f64 = 4.5;
-        for (variant, background) in [
-            (Variant::Dark, Color::new(0x1a, 0x1b, 0x26)),
-            (Variant::Light, Color::new(0xff, 0xff, 0xff)),
-        ] {
+        // `contrast_ratio` and `reference_background` rather than a copy
+        // local to this test: a user theme's low-contrast *warning* runs the
+        // same two functions, so a colour cannot be judged legible by one and
+        // illegible by the other.
+        for variant in [Variant::Dark, Variant::Light] {
+            let background = reference_background(variant);
             // Both the truecolor value and the 256-color cell it snaps to have
             // to clear the bar — a terminal in 256-color mode paints the cell.
             for mode in [ColorMode::Truecolor, ColorMode::Downsample256] {
@@ -1285,7 +1591,7 @@ mod tests {
                         .resolve(StyleId::Semantic(Semantic::Heading(level)))
                         .fg
                         .expect("every heading level carries a rung color");
-                    let ratio = contrast(fg, background);
+                    let ratio = contrast_ratio(fg, background);
                     assert!(
                         ratio >= AA_NORMAL_TEXT,
                         "H{level} in {variant:?}/{mode:?} is {ratio:.2}:1 against {background:?} \
@@ -1335,5 +1641,186 @@ mod tests {
             None
         );
         assert_eq!(variant_from_osc11_reply(b"\x1b]11;rgb:11/22\x1b\\"), None);
+    }
+
+    /// The name table and its inverse must agree on every role. They are two
+    /// hand-written matches, and a disagreement would not fail to compile —
+    /// it would hand a theme's colour to the wrong role, or drop it. Driven
+    /// off `THEMEABLE_ROLES` rather than a list written here, so the public
+    /// constant is what is actually under test.
+    #[test]
+    fn test_every_themeable_role_name_round_trips() {
+        for name in THEMEABLE_ROLES {
+            let semantic = semantic_from_name(name).unwrap_or_else(|| {
+                panic!("THEMEABLE_ROLES lists {name:?}, which resolves to no role")
+            });
+            assert_eq!(
+                role_name(semantic),
+                Some(*name),
+                "{name:?} resolves to {semantic:?}, which names itself differently"
+            );
+        }
+    }
+
+    /// The other direction: a role that has a name must be reachable by it.
+    /// Without this, a role could be silently un-themeable — `role_name`
+    /// would answer, `THEMEABLE_ROLES` would omit it, and no file could ever
+    /// name it because the docs and the parser both read the constant.
+    #[test]
+    fn test_every_named_role_appears_in_the_public_list() {
+        for semantic in all_semantics() {
+            let Some(name) = role_name(semantic) else {
+                continue;
+            };
+            assert!(
+                THEMEABLE_ROLES.contains(&name),
+                "{semantic:?} names itself {name:?}, which THEMEABLE_ROLES omits — \
+                 nothing could ever set it"
+            );
+        }
+    }
+
+    /// An out-of-range heading level names a real rung rather than panicking
+    /// or inventing a name no file could contain. `Heading(0)` and
+    /// `Heading(9)` reach `resolve` from a malformed document, and every
+    /// other table in this file clamps them.
+    #[test]
+    fn test_an_out_of_range_heading_still_names_a_real_role() {
+        for level in [0u8, 7, 9, u8::MAX] {
+            let name = role_name(Semantic::Heading(level))
+                .unwrap_or_else(|| panic!("Heading({level}) has no name"));
+            assert!(
+                THEMEABLE_ROLES.contains(&name),
+                "Heading({level}) named itself {name:?}, which is not a themeable role"
+            );
+        }
+        assert_eq!(
+            role_name(Semantic::Heading(0)),
+            role_name(Semantic::Heading(1))
+        );
+        assert_eq!(
+            role_name(Semantic::Heading(9)),
+            role_name(Semantic::Heading(6))
+        );
+    }
+
+    /// The requirement this whole seam exists for. `Text` has no palette slot
+    /// — it resolves to `None` so body prose inherits the terminal's own
+    /// foreground — and it must still be settable from a theme.
+    #[test]
+    fn test_an_override_colours_a_role_that_has_no_palette_slot() {
+        let plain = Theme::new(Variant::Dark, ColorMode::Truecolor);
+        assert_eq!(
+            plain.resolve(StyleId::Semantic(Semantic::Text)).fg,
+            None,
+            "body text must inherit the terminal foreground with no theme"
+        );
+
+        let wanted = Color::new(0x9a, 0xbc, 0xde);
+        let themed = Theme::with_overrides(
+            Variant::Dark,
+            ColorMode::Truecolor,
+            [(Semantic::Text, wanted)].into_iter().collect(),
+        );
+        assert_eq!(
+            themed.resolve(StyleId::Semantic(Semantic::Text)).fg,
+            Some(wanted),
+            "an override must reach a role the palette never colours"
+        );
+    }
+
+    /// An empty overlay must change nothing at all. This is what lets the
+    /// overlay ship without touching the no-config path: if it is inert when
+    /// unused, every existing invariant test is still testing the shipped
+    /// rendering.
+    #[test]
+    fn test_an_empty_overlay_resolves_identically_to_the_built_in() {
+        for variant in [Variant::Dark, Variant::Light] {
+            for mode in [
+                ColorMode::Truecolor,
+                ColorMode::Downsample256,
+                ColorMode::NoColor,
+            ] {
+                let built_in = Theme::new(variant, mode);
+                let overlaid = Theme::with_overrides(variant, mode, ThemeOverrides::new());
+                for semantic in all_semantics() {
+                    assert_eq!(
+                        built_in.resolve(StyleId::Semantic(semantic)),
+                        overlaid.resolve(StyleId::Semantic(semantic)),
+                        "{semantic:?} differs under an empty overlay in {variant:?}/{mode:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `NO_COLOR` means no colours, and a theme file is a set of colours — so
+    /// a file cannot be a way around it. Every role, including the six with
+    /// no palette slot, must still come back with no foreground.
+    #[test]
+    fn test_no_color_strips_a_user_theme_as_thoroughly_as_a_built_in() {
+        let every_role: ThemeOverrides = all_semantics()
+            .into_iter()
+            .map(|s| (s, Color::new(0xff, 0x00, 0xff)))
+            .collect();
+        let theme = Theme::with_overrides(Variant::Dark, ColorMode::NoColor, every_role);
+        for semantic in all_semantics() {
+            let style = theme.resolve(StyleId::Semantic(semantic));
+            assert_eq!(
+                style.fg, None,
+                "{semantic:?} carries a user colour under NO_COLOR"
+            );
+            assert_eq!(
+                style.bg, None,
+                "{semantic:?} carries a background under NO_COLOR"
+            );
+        }
+    }
+
+    /// A heading's depth markers and its ember rule are painted through
+    /// `HeadingRung`, which has no name of its own. Theming `heading2` must
+    /// move them too — a heading whose title changed colour while its markers
+    /// stayed built-in would read as a rendering fault, not a theme.
+    #[test]
+    fn test_theming_a_heading_moves_its_markers_and_rule_with_it() {
+        let wanted = Color::new(0x12, 0x34, 0x56);
+        let theme = Theme::with_overrides(
+            Variant::Dark,
+            ColorMode::Truecolor,
+            [(Semantic::Heading(2), wanted)].into_iter().collect(),
+        );
+        assert_eq!(
+            theme.resolve(StyleId::Semantic(Semantic::Heading(2))).fg,
+            Some(wanted)
+        );
+        assert_eq!(
+            theme
+                .resolve(StyleId::Semantic(Semantic::HeadingRung(2)))
+                .fg,
+            Some(wanted),
+            "the rung a marker and a rule band paint with must follow its heading"
+        );
+        // And an untouched level must not move.
+        assert_ne!(
+            theme
+                .resolve(StyleId::Semantic(Semantic::HeadingRung(3)))
+                .fg,
+            Some(wanted),
+            "theming heading2 must not repaint heading3's rung"
+        );
+    }
+
+    /// `HeadingRung` must stay unnameable. If a file could set it, a theme
+    /// could point a heading and its own markers at different colours.
+    #[test]
+    fn test_the_internal_heading_rung_role_is_not_themeable() {
+        for level in 1..=HEADING_LEVELS {
+            assert_eq!(
+                role_name(Semantic::HeadingRung(level)),
+                None,
+                "HeadingRung({level}) must not be nameable from a theme file"
+            );
+        }
+        assert!(!THEMEABLE_ROLES.contains(&"heading_rung"));
     }
 }
