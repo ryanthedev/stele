@@ -1,19 +1,20 @@
-# Catppuccin Mocha — a port of catppuccin/catppuccin (Mocha flavour).
+# Catppuccin Mocha — a port of catppuccin/catppuccin.
 #
-# Pastel on a soft charcoal base. Every accent is deliberately held at a
-# similar lightness, which is why its code blocks read as calm even with
-# twelve hues in play.
+# Pastel on a soft charcoal base. Every accent is held at a similar
+# lightness, which is why its code reads as calm with twelve hues in play.
 #
-# Every colour below is a value published by the upstream theme, with two
-# exceptions, both forced by things stele has and an editor does not:
+# The [syntax] table is mapped from the upstream project's own scope
+# definitions (catppuccin/nvim groups/syntax.lua + treesitter.lua), not from a house convention. These themes
+# disagree with each other about what colour a keyword is far more than you
+# would expect, and flattening that would make six ports that were the same
+# picture in different paint.
 #
-#   - The six heading rungs are interpolated between two of the theme's own
-#     colours. No editor theme defines a six-level markdown ramp, and a
-#     rainbow of six unrelated accents would break the one thing the ramp is
-#     for — saying "these are all headings" while the marker count says how
-#     deep. See docs/theming.md.
-#   - Where the upstream palette offers one tier and stele wants two, the
-#     second is derived from the first and said so above.
+# The [colors] table is not a port. Markdown roles — headings, alerts, a
+# blockquote gutter — have no upstream equivalent to be faithful to, so they
+# follow one convention across every theme here, drawn from this palette. The
+# six heading rungs are interpolated between two of the theme's own colours:
+# no editor defines a six-level ramp, and six unrelated accents would break
+# the one thing the ramp is for. See docs/theming.md.
 #
 # Contrast is measured against stele's reference background rather than the
 # upstream theme's own, because stele does not set your terminal background.
@@ -21,6 +22,7 @@
 # Every role here clears WCAG AA against that reference.
 #
 # under-aa:
+# upstream: catppuccin/catppuccin
 name = "Catppuccin Mocha"
 appearance = "dark"
 
@@ -60,31 +62,30 @@ search_match = "#fab387"
 search_current = "#f5c2e7"
 
 # Naming any of these hands the theme the whole code block — see
-# docs/theming.md. Mapped the way the upstream theme maps its own
-# TextMate and tree-sitter scopes.
+# docs/theming.md.
 [syntax]
 plain = "#cdd6f4"
-comment = "#7f849c"
+comment = "#9399b2"
 comment_doc = "#9399b2"
-punctuation = "#bac2de"
-operator = "#fab387"
-keyword = "#f38ba8"
-keyword_control = "#eba0ac"
-label = "#f38ba8"
-attribute = "#94e2d5"
-function = "#94e2d5"
-function_macro = "#89dceb"
+punctuation = "#9399b2"
+operator = "#89dceb"
+keyword = "#cba6f7"
+keyword_control = "#cba6f7"
+label = "#74c7ec"
+attribute = "#fab387"
+function = "#89b4fa"
+function_macro = "#f5c2e7"
 type = "#f9e2af"
-type_builtin = "#fab387"
+type_builtin = "#cba6f7"
 constructor = "#f9e2af"
-namespace = "#89b4fa"
-tag = "#74c7ec"
-property = "#89b4fa"
+namespace = "#f9e2af"
+tag = "#b4befe"
+property = "#b4befe"
 string = "#a6e3a1"
 string_escape = "#f5c2e7"
-number = "#cba6f7"
-boolean = "#b4befe"
-constant = "#cba6f7"
+number = "#fab387"
+boolean = "#fab387"
+constant = "#fab387"
 variable = "#cdd6f4"
-variable_builtin = "#b4befe"
-error = "#eba0ac"
+variable_builtin = "#f38ba8"
+error = "#f38ba8"

@@ -1,18 +1,22 @@
 # Gruvbox Dark — a port of morhetz/gruvbox.
 #
 # Retro groove: warm, low-blue, high-contrast. The most-ported terminal
-# palette there is, and the one that reads best on a warm-white terminal.
+# palette there is.
 #
-# Every colour below is a value published by the upstream theme, with two
-# exceptions, both forced by things stele has and an editor does not:
+# The [syntax] table is mapped from the upstream project's own scope
+# definitions (colors/gruvbox.vim), not from a house convention. These themes
+# disagree with each other about what colour a keyword is far more than you
+# would expect, and flattening that would make six ports that were the same
+# picture in different paint.
 #
-#   - The six heading rungs are interpolated between two of the theme's own
-#     colours. No editor theme defines a six-level markdown ramp, and a
-#     rainbow of six unrelated accents would break the one thing the ramp is
-#     for — saying "these are all headings" while the marker count says how
-#     deep. See docs/theming.md.
-#   - Where the upstream palette offers one tier and stele wants two, the
-#     second is derived from the first and said so above.
+# The [colors] table is not a port. Markdown roles — headings, alerts, a
+# blockquote gutter — have no upstream equivalent to be faithful to, so they
+# follow one convention across every theme here, drawn from this palette. The
+# six heading rungs are interpolated between two of the theme's own colours:
+# no editor defines a six-level ramp, and six unrelated accents would break
+# the one thing the ramp is for. See docs/theming.md.
+#
+# NOTE: gruvbox dark draws syntax from its `bright_*` tier; `neutral_*` is what the light variant uses.
 #
 # Contrast is measured against stele's reference background rather than the
 # upstream theme's own, because stele does not set your terminal background.
@@ -20,6 +24,7 @@
 # Every role here clears WCAG AA against that reference.
 #
 # under-aa:
+# upstream: morhetz/gruvbox
 name = "Gruvbox Dark"
 appearance = "dark"
 
@@ -59,14 +64,13 @@ search_match = "#fabd2f"
 search_current = "#fe8019"
 
 # Naming any of these hands the theme the whole code block — see
-# docs/theming.md. Mapped the way the upstream theme maps its own
-# TextMate and tree-sitter scopes.
+# docs/theming.md.
 [syntax]
 plain = "#ebdbb2"
 comment = "#928374"
 comment_doc = "#a89984"
 punctuation = "#d5c4a1"
-operator = "#fe8019"
+operator = "#ebdbb2"
 keyword = "#fb4934"
 keyword_control = "#fb4934"
 label = "#fb4934"
@@ -76,7 +80,7 @@ function_macro = "#8ec07c"
 type = "#fabd2f"
 type_builtin = "#fabd2f"
 constructor = "#fabd2f"
-namespace = "#83a598"
+namespace = "#8ec07c"
 tag = "#83a598"
 property = "#83a598"
 string = "#b8bb26"
@@ -84,6 +88,6 @@ string_escape = "#fe8019"
 number = "#d3869b"
 boolean = "#d3869b"
 constant = "#d3869b"
-variable = "#ebdbb2"
-variable_builtin = "#d3869b"
+variable = "#83a598"
+variable_builtin = "#fe8019"
 error = "#fb4934"

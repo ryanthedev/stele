@@ -229,7 +229,16 @@ your editor:
 stele --theme themes/ports/gruvbox-dark.toml notes.md
 ```
 
-Two things are worth knowing before you use one.
+Three things are worth knowing before you use one.
+
+**The `[syntax]` table is a port; the `[colors]` table is not.** Each project
+publishes its own scope mapping and they disagree with each other more than you
+would guess — Gruvbox paints keywords red, Nord frost blue, Dracula pink,
+Catppuccin mauve, Tokyo Night purple. Those mappings are read from each
+project's own source and each file cites which. The markdown roles are
+different: an editor theme has no opinion about a blockquote gutter or a
+footnote label, so those follow one convention across all six, drawn from that
+theme's palette.
 
 **They set colours, not a background.** stele paints foregrounds onto whatever
 your terminal already is. A port looks like its editor when your terminal is

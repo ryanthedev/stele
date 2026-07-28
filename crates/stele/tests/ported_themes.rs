@@ -157,6 +157,68 @@ fn test_every_port_declares_exactly_its_own_illegible_roles() {
     }
 }
 
+/// The `# upstream:` line, which says whose theme this is.
+fn upstream(source: &str) -> String {
+    source
+        .lines()
+        .find_map(|l| l.trim_start_matches('#').trim().strip_prefix("upstream:"))
+        .expect("every port must name its upstream")
+        .trim()
+        .to_string()
+}
+
+/// Which roles share a colour, as a set of groups — the *shape* of a mapping,
+/// independent of the hues it uses.
+fn shape(theme: &ThemeFile) -> BTreeSet<BTreeSet<String>> {
+    let mut by_colour: std::collections::HashMap<String, BTreeSet<String>> =
+        std::collections::HashMap::new();
+    for (capture, colour) in theme.overrides.capture_iter() {
+        by_colour
+            .entry(format!("{colour:?}"))
+            .or_default()
+            .insert(highlight::capture_name(capture).to_string());
+    }
+    by_colour.into_values().collect()
+}
+
+/// Two different upstreams must not produce the same mapping shape.
+///
+/// This exists because they once did. The first version of these ports ran one
+/// shared role-to-colour convention over all six palettes — keyword red,
+/// function green, type yellow — which is gruvbox's convention and nobody
+/// else's. Nord paints keywords frost blue and does not separate control flow
+/// from other keywords at all; Tokyo Night paints them purple and gives control
+/// flow its own magenta. Flattening that produced six themes a reader could not
+/// tell apart, all of them wrong, and every colour in them was a genuine
+/// upstream hex, so nothing else in this file noticed.
+///
+/// The shape is the tell. Two upstreams agreeing on which roles share a colour,
+/// across twenty-five roles, means somebody reused a convention instead of
+/// reading the source. Gruvbox's two variants are one upstream and are expected
+/// to match, which is why this compares upstreams rather than files.
+#[test]
+fn test_no_two_upstreams_share_a_syntax_mapping_shape() {
+    let mut by_shape: std::collections::HashMap<BTreeSet<BTreeSet<String>>, BTreeSet<String>> =
+        std::collections::HashMap::new();
+    for (name, source) in ports() {
+        let (theme, _) = ThemeFile::parse(&source)
+            .unwrap_or_else(|e| panic!("ports/{name} does not parse: {e}"));
+        by_shape
+            .entry(shape(&theme))
+            .or_default()
+            .insert(upstream(&source));
+    }
+
+    for upstreams in by_shape.values() {
+        assert!(
+            upstreams.len() == 1,
+            "these upstreams share one syntax mapping shape: {upstreams:?} — they \
+             disagree about their own scope colours, so a shared shape means a \
+             house convention was applied instead of each project's definitions"
+        );
+    }
+}
+
 /// Between them the ports must cover both appearances. A light port is the
 /// only one of these files that exercises the light reference background, and
 /// `gruvbox-light` is the reason the light branch of the mapping was found to

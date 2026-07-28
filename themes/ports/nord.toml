@@ -1,30 +1,35 @@
 # Nord — a port of arcticicestudio/nord.
 #
-# An arctic, north-bluish palette. Deliberately low-contrast and
-# low-saturation — the quietest of these ports, and the closest in
-# temperament to stele's own Lichen.
+# An arctic, north-bluish palette. Deliberately low-saturation, and the one
+# port here whose keywords are *blue* — Nord spends its warm colours on
+# meaning (errors, annotations, strings) and its cool ones on syntax.
 #
-# Every colour below is a value published by the upstream theme, with two
-# exceptions, both forced by things stele has and an editor does not:
+# The [syntax] table is mapped from the upstream project's own scope
+# definitions (nordtheme.com/docs/colors-and-palettes), not from a house convention. These themes
+# disagree with each other about what colour a keyword is far more than you
+# would expect, and flattening that would make six ports that were the same
+# picture in different paint.
 #
-#   - The six heading rungs are interpolated between two of the theme's own
-#     colours. No editor theme defines a six-level markdown ramp, and a
-#     rainbow of six unrelated accents would break the one thing the ramp is
-#     for — saying "these are all headings" while the marker count says how
-#     deep. See docs/theming.md.
-#   - Where the upstream palette offers one tier and stele wants two, the
-#     second is derived from the first and said so above.
+# The [colors] table is not a port. Markdown roles — headings, alerts, a
+# blockquote gutter — have no upstream equivalent to be faithful to, so they
+# follow one convention across every theme here, drawn from this palette. The
+# six heading rungs are interpolated between two of the theme's own colours:
+# no editor defines a six-level ramp, and six unrelated accents would break
+# the one thing the ramp is for. See docs/theming.md.
+#
+# NOTE: Nord specifies nord3 (#4c566a) for comments, which is 1.9:1 against this page and unreadable. This uses #616e88, the brightened comment every real Nord editor port ships instead.
 #
 # Contrast is measured against stele's reference background rather than the
 # upstream theme's own, because stele does not set your terminal background.
 #
 # This port is faithful rather than corrected, so it inherits the roles
-# upstream ships below WCAG AA. stele will say so in the status line every
+# upstream ships below WCAG AA. stele says so in the status line every
 # time you load it. Brightening them would make this a theme that merely
-# resembles Nord rather than one that is it. The roles are
-# listed below so you can edit them if you would rather have the contrast.
+# resembles Nord rather than one that is it. They are listed
+# here so you can edit them if you would rather have the contrast.
 #
-# under-aa: syntax.keyword, syntax.label
+# under-aa: alert_caution, syntax.comment, syntax.error
+# upstream: arcticicestudio/nord
 name = "Nord"
 appearance = "dark"
 
@@ -45,13 +50,13 @@ link = "#88c0d0"
 image_alt = "#8f9ab5"
 math = "#b48ead"
 list_marker = "#d08770"
-task_marker = "#b5cf9f"
+task_marker = "#a3be8c"
 blockquote = "#8f9ab5"
 alert_note = "#88c0d0"
-alert_tip = "#b5cf9f"
-alert_important = "#c8a5c1"
-alert_warning = "#f0d9a8"
-alert_caution = "#d08770"
+alert_tip = "#a3be8c"
+alert_important = "#b48ead"
+alert_warning = "#ebcb8b"
+alert_caution = "#bf616a"
 rule = "#8f9ab5"
 table_border = "#8f9ab5"
 table_header = "#ebcb8b"
@@ -60,35 +65,34 @@ footnote_label = "#8f9ab5"
 html = "#8f9ab5"
 front_matter = "#8f9ab5"
 overflow = "#8f9ab5"
-search_match = "#f0d9a8"
-search_current = "#e0a08c"
+search_match = "#ebcb8b"
+search_current = "#d08770"
 
 # Naming any of these hands the theme the whole code block — see
-# docs/theming.md. Mapped the way the upstream theme maps its own
-# TextMate and tree-sitter scopes.
+# docs/theming.md.
 [syntax]
 plain = "#d8dee9"
-comment = "#7b88a1"
-comment_doc = "#8f9ab5"
-punctuation = "#e5e9f0"
-operator = "#d08770"
-keyword = "#bf616a"
-keyword_control = "#d08770"
-label = "#bf616a"
-attribute = "#8fbcbb"
-function = "#b5cf9f"
-function_macro = "#a3cdcc"
-type = "#ebcb8b"
-type_builtin = "#f0d9a8"
-constructor = "#ebcb8b"
-namespace = "#81a1c1"
-tag = "#88c0d0"
-property = "#81a1c1"
+comment = "#616e88"
+comment_doc = "#7b88a1"
+punctuation = "#81a1c1"
+operator = "#81a1c1"
+keyword = "#81a1c1"
+keyword_control = "#81a1c1"
+label = "#81a1c1"
+attribute = "#d08770"
+function = "#88c0d0"
+function_macro = "#88c0d0"
+type = "#8fbcbb"
+type_builtin = "#8fbcbb"
+constructor = "#8fbcbb"
+namespace = "#8fbcbb"
+tag = "#81a1c1"
+property = "#d8dee9"
 string = "#a3be8c"
-string_escape = "#e0a08c"
+string_escape = "#ebcb8b"
 number = "#b48ead"
-boolean = "#c8a5c1"
-constant = "#b48ead"
+boolean = "#b48ead"
+constant = "#d8dee9"
 variable = "#d8dee9"
-variable_builtin = "#c8a5c1"
-error = "#d08770"
+variable_builtin = "#d8dee9"
+error = "#bf616a"

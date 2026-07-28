@@ -1,31 +1,33 @@
 # Gruvbox Light — a port of morhetz/gruvbox.
 #
-# The same retro groove inverted for paper. Gruvbox's `faded_*` accents do
-# the work here — the `neutral_*` set is tuned for a dark page and washes
-# out on a white one, which is why `*_bright` below is a darkened faded
-# rather than a neutral: on paper, louder means closer to the ink.
+# The same retro groove inverted for paper.
 #
-# Every colour below is a value published by the upstream theme, with two
-# exceptions, both forced by things stele has and an editor does not:
+# The [syntax] table is mapped from the upstream project's own scope
+# definitions (colors/gruvbox.vim), not from a house convention. These themes
+# disagree with each other about what colour a keyword is far more than you
+# would expect, and flattening that would make six ports that were the same
+# picture in different paint.
 #
-#   - The six heading rungs are interpolated between two of the theme's own
-#     colours. No editor theme defines a six-level markdown ramp, and a
-#     rainbow of six unrelated accents would break the one thing the ramp is
-#     for — saying "these are all headings" while the marker count says how
-#     deep. See docs/theming.md.
-#   - Where the upstream palette offers one tier and stele wants two, the
-#     second is derived from the first and said so above.
+# The [colors] table is not a port. Markdown roles — headings, alerts, a
+# blockquote gutter — have no upstream equivalent to be faithful to, so they
+# follow one convention across every theme here, drawn from this palette. The
+# six heading rungs are interpolated between two of the theme's own colours:
+# no editor defines a six-level ramp, and six unrelated accents would break
+# the one thing the ramp is for. See docs/theming.md.
+#
+# NOTE: on paper louder means closer to the ink, so `*_bright` is a darkened `faded_*` rather than a `neutral_*` — the neutral tier is tuned for a dark page and washes out on a white one.
 #
 # Contrast is measured against stele's reference background rather than the
 # upstream theme's own, because stele does not set your terminal background.
 #
 # This port is faithful rather than corrected, so it inherits the roles
-# upstream ships below WCAG AA. stele will say so in the status line every
+# upstream ships below WCAG AA. stele says so in the status line every
 # time you load it. Brightening them would make this a theme that merely
-# resembles Gruvbox Light rather than one that is it. The roles are
-# listed below so you can edit them if you would rather have the contrast.
+# resembles Gruvbox Light rather than one that is it. They are listed
+# here so you can edit them if you would rather have the contrast.
 #
-# under-aa: syntax.constructor, syntax.type, table_header
+# under-aa: syntax.constructor, syntax.type, syntax.type_builtin, table_header
+# upstream: morhetz/gruvbox
 name = "Gruvbox Light"
 appearance = "light"
 
@@ -65,31 +67,30 @@ search_match = "#88580f"
 search_current = "#953103"
 
 # Naming any of these hands the theme the whole code block — see
-# docs/theming.md. Mapped the way the upstream theme maps its own
-# TextMate and tree-sitter scopes.
+# docs/theming.md.
 [syntax]
 plain = "#3c3836"
 comment = "#7c6f64"
 comment_doc = "#665c54"
 punctuation = "#504945"
-operator = "#af3a03"
+operator = "#3c3836"
 keyword = "#9d0006"
-keyword_control = "#850005"
+keyword_control = "#9d0006"
 label = "#9d0006"
 attribute = "#427b58"
-function = "#67630c"
-function_macro = "#38694b"
+function = "#79740e"
+function_macro = "#427b58"
 type = "#b57614"
-type_builtin = "#88580f"
+type_builtin = "#b57614"
 constructor = "#b57614"
-namespace = "#076678"
-tag = "#065766"
+namespace = "#427b58"
+tag = "#076678"
 property = "#076678"
 string = "#79740e"
-string_escape = "#953103"
+string_escape = "#af3a03"
 number = "#8f3f71"
-boolean = "#7a3660"
+boolean = "#8f3f71"
 constant = "#8f3f71"
-variable = "#3c3836"
-variable_builtin = "#7a3660"
-error = "#850005"
+variable = "#076678"
+variable_builtin = "#af3a03"
+error = "#9d0006"

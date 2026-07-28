@@ -1,30 +1,33 @@
-# Tokyo Night — a port of folke/tokyonight.nvim (Night variant).
+# Tokyo Night — a port of folke/tokyonight.nvim.
 #
-# Neon over deep navy. Worth knowing: stele's own dark reference background
-# is #1a1b26, which *is* Tokyo Night's — so this port's contrast numbers are
-# the ones its author intended rather than an approximation.
+# Neon over deep navy. Worth knowing: stele's dark reference background is
+# #1a1b26, which *is* Tokyo Night's — so this port's contrast numbers are the
+# ones its author intended rather than an approximation.
 #
-# Every colour below is a value published by the upstream theme, with two
-# exceptions, both forced by things stele has and an editor does not:
+# The [syntax] table is mapped from the upstream project's own scope
+# definitions (tokyonight.nvim groups/base.lua + treesitter.lua), not from a house convention. These themes
+# disagree with each other about what colour a keyword is far more than you
+# would expect, and flattening that would make six ports that were the same
+# picture in different paint.
 #
-#   - The six heading rungs are interpolated between two of the theme's own
-#     colours. No editor theme defines a six-level markdown ramp, and a
-#     rainbow of six unrelated accents would break the one thing the ramp is
-#     for — saying "these are all headings" while the marker count says how
-#     deep. See docs/theming.md.
-#   - Where the upstream palette offers one tier and stele wants two, the
-#     second is derived from the first and said so above.
+# The [colors] table is not a port. Markdown roles — headings, alerts, a
+# blockquote gutter — have no upstream equivalent to be faithful to, so they
+# follow one convention across every theme here, drawn from this palette. The
+# six heading rungs are interpolated between two of the theme's own colours:
+# no editor defines a six-level ramp, and six unrelated accents would break
+# the one thing the ramp is for. See docs/theming.md.
 #
 # Contrast is measured against stele's reference background rather than the
 # upstream theme's own, because stele does not set your terminal background.
 #
 # This port is faithful rather than corrected, so it inherits the roles
-# upstream ships below WCAG AA. stele will say so in the status line every
+# upstream ships below WCAG AA. stele says so in the status line every
 # time you load it. Brightening them would make this a theme that merely
-# resembles Tokyo Night rather than one that is it. The roles are
-# listed below so you can edit them if you would rather have the contrast.
+# resembles Tokyo Night rather than one that is it. They are listed
+# here so you can edit them if you would rather have the contrast.
 #
 # under-aa: footnote_label, front_matter, html, image_alt, strikethrough, syntax.comment, syntax.comment_doc
+# upstream: folke/tokyonight.nvim
 name = "Tokyo Night"
 appearance = "dark"
 
@@ -45,13 +48,13 @@ link = "#2ac3de"
 image_alt = "#737aa2"
 math = "#bb9af7"
 list_marker = "#ff9e64"
-task_marker = "#b9f27c"
+task_marker = "#9ece6a"
 blockquote = "#737aa2"
 alert_note = "#2ac3de"
-alert_tip = "#b9f27c"
-alert_important = "#c8a9ff"
-alert_warning = "#ffc777"
-alert_caution = "#ff7a93"
+alert_tip = "#9ece6a"
+alert_important = "#9d7cd8"
+alert_warning = "#e0af68"
+alert_caution = "#f7768e"
 rule = "#737aa2"
 table_border = "#737aa2"
 table_header = "#e0af68"
@@ -60,35 +63,34 @@ footnote_label = "#737aa2"
 html = "#737aa2"
 front_matter = "#737aa2"
 overflow = "#737aa2"
-search_match = "#ffc777"
-search_current = "#ffb489"
+search_match = "#e0af68"
+search_current = "#ff9e64"
 
 # Naming any of these hands the theme the whole code block — see
-# docs/theming.md. Mapped the way the upstream theme maps its own
-# TextMate and tree-sitter scopes.
+# docs/theming.md.
 [syntax]
 plain = "#c0caf5"
 comment = "#565f89"
 comment_doc = "#737aa2"
 punctuation = "#a9b1d6"
-operator = "#ff9e64"
-keyword = "#f7768e"
-keyword_control = "#ff7a93"
-label = "#f7768e"
+operator = "#89ddff"
+keyword = "#9d7cd8"
+keyword_control = "#bb9af7"
+label = "#7aa2f7"
 attribute = "#7dcfff"
-function = "#b9f27c"
-function_macro = "#89ddff"
-type = "#e0af68"
-type_builtin = "#ffc777"
-constructor = "#e0af68"
-namespace = "#7aa2f7"
-tag = "#2ac3de"
-property = "#7aa2f7"
+function = "#7aa2f7"
+function_macro = "#7dcfff"
+type = "#2ac3de"
+type_builtin = "#27a1b9"
+constructor = "#bb9af7"
+namespace = "#7dcfff"
+tag = "#7aa2f7"
+property = "#73daca"
 string = "#9ece6a"
-string_escape = "#ffb489"
-number = "#bb9af7"
-boolean = "#c8a9ff"
-constant = "#bb9af7"
+string_escape = "#bb9af7"
+number = "#ff9e64"
+boolean = "#ff9e64"
+constant = "#ff9e64"
 variable = "#c0caf5"
-variable_builtin = "#c8a9ff"
-error = "#ff7a93"
+variable_builtin = "#f7768e"
+error = "#f7768e"
