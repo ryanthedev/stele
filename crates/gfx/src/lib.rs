@@ -25,6 +25,7 @@
 
 pub mod decode;
 pub mod protocol;
+mod svg;
 
 pub use decode::{DecodeError, DecodedImage, Limits};
 pub use protocol::{CellRect, Emitter, IdAllocator, ImageId, SourceRect};

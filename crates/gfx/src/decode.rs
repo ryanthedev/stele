@@ -33,6 +33,8 @@ use std::path::Path;
 
 use image::ImageReader;
 
+use crate::svg;
+
 /// Bounds on what this crate will decode. Applied to both the header-only
 /// probe and the full decode, so a bomb-dimension header is rejected before
 /// anything downstream (a layout box reservation, a pixel buffer
@@ -73,7 +75,11 @@ impl Limits {
     /// True if `(width, height)` fits within `max_dim` on both axes and the
     /// RGBA8-decoded byte size fits within `max_alloc`. Zero on either axis
     /// is rejected too (never a valid image to lay out or paint).
-    fn accepts(self, width: u32, height: u32) -> bool {
+    ///
+    /// Crate-visible rather than private so [`crate::svg`] answers to the same
+    /// arithmetic as the raster path. A vector drawing's declared canvas is
+    /// its header, and it earns the same refusal.
+    pub(crate) fn accepts(self, width: u32, height: u32) -> bool {
         if width == 0 || height == 0 || width > self.max_dim || height > self.max_dim {
             return false;
         }
@@ -165,16 +171,67 @@ fn opened(
     path: &Path,
     limits: Limits,
 ) -> Result<ImageReader<std::io::BufReader<std::fs::File>>, DecodeError> {
-    let meta = std::fs::metadata(path).map_err(DecodeError::Io)?;
-    if !meta.is_file() {
-        return Err(DecodeError::NotAFile(path.to_path_buf()));
-    }
+    ensure_regular_file(path)?;
     let mut reader = ImageReader::open(path)
         .map_err(DecodeError::Io)?
         .with_guessed_format()
         .map_err(DecodeError::Io)?;
     reader.limits(limits.to_image_limits());
     Ok(reader)
+}
+
+/// The `stat` half of [`opened`]'s barricade, on its own so the SVG path
+/// answers to it too.
+///
+/// Extracted rather than duplicated, and that is not tidiness. [`opened`]'s
+/// doc explains at length that this check earns its keep by living at the one
+/// function that owns "a path becomes pixels" — the FIFO that hangs `open(2)`
+/// forever had already been fixed four times at four call sites before it was
+/// fixed here. A second reader of document-supplied paths is exactly the
+/// fifth call site that argument predicted, so it gets the same guard rather
+/// than its own copy of one.
+fn ensure_regular_file(path: &Path) -> Result<(), DecodeError> {
+    let meta = std::fs::metadata(path).map_err(DecodeError::Io)?;
+    if !meta.is_file() {
+        return Err(DecodeError::NotAFile(path.to_path_buf()));
+    }
+    Ok(())
+}
+
+/// Reads `path` as SVG source if that is what it is.
+///
+/// `Ok(None)` means "this is not an SVG, carry on with the raster path" — the
+/// sniff is on content, never on the extension, so a `.svg` holding a PNG
+/// decodes as a PNG and a `diagram.txt` holding SVG renders as a drawing.
+///
+/// Bounded twice over: the file is refused before reading if it is larger
+/// than [`svg::MAX_SVG_BYTES`], so a huge file is never pulled into memory to
+/// discover it was too big, and the read is capped anyway in case the file
+/// grew between the two.
+fn read_svg_source(path: &Path) -> Result<Option<String>, DecodeError> {
+    use std::io::Read as _;
+
+    ensure_regular_file(path)?;
+    let mut file = std::fs::File::open(path).map_err(DecodeError::Io)?;
+
+    let mut prefix = [0u8; 1024];
+    let read = file.read(&mut prefix).map_err(DecodeError::Io)?;
+    if !svg::looks_like_svg(&prefix[..read]) {
+        return Ok(None);
+    }
+
+    let len = file.metadata().map_err(DecodeError::Io)?.len();
+    if len > svg::MAX_SVG_BYTES as u64 {
+        return Err(DecodeError::Malformed(format!(
+            "svg: {len} bytes, over the {}-byte limit",
+            svg::MAX_SVG_BYTES
+        )));
+    }
+    let mut source = String::from_utf8_lossy(&prefix[..read]).into_owned();
+    file.take(svg::MAX_SVG_BYTES as u64)
+        .read_to_string(&mut source)
+        .map_err(|_| DecodeError::Malformed("svg: source is not valid UTF-8".to_string()))?;
+    Ok(Some(source))
 }
 
 /// The in-memory twin of [`opened`]. Same `limits`, applied the same way and
@@ -198,6 +255,9 @@ fn opened_bytes(bytes: &[u8], limits: Limits) -> Result<ImageReader<Cursor<&[u8]
 /// `limits` would reject — a decompression-bomb *header* never gets a
 /// chance to reserve a giant layout box.
 pub fn probe_dimensions(path: &Path, limits: Limits) -> Result<(u32, u32), DecodeError> {
+    if let Some(source) = read_svg_source(path)? {
+        return svg::probe(&source, limits);
+    }
     let reader = opened(path, limits)?;
     let (width, height) = reader.into_dimensions().map_err(|e| match e {
         image::ImageError::Limits(_) => DecodeError::ExceedsLimits {
@@ -228,11 +288,27 @@ pub fn decode_and_scale(
     target_px: (u32, u32),
     limits: Limits,
 ) -> Result<DecodedImage, DecodeError> {
-    let img = decode_within_limits(|| opened(path, limits), limits)?;
+    // Vector and raster meet here and nowhere else: both produce a
+    // `DynamicImage`, and `letterbox_onto` is the single place that decides
+    // what a transmitted raster's pixel dimensions are. An SVG that
+    // letterboxed itself would be a second answer to that question.
+    // The reported source size is the *input's* own, never the buffer's —
+    // they are the same number for a raster and deliberately different for a
+    // vector, which is fitted to the target before a pixel is allocated.
+    let (source_width, source_height, img) = match read_svg_source(path)? {
+        Some(source) => {
+            let out = svg::rasterize(&source, target_px, limits)?;
+            (out.source.0, out.source.1, out.image)
+        }
+        None => {
+            let img = decode_within_limits(|| opened(path, limits), limits)?;
+            (img.width(), img.height(), img)
+        }
+    };
     let png = letterbox_onto(&img, target_px)?;
     Ok(DecodedImage {
-        source_width: img.width(),
-        source_height: img.height(),
+        source_width,
+        source_height,
         png,
     })
 }
@@ -1066,6 +1142,103 @@ mod tests {
             pixel[0] > 200 && pixel[2] < 60,
             "expected the first (red) frame, got {pixel:?}"
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// SVG through the public entry points, which is the half `svg`'s own
+    /// tests cannot reach: the sniff, the byte cap, and the shared letterbox.
+    ///
+    /// The extension is deliberately wrong on two of these. Detection is by
+    /// content everywhere in this module, and an SVG named `.png` is the
+    /// cheapest way to state that a reader can trust the picture over the
+    /// filename.
+    #[test]
+    fn test_svg_probes_and_decodes_through_the_public_path() {
+        const DRAWING: &[u8] =
+            br##"<svg xmlns="http://www.w3.org/2000/svg" width="120" height="60">
+            <rect width="120" height="60" fill="#3a78c8"/></svg>"##;
+
+        for name in ["drawing.svg", "lying.png", "no-extension"] {
+            let path = write_file(name, DRAWING);
+            assert_eq!(
+                probe_dimensions(&path, Limits::default()).expect("probes"),
+                (120, 60),
+                "{name} did not probe as SVG"
+            );
+            let decoded = decode_and_scale(&path, (40, 40), Limits::default()).expect("decodes");
+            assert_eq!((decoded.source_width, decoded.source_height), (120, 60));
+            let raster = image::load_from_memory(&decoded.png).expect("a readable png");
+            assert_eq!(
+                (raster.width(), raster.height()),
+                (40, 40),
+                "the shared letterbox must still hand back exactly the target box"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    /// A `.svg` holding a PNG is a PNG. The sniff runs both ways or it is not
+    /// a sniff.
+    #[test]
+    fn test_a_raster_named_svg_still_decodes_as_a_raster() {
+        let path = write_file("raster-named.svg", &valid_tiny_png());
+        assert!(probe_dimensions(&path, Limits::default()).is_ok());
+        assert!(decode_and_scale(&path, (8, 8), Limits::default()).is_ok());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The byte cap is checked from the file's own length before the source is
+    /// read, so an oversized drawing never reaches memory to be measured.
+    #[test]
+    fn test_an_oversized_svg_is_refused_without_being_read() {
+        let mut source = Vec::from(
+            &b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\">"[..],
+        );
+        source.resize(crate::svg::MAX_SVG_BYTES + 1_024, b' ');
+        source.extend_from_slice(b"</svg>");
+        let path = write_file("huge.svg", &source);
+
+        let err = probe_dimensions(&path, Limits::default()).expect_err("too large");
+        assert!(
+            matches!(&err, DecodeError::Malformed(m) if m.contains("over the")),
+            "{err:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The barricade covers the vector path too — with the same watchdog the
+    /// raster FIFO test uses, because a regression here *hangs* rather than
+    /// failing, and a bare call would wedge the suite.
+    ///
+    /// This is the test the `ensure_regular_file` extraction exists for. The
+    /// whole argument in `opened`'s doc is that fixing the block at call sites
+    /// leaves the next reader of a document-supplied path exposed; the SVG
+    /// path is that next reader, and a `.svg` FIFO is how it would have shown
+    /// up.
+    #[cfg(unix)]
+    #[test]
+    fn test_a_fifo_named_svg_is_refused_by_type_and_never_opened() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let path = scratch_path("svg-fifo.svg");
+        let _ = std::fs::remove_file(&path);
+        let made = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .expect("run mkfifo");
+        assert!(made.success(), "mkfifo failed: {made:?}");
+
+        let (tx, rx) = mpsc::channel();
+        let path_for_thread = path.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(probe_dimensions(&path_for_thread, Limits::default()).err());
+        });
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(Some(err)) => assert!(matches!(err, DecodeError::NotAFile(_)), "{err:?}"),
+            Ok(None) => panic!("a fifo must not probe as an image"),
+            Err(_) => panic!("the svg path blocked on a fifo — the stat guard was bypassed"),
+        }
         let _ = std::fs::remove_file(&path);
     }
 }

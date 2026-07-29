@@ -33,6 +33,23 @@ image = { version = "0.25", default-features = false, features = [
     "ico",
     "tiff",
 ] }
+# SVG, the one vector format on this path. Pure Rust like everything else
+# here (usvg parses, tiny-skia rasterizes). Two of resvg's default features
+# are deliberately off:
+#
+#   raster-images — lets an SVG embed a PNG/JPEG/GIF via `<image href="data:">`
+#     and decode it during parsing. That is a second decoder, reached from
+#     document content, that would not answer to this crate's `Limits` — the
+#     one property the module exists to guarantee. An SVG that embeds a bitmap
+#     renders everything except the bitmap, which is the safe half of the
+#     trade and the one worth taking on a hostile-input path.
+#   memmap-fonts — maps font files into the address space to load them faster.
+#     `svg::fonts` loads once for the life of the process, so the speed is not
+#     worth the extra surface.
+resvg = { version = "0.47", default-features = false, features = [
+    "text",
+    "system-fonts",
+] }
 
 [dev-dependencies]
 # Live-Ghostty test only (crates/gfx/tests/live_ghostty.rs); not linked into

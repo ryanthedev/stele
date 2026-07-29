@@ -235,14 +235,17 @@ impl IntrinsicSizer for ImageSizer {
     }
 }
 
-/// Rejects remote (`scheme://`) URLs and SVG — both explicitly out of
-/// scope ("local file paths only... no SVG"). Everything else is treated
-/// as a local, possibly relative, path.
+/// Rejects remote (`scheme://`) URLs. Everything else is treated as a local,
+/// possibly relative, path.
+///
+/// This used to reject `.svg` as well, back when vector input was out of
+/// scope, and it did so by *extension* — the one place in the media path that
+/// judged a file by its name rather than its content. `gfx` now renders SVG
+/// and sniffs every format from its bytes, so the exclusion is gone and the
+/// inconsistency with it: what a file is called decides nothing here except
+/// whether it is a URL.
 fn is_local_image_path(dest: &str) -> bool {
-    if dest.is_empty() || dest.contains("://") || dest.starts_with("//") {
-        return false;
-    }
-    !dest.to_ascii_lowercase().ends_with(".svg")
+    !(dest.is_empty() || dest.contains("://") || dest.starts_with("//"))
 }
 
 fn resolve_path(base_dir: &Path, dest: &str) -> PathBuf {
@@ -515,9 +518,23 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// An SVG reserves a box from its own declared canvas.
+    ///
+    /// This test used to assert the opposite — that `.svg` sized to `None` —
+    /// because vector input was out of scope and `is_local_image_path`
+    /// excluded it by extension. That exclusion is exactly why SVG rendered
+    /// as alt text after `gfx` had already learned to draw it, and every unit
+    /// test in `gfx` passed the whole time: the format worked and nothing was
+    /// allowed to ask it to. The assertion is inverted rather than deleted so
+    /// the file still says what happens to an SVG.
     #[test]
-    fn test_size_image_none_for_svg() {
+    fn test_size_image_sizes_an_svg_from_its_own_canvas() {
         let dir = scratch_dir("svg");
+        std::fs::write(
+            dir.join("diagram.svg"),
+            br##"<svg xmlns="http://www.w3.org/2000/svg" width="240" height="120"><rect width="240" height="120" fill="#123456"/></svg>"##,
+        )
+        .expect("write svg");
         let sizer = ImageSizer::new(&dir);
         let doc = Document::parse("![alt](diagram.svg)\n");
         let image_node = doc
@@ -525,7 +542,13 @@ mod tests {
             .find(|n| matches!(n, NodeRef::Inline(i) if matches!(i.kind, InlineKind::Image { .. })))
             .unwrap()
             .id();
-        assert!(sizer.size(image_node, &doc).is_none());
+        let size = sizer
+            .size(image_node, &doc)
+            .expect("an svg must reserve a box");
+        assert!(
+            size.cols > 0 && size.rows > 0,
+            "an svg box must have extent: {size:?}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
