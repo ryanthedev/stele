@@ -63,6 +63,40 @@ Separately, `test_probing_a_labelled_drawing_does_not_load_fonts` (`svg.rs:797-8
 - [ ] DW-1.6: The surviving test is renamed to what it now asserts (e.g. `test_the_node_cap_is_reachable_within_the_byte_cap`), and its doc records the actual headroom (`MAX_SVG_BYTES` 4,194,304 vs `MAX_XML_NODES` × 4 = 800,000, a 5.24× margin) so a future reader knows how loose the pin is. The `decode.rs:641` cross-reference survives.
 - [ ] DW-1.7: `cargo test -p gfx` passes and `cargo clippy --all-targets` is silent.
 
+### Phase 1b: Close the DOCTYPE-scan bypass the batch review found
+**Skills:** code-foundations:cc-defensive-programming
+**Model:** opus
+**Gate:** Full
+**Security-sensitive:** yes
+**Depends on:** Phase 1
+**File scope:** crates/gfx/src/svg.rs
+
+**Amendment note.** This phase did not exist when the plan was written and it violates the plan's original "no change to guard behaviour" constraint. It is added because the Phase 1 batch review falsified DW-1.2 by execution: `refuse_internal_subset` ends the DOCTYPE at the first `>` (`svg.rs:111`), but XML's `SystemLiteral` may contain `>`, so `<!DOCTYPE svg SYSTEM "x>y" [ <!ENTITY a "…"> ]>` slips an internal subset past the guard. Reproduced independently by the orchestrator through the real public path `gfx::decode::probe_dimensions`: two files differing by one byte — `SYSTEM "x>y"` vs `SYSTEM "xy"` — gave `Ok((10, 10))` in 23 ms with 1,000,000 bytes of entity text expanded, versus `Err(Malformed("svg: declares its own XML entities, which this refuses to expand"))` in 127 µs. Weakening the DW-1.2 sentence to match a leaky guard was the alternative and is worse: it would ship a known hole with a comment explaining it.
+
+**Goal:** Make the DOCTYPE internal-subset scan quote-aware so the guard refuses the entire class it claims to, and pin the bypass shape with a regression test.
+
+**Scope:**
+- IN: `refuse_internal_subset` (`svg.rs:101-118`) and its doc; new regression tests for the quoted-`>` shapes.
+- OUT: Every other guard, every cap value, `parse`, `probe`, `rasterize`, and all Phase 1 prose (already correct once this lands).
+
+**Edge cases:**
+- Both quote characters are legal delimiters in XML literals: `SYSTEM "x>y"` and `SYSTEM 'x>y'`. A scan that handles only `"` is the same defect with an extra step.
+- `PUBLIC` declarations carry **two** literals (`PublicidLiteral` then `SystemLiteral`); both may contain `>`.
+- A `>` inside a quoted literal must not end the DOCTYPE; a `[` inside a quoted literal must *not* be read as an internal subset opening (`SYSTEM "a[b"` is not a subset).
+- An unterminated quote must not run the scan off the end or panic — it should refuse, not silently accept.
+- The existing accepted case must keep working: `<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">` (Illustrator/Inkscape emit it) must still parse.
+
+**Produces:** A guard whose doc claim ("refusing that construct refuses the entire class") is true, which is what DW-1.2's argument for `MAX_SVG_BYTES` rests on.
+
+**Done when:**
+- [ ] DW-1b.1: `<!DOCTYPE svg SYSTEM "x>y" [ <!ENTITY a "…"> ]>` is refused, with the same error as the unquoted form. Pinned by a test that fails against the pre-fix scan.
+- [ ] DW-1b.2: The single-quoted form `SYSTEM 'x>y'` and the two-literal `PUBLIC "…>…" "…>…"` form are refused too, each with its own test.
+- [ ] DW-1b.3: `SYSTEM "a[b"` — a `[` inside a literal, no real subset — still parses; a bracket in a quoted literal is not an internal subset.
+- [ ] DW-1b.4: An unterminated literal (`SYSTEM "x` with no closing quote) is refused rather than accepted, and does not panic or scan out of bounds.
+- [ ] DW-1b.5: `test_a_plain_doctype_is_still_accepted` still passes unchanged — the legitimate Illustrator/Inkscape DOCTYPE is not collateral.
+- [ ] DW-1b.6: The orchestrator's reproduction is inverted: the `evil.svg` shape that returned `Ok((10, 10))` now returns the refusal error, demonstrated through `probe_dimensions`, and the output is recorded in the execution log.
+- [ ] DW-1b.7: Full workspace suite green (≥806 passed, 0 failed), `cargo clippy --workspace --all-targets --all-features -- -D warnings` silent, `cargo fmt --all --check` clean.
+
 ### Phase 2: Pin "probe requests no fonts" without a stopwatch
 **Skills:** code-foundations:cc-quality-practices
 **Model:** opus
@@ -92,7 +126,8 @@ Separately, `test_probing_a_labelled_drawing_does_not_load_fonts` (`svg.rs:797-8
 - [ ] DW-2.2: `test_probing_a_labelled_drawing_does_not_load_fonts` asserts that the database `probe` selects for a text-bearing drawing is empty, and that the mode `probe` passes is `Fonts::Never`. It passes.
 - [ ] DW-2.3: Demonstrated failure: with `probe` temporarily switched to `Fonts::IfPresent`, the new assertion fails and the failure output is recorded in the execution log. The old timing-only assertion's outcome under the same mutation is also recorded, together with the conditions (`OnceLock` warmth, host font-load speed) that determine it. The mutation is reverted.
 - [ ] DW-2.4: No `cfg(test)` conditional determines which `fontdb` `parse` receives — verified by inspecting the diff for `cfg(test)` inside the parse path.
-- [ ] DW-2.5: Full workspace suite green — the `b1b2cee` baseline is `806 passed, 6 ignored`, and the count may only rise — and `cargo clippy --all-targets` silent. Suite re-run at `--test-threads=16` to confirm order-independence.
+- [ ] DW-2.5: Full workspace suite green — the measured baseline is `806 passed, 0 failed, 7 ignored` (Phase 1 corrected the plan's original "6 ignored"), and the count may only rise — and `cargo clippy --workspace --all-targets --all-features -- -D warnings` silent. Suite re-run at `--test-threads=16` to confirm order-independence.
+- [ ] DW-2.6: The orphaned doc block at `svg.rs:319-325` is reattached. It documents `fn parse` but sits on `enum Fonts`, and `Fonts`'s own one-line doc is stranded as that block's last line, leaving `fn parse` undocumented. Found by Phase 1, in the exact region this phase restructures; added to scope so this phase does not edit around a broken doc attachment.
 
 ---
 ## Test Coverage
@@ -116,4 +151,11 @@ Separately, `test_probing_a_labelled_drawing_does_not_load_fonts` (`svg.rs:797-8
 
 ---
 ## Execution Log
-_To be filled during /code-foundations:build_
+
+### Phase 1: Make every surviving dependency claim true (Gate: Standard)
+- [x] BUILD: Discovery + design + implementation (stub → implement → validate) complete
+- [x] REVIEW: DEFERRED — batch pending (tests green at commit)
+- [x] Committed
+Commit: e3d2a80
+Summary: All six stale dependency claims in `crates/gfx/src/svg.rs` now match what roxmltree and usvg actually do; `ROXMLTREE_MAX_EXPANSION` and the 2 GiB assertion are gone, the surviving test is renamed `test_the_node_cap_is_reachable_within_the_byte_cap`, and `MAX_SVG_BYTES` has a real argument (no internal subset ⇒ no expansion ⇒ peak text ≈ source bytes). No guard, cap value, or parse path changed. 806 passed / 0 failed / 7 ignored, clippy and fmt clean.
+Build-agent corrections to this plan: (a) `NodesLimitReached` is **roxmltree's** error which usvg imports (`svgtree/parse.rs:6`), not a usvg variant — the plan's site-6 row said otherwise and would have planted a fresh false claim; (b) `crates/gfx/src/decode.rs:51` named the renamed test and claimed a relationship the deleted assertion no longer supports, so it was corrected too — two lines outside the declared File scope, accepted by the orchestrator because DW-1.6 requires that cross-reference to survive.

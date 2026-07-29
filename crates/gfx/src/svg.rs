@@ -99,6 +99,37 @@ const SNIFF_BYTES: usize = 1024;
 /// `<!DOCTYPE svg` and its closing `>`, so refusing that construct refuses
 /// the entire class.
 ///
+/// Finding that `[` takes a quote-aware walk rather than a `find('>')`, and
+/// the difference is a bypass rather than a nicety. XML's `SystemLiteral` is
+/// `('"' [^"]* '"') | ("'" [^']* "'")` (production 11), so it may hold a `>`
+/// — and `<!DOCTYPE svg SYSTEM "x>y" [ <!ENTITY a "…"> ]>` does not end at
+/// that one. Measured through [`crate::decode::probe_dimensions`] against the
+/// pre-fix scan, on the fixture
+/// `test_dw_1b_6_the_reproduced_bypass_is_refused_through_probe_dimensions`
+/// still holds and its twin one byte shorter: `SYSTEM "x>y"` returned
+/// `Ok((10, 10))` in 12 ms having expanded 256 KiB of entity text, while
+/// `SYSTEM "xy"` was refused in 124 µs.
+///
+/// So this walks the declaration once, treating a quoted run as opaque. One
+/// pass is exact rather than approximate, because production 28 is
+/// `'<!DOCTYPE' S Name (S ExternalID)? S? ('[' intSubset ']' S?)? '>'` and
+/// between `<!DOCTYPE` and the subset's `[` it admits only `Name` and
+/// `ExternalID` (75): a name carries no `>` or quote, and an external id's
+/// only free-form regions are its literals. No unquoted `>` can precede the
+/// `[`, so whichever of the two turns up first outside a quote settles it.
+///
+/// Both quote characters delimit, and both of `PUBLIC`'s literals are walked
+/// the same way. `PubidChar` (13) lists neither `>` nor `[`, so a *legal*
+/// `PubidLiteral` could not hide either — but a hostile document is under no
+/// obligation to be legal, and that asymmetry is not worth the branch it would
+/// save.
+///
+/// A declaration that never closes — an unterminated literal, or a `<!DOCTYPE`
+/// cut off before its `>` — is refused rather than accepted, since at that
+/// point this cannot say what the document declares. It gets a message of its
+/// own: calling it a document that "declares its own XML entities" would
+/// assert something the walk never read.
+///
 /// A DOCTYPE **without** an internal subset stays legal, which is the reason
 /// this is a scan and not `allow_dtd: false`. Illustrator and older Inkscape
 /// emit `<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" ...>` on files that
@@ -118,15 +149,27 @@ fn refuse_internal_subset(source: &str) -> Result<(), DecodeError> {
     let Some(doctype) = prologue.find("<!DOCTYPE") else {
         return Ok(());
     };
-    // The internal subset opens with `[` before the declaration's own `>`.
-    let rest = &prologue[doctype..];
-    let end = rest.find('>').unwrap_or(rest.len());
-    if rest[..end].contains('[') {
-        return Err(DecodeError::Malformed(
-            "svg: declares its own XML entities, which this refuses to expand".to_string(),
-        ));
+    // Walked as bytes: every delimiter here is ASCII and no UTF-8
+    // continuation byte is, so this cannot land inside a character.
+    let mut quote: Option<u8> = None;
+    for &byte in &prologue.as_bytes()[doctype..] {
+        match (quote, byte) {
+            (Some(open), b) if b == open => quote = None,
+            (Some(_), _) => {}
+            (None, b'"' | b'\'') => quote = Some(byte),
+            // The internal subset opens here, before the declaration's `>`.
+            (None, b'[') => {
+                return Err(DecodeError::Malformed(
+                    "svg: declares its own XML entities, which this refuses to expand".to_string(),
+                ));
+            }
+            (None, b'>') => return Ok(()),
+            (None, _) => {}
+        }
     }
-    Ok(())
+    Err(DecodeError::Malformed(
+        "svg: DOCTYPE does not close before the root element".to_string(),
+    ))
 }
 
 /// Wall-clock budget for turning one drawing into pixels.
@@ -772,6 +815,153 @@ mod tests {
             "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"40\" height=\"20\"/>"
         );
         assert_eq!(probe(source, Limits::default()).expect("parses"), (40, 20));
+    }
+
+    /// Builds a drawing whose DOCTYPE carries `external_id` and an internal
+    /// subset. Small on purpose: `read_source` only sniffs
+    /// [`SNIFF_BYTES`] for the root element, so a fixture whose prologue
+    /// outgrew that would stop being recognised as SVG and would prove
+    /// nothing about this guard.
+    fn subset_behind(external_id: &str) -> String {
+        format!(
+            "<?xml version=\"1.0\"?>\n\
+             <!DOCTYPE svg {external_id} [ <!ENTITY a \"AAAAAAAAAAAAAAAA\"> ]>\n\
+             <svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\">\
+             <desc>&a;</desc></svg>"
+        )
+    }
+
+    fn refusal_of(source: &str) -> DecodeError {
+        probe(source, Limits::default()).expect_err("an internal subset is refused")
+    }
+
+    /// The bypass the Phase 1 batch review found by execution.
+    ///
+    /// A `>` inside a `SystemLiteral` is legal (XML production 11 is
+    /// `('"' [^"]* '"') | ("'" [^']* "'")`), and the old scan ended the
+    /// declaration at the first `>` it saw — so the `[` two characters later
+    /// was never examined. Measured through `probe_dimensions` before the fix:
+    /// `Ok((10, 10))` in 23 ms, a megabyte of entity text expanded. The
+    /// unquoted twin differs by one byte and was refused in 127 µs; this
+    /// asserts the two now produce the *same* error, which is the whole claim.
+    #[test]
+    fn test_dw_1b_1_a_subset_behind_a_quoted_gt_is_refused_like_the_unquoted_twin() {
+        let hidden = refusal_of(&subset_behind(r#"SYSTEM "x>y""#));
+        let plain = refusal_of(&subset_behind(r#"SYSTEM "xy""#));
+        assert!(
+            matches!(&hidden, DecodeError::Malformed(m) if m.contains("own XML entities")),
+            "{hidden:?}"
+        );
+        assert_eq!(
+            format!("{hidden:?}"),
+            format!("{plain:?}"),
+            "one byte of quoting must not change the answer"
+        );
+    }
+
+    /// `'` delimits a literal exactly as `"` does, so a scan that knew only
+    /// about double quotes would be the same defect with an extra step.
+    #[test]
+    fn test_dw_1b_2_a_single_quoted_literal_hides_no_subset_either() {
+        let err = refusal_of(&subset_behind(r#"SYSTEM 'x>y'"#));
+        assert!(
+            matches!(&err, DecodeError::Malformed(m) if m.contains("own XML entities")),
+            "{err:?}"
+        );
+    }
+
+    /// `PUBLIC` carries **two** literals (production 75: `'PUBLIC' S
+    /// PubidLiteral S SystemLiteral`), so both have to be walked. A legal
+    /// `PubidLiteral` could not in fact hold a `>` — `PubidChar` (13) does not
+    /// list one — but nothing obliges a hostile document to be legal, and the
+    /// guard does not lean on that.
+    #[test]
+    fn test_dw_1b_2_both_public_literals_are_walked_for_a_hidden_subset() {
+        let err = refusal_of(&subset_behind(r#"PUBLIC "-//a>b//EN" "http://c>d/x.dtd""#));
+        assert!(
+            matches!(&err, DecodeError::Malformed(m) if m.contains("own XML entities")),
+            "{err:?}"
+        );
+    }
+
+    /// The inverse error, and the reason the walk cannot simply refuse on any
+    /// `[`: a bracket inside a literal is an ordinary character, not a subset.
+    #[test]
+    fn test_dw_1b_3_a_bracket_inside_a_literal_is_not_an_internal_subset() {
+        let source = concat!(
+            "<?xml version=\"1.0\"?>\n",
+            "<!DOCTYPE svg SYSTEM \"a[b\">\n",
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"40\" height=\"20\"/>"
+        );
+        assert_eq!(probe(source, Limits::default()).expect("parses"), (40, 20));
+    }
+
+    /// A literal that never closes leaves the walk unable to say what the
+    /// document declares, so it refuses — the safe direction in front of a
+    /// parser whose failure mode is unbounded memory on the layout thread.
+    /// The message is the DOCTYPE one rather than the entity one, because no
+    /// subset was ever read.
+    #[test]
+    fn test_dw_1b_4_an_unterminated_literal_is_refused_rather_than_walked_past() {
+        let source = concat!(
+            "<?xml version=\"1.0\"?>\n",
+            "<!DOCTYPE svg SYSTEM \"x\n",
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"40\" height=\"20\"/>"
+        );
+        let err = probe(source, Limits::default()).expect_err("an unclosed DOCTYPE is refused");
+        assert!(
+            matches!(&err, DecodeError::Malformed(m) if m.contains("does not close")),
+            "{err:?}"
+        );
+    }
+
+    /// Every truncation of a hostile DOCTYPE, since the walk indexes bytes and
+    /// a file can end anywhere. Nothing may panic; each prefix must land on
+    /// one of the two answers rather than out of bounds.
+    #[test]
+    fn test_dw_1b_4_no_prefix_of_a_hostile_doctype_walks_out_of_bounds() {
+        let hostile = subset_behind(r#"PUBLIC 'p>[q' "s>[t""#);
+        assert!(
+            hostile.is_ascii(),
+            "prefixes must split on character bounds"
+        );
+        for end in 0..=hostile.len() {
+            let _ = refuse_internal_subset(&hostile[..end]);
+        }
+    }
+
+    /// The reproduction, inverted, through the real public entry point.
+    ///
+    /// `decode::probe_dimensions` is what layout calls, and it is where the
+    /// bypass was demonstrated: this file's shape returned `Ok((10, 10))` with
+    /// a megabyte of entity text expanded. Driving the same bytes off disk
+    /// rather than calling [`refuse_internal_subset`] directly is the point —
+    /// it pins the guard where it is actually reached, past the sniff and the
+    /// byte cap.
+    #[test]
+    fn test_dw_1b_6_the_reproduced_bypass_is_refused_through_probe_dimensions() {
+        let mut source = String::from(
+            "<?xml version=\"1.0\"?>\n\
+             <!DOCTYPE svg SYSTEM \"x>y\" [ <!ENTITY a \"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"> ]>\n\
+             <svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\"><desc>",
+        );
+        for _ in 0..8_192 {
+            source.push_str("&a;");
+        }
+        source.push_str("</desc></svg>");
+
+        let dir = std::env::temp_dir().join(format!("stele-svg-bypass-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("evil.svg");
+        std::fs::write(&path, &source).expect("write");
+
+        let err = crate::decode::probe_dimensions(&path, Limits::default())
+            .expect_err("the hidden subset is refused on the public path");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            matches!(&err, DecodeError::Malformed(m) if m.contains("own XML entities")),
+            "{err:?}"
+        );
     }
 
     /// The time cap, on the one axis no byte or node count can see.
