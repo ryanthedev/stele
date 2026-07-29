@@ -48,8 +48,9 @@ use crate::svg;
 /// `svg::MAX_XML_NODES` — are compile-time constants there rather than knobs
 /// here; asking a caller to tune a node budget in the same struct as a pixel
 /// budget would be asking them to reason about something they cannot see.
-/// `svg::test_the_input_caps_cannot_outgrow_the_output_cap` is what keeps the
-/// two sides in a stated relationship.
+/// `svg::test_the_node_cap_is_reachable_within_the_byte_cap` keeps those two
+/// input caps in a stated relationship with *each other*. Nothing ties either
+/// to the pixel budget here, because there is no honest conversion to state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
     /// No decoded (or header-reported) dimension may exceed this on either

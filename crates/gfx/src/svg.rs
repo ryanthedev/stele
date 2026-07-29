@@ -21,14 +21,18 @@
 //!      the source, so the real growth is quadratic, and at [`MAX_SVG_BYTES`]
 //!      it is terabytes. [`refuse_internal_subset`] is what actually stops it.
 //!   2. **Node count.** [`MAX_XML_NODES`] bounds elements. `usvg` has caps of
-//!      its own on this path — 1,000,000 elements
-//!      (`usvg-0.47.0/src/parser/mod.rs:36`) and `<use>` depth 1024
-//!      (`svgtree/parse.rs:182`) — so this is a tightening rather than the
-//!      only bound, five times lower and applied a stage earlier. The reason
-//!      to keep parsing the XML here rather than calling
-//!      `usvg::Tree::from_data` is that `from_data` fixes `nodes_limit` at
-//!      `u32::MAX` with no way to change it
-//!      (`usvg-0.47.0/src/parser/mod.rs:147`), and `from_xmltree` is the seam
+//!      its own on this path — 1,000,000 nodes
+//!      (`usvg-0.47.0/src/parser/svgtree/parse.rs:392`) and `<use>` depth 1024
+//!      (`svgtree/parse.rs:182`), both raising
+//!      `roxmltree::Error::NodesLimitReached`, which `usvg` imports there
+//!      rather than using an error of its own (`svgtree/parse.rs:6`) — so this
+//!      is a tightening rather than the only bound, five times lower and
+//!      applied a stage earlier. The reason to keep parsing the XML here
+//!      rather than calling `usvg::Tree::from_data` is that `from_data`
+//!      (`usvg-0.47.0/src/parser/mod.rs:98`) hands off to `from_str`
+//!      (`mod.rs:146`), whose `ParsingOptions` leaves `nodes_limit` at its
+//!      `u32::MAX` default with no way to change it (`mod.rs:147`,
+//!      `roxmltree-0.21.1/src/parse.rs:375`), and `from_xmltree` is the seam
 //!      that lets a caller set one.
 //!   3. **Canvas size.** A `viewBox` can claim any dimensions it likes. The
 //!      declared size is checked against `Limits` like a raster header, and
@@ -66,9 +70,17 @@ use crate::decode::{DecodeError, Limits};
 /// The largest SVG source this will parse.
 ///
 /// An SVG is text, and a hand-written or tool-exported one is kilobytes. Four
-/// megabytes is far past any real diagram and is the number that turns
-/// `roxmltree`'s "expansion is linear in the source" into an absolute ceiling
-/// rather than a relative one.
+/// megabytes is far past any real diagram.
+///
+/// It also bounds the text one parse can *hold*, and that is a fact about
+/// [`refuse_internal_subset`] rather than about `roxmltree`. Custom entities
+/// are the only construct that makes an XML document grow, and the only way
+/// one reaches a parse here is a DOCTYPE's internal subset — that is what is
+/// refused, and an external subset is never fetched to begin with. Every
+/// substitution still legal — `&amp;`, `&#x2014;` — is shorter than the source
+/// it replaces. So peak text stays at roughly the source's own size and this
+/// one number caps both. What `roxmltree` does to entity expansion is measured
+/// in the module doc, and it is not a bound.
 pub(crate) const MAX_SVG_BYTES: usize = 4 * 1024 * 1024;
 
 /// How much of a file is read to decide whether it is SVG.
@@ -132,8 +144,14 @@ const RENDER_TIME_CAP: Duration = Duration::from_millis(250);
 
 /// The largest parsed XML node count.
 ///
-/// `usvg` sets no limit of its own, so this is the whole of that bound. A
-/// complex real diagram — a full architecture drawing, a rendered Mermaid
+/// A tightening, not the only bound. `usvg` caps this path too — 1,000,000
+/// nodes (`usvg-0.47.0/src/parser/svgtree/parse.rs:392`) and 1024 levels of
+/// nesting, which `<use>` expansion also spends (`svgtree/parse.rs:182`) — but
+/// both fire a stage later, once `roxmltree` has already built the document
+/// this bounds. Five times lower and one stage earlier is the whole of what
+/// this adds.
+///
+/// A complex real diagram — a full architecture drawing, a rendered Mermaid
 /// graph — lands in the low thousands; two hundred thousand is generous
 /// enough that no honest document meets it and small enough that a
 /// pathological one stops early.
@@ -605,9 +623,12 @@ mod tests {
         assert!(matches!(err, DecodeError::ExceedsLimits { .. }), "{err:?}");
     }
 
-    /// The node-count bound, which is entirely this module's — `usvg` sets
-    /// none. Built as a wide, shallow document so it is the *count* under
-    /// test rather than recursion depth.
+    /// The node-count bound. Not the only one — `usvg` caps the same path at
+    /// 1,000,000 nodes (`usvg-0.47.0/src/parser/svgtree/parse.rs:392`) — but
+    /// [`MAX_XML_NODES`] is five times lower and applied a stage earlier, so
+    /// it is the one a document meets first, and the one this pins. Built as
+    /// a wide, shallow document so it is the *count* under test rather than
+    /// nesting depth.
     #[test]
     fn test_a_document_past_the_node_limit_is_refused() {
         let mut source =
@@ -620,9 +641,17 @@ mod tests {
         assert!(matches!(err, DecodeError::Malformed(_)), "{err:?}");
     }
 
-    /// Billion laughs. `roxmltree` is what bounds this, and the bound is
-    /// asserted rather than trusted: a document whose entities would expand
-    /// exponentially must come back as an error, not as gigabytes.
+    /// Billion laughs, in its classic shape: entities nested ten to a level so
+    /// each tier multiplies the last.
+    ///
+    /// [`refuse_internal_subset`] is what stops this, not `roxmltree`. The
+    /// fixture declares an internal subset, so it is refused on [`parse`]'s
+    /// first line, before any entity is resolved at all. What this test pins
+    /// is therefore the *shape* and not the bound: `Malformed(_)` is broad
+    /// enough to pass on any refusal, and `test_a_wide_entity_bomb_is_refused`
+    /// is the one that checks the guard by its message. The module doc has the
+    /// measurement showing why the guard, rather than the parser, has to be
+    /// the thing that stops it.
     #[test]
     fn test_an_entity_bomb_is_refused_rather_than_expanded() {
         let bomb = r##"<?xml version="1.0"?>
@@ -670,31 +699,26 @@ mod tests {
         );
     }
 
-    /// The two input caps and the output cap must stay in a stated
-    /// relationship, not merely each be a number.
+    /// The two input caps must stay in a stated relationship, not merely each
+    /// be a number: every node costs bytes, so a node cap the byte cap could
+    /// never let a document reach would be decoration.
     ///
     /// `decode` has
     /// `test_dw_6_3_no_input_the_dimension_cap_admits_can_exceed_the_allocation_cap`
     /// for exactly this on the raster side: it pins the *conjunction*, so
     /// raising one cap alone fails loudly. This is the vector counterpart.
-    /// The arithmetic it guards: `MAX_SVG_BYTES` of source can expand about
-    /// 255x through entity references before `roxmltree` refuses, so the
-    /// largest text this will ever hold is ~1 GiB — which is why the byte cap
-    /// cannot be raised casually, and why the node cap has to bite first for a
-    /// document that is merely wide rather than deeply referenced.
+    ///
+    /// No expansion factor enters the arithmetic, and that is deliberate.
+    /// [`refuse_internal_subset`] means a source cannot declare entities, so
+    /// bytes of source are bytes of text — see [`MAX_SVG_BYTES`], which is
+    /// where that argument is made.
+    ///
+    /// Worth knowing how loose the pin is: `<g/>` is the shortest element that
+    /// makes a node, so [`MAX_XML_NODES`] needs 800,000 bytes of source
+    /// against [`MAX_SVG_BYTES`]'s 4,194,304 — 5.24x of headroom. Raising the
+    /// node cap past 1,048,576 is what trips this.
     #[test]
-    fn test_the_input_caps_cannot_outgrow_the_output_cap() {
-        const ROXMLTREE_MAX_EXPANSION: u64 = 255;
-        let worst_expanded = MAX_SVG_BYTES as u64 * ROXMLTREE_MAX_EXPANSION;
-        assert!(
-            worst_expanded <= 2 * 1024 * 1024 * 1024,
-            "a fully expanded source ({worst_expanded} bytes) must stay inside a \
-             budget a terminal reader can survive — raising MAX_SVG_BYTES moves this"
-        );
-
-        // Every node costs bytes in the source, so the byte cap must be able
-        // to reach the node cap; a node cap that could never be hit would be
-        // decoration. `<g/>` is the shortest element that makes a node.
+    fn test_the_node_cap_is_reachable_within_the_byte_cap() {
         let smallest_node_bytes = "<g/>".len() as u64;
         assert!(
             MAX_SVG_BYTES as u64 >= u64::from(MAX_XML_NODES) * smallest_node_bytes,
