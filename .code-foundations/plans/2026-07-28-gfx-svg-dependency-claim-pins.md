@@ -1,8 +1,9 @@
 # Plan: gfx SVG dependency-claim pins
 **Created:** 2026-07-28
-**Status:** in-progress
+**Status:** blocked
 **Started:** 2026-07-28
-**Current Phase:** 1
+**Blocked:** 2026-07-29 — Phase 1b's 3-sample security review returned 3/3 FAIL. The entity guard is bypassable by a prologue comment or PI, which is a design question (how to locate the DOCTYPE at all), not a defect within this plan's scope. Phase 2 is untouched and independently buildable; the decision is whether to widen this plan again or split the guard work out.
+**Current Phase:** 1b (blocked); Phase 2 not started
 **Complexity:** simple
 **Review cadence:** 1
 ---
@@ -158,4 +159,13 @@ Separately, `test_probing_a_labelled_drawing_does_not_load_fonts` (`svg.rs:797-8
 - [x] Committed
 Commit: e3d2a80
 Summary: All six stale dependency claims in `crates/gfx/src/svg.rs` now match what roxmltree and usvg actually do; `ROXMLTREE_MAX_EXPANSION` and the 2 GiB assertion are gone, the surviving test is renamed `test_the_node_cap_is_reachable_within_the_byte_cap`, and `MAX_SVG_BYTES` has a real argument (no internal subset ⇒ no expansion ⇒ peak text ≈ source bytes). No guard, cap value, or parse path changed. 806 passed / 0 failed / 7 ignored, clippy and fmt clean.
+Batch review (2026-07-29, phases 1–1): **FAIL** on DW-1.2 — not because the prose is wrong, but because it is unverifiable: the guard its argument rests on is bypassable. DW-1.1 and DW-1.3 through DW-1.7 passed with execution evidence; all 25 dependency-attributing comments in the file were checked against the vendored sources and the six repaired sites are exact. See `phase-1-1-review.md`.
+
+### Phase 1b: Close the DOCTYPE-scan bypass (Gate: Full, Security-sensitive)
+- [x] BUILD: quote-aware byte walk; 7 tests, 6 confirmed failing against the pre-fix body
+- [ ] REVIEW: **FAIL — 3 of 3 samples**, all on the same root cause the phase did not address
+- [x] Committed anyway (branch only, not merged) — b306907
+Commit: b306907
+Summary: Closes the `SYSTEM "x>y"` family: the DOCTYPE scan is now quote-aware and refuses an unterminated declaration with a message of its own. Does **not** make the guard total. All three reviewers independently defeated it with a prologue decoy — `<!--<svg-->` truncates the prologue before the DOCTYPE (`find("<svg")`), and `<!-- <!DOCTYPE x> -->` shadows the real declaration (`find("<!DOCTYPE")` takes the first). Orchestrator reproduced both: 11 added bytes turn `Err(Malformed)` into `Ok((10, 10))` with 800 KB expanded; at scale 98 KB of source → 8 MB of text in 165 ms, and past `RENDER_TIME_CAP` the abandoned thread keeps allocating (RSS 18.6 → 38.6 MiB over 5 s, still climbing). The root cause is that a hand-written substring scan models XML production 28 (the DOCTYPE's interior) correctly and production 22 (how you locate it) not at all — roxmltree runs `Comment | PI | S` first (`tokenizer.rs:252-255`). Blocked pending a decision on the real fix.
+
 Build-agent corrections to this plan: (a) `NodesLimitReached` is **roxmltree's** error which usvg imports (`svgtree/parse.rs:6`), not a usvg variant — the plan's site-6 row said otherwise and would have planted a fresh false claim; (b) `crates/gfx/src/decode.rs:51` named the renamed test and claimed a relationship the deleted assertion no longer supports, so it was corrected too — two lines outside the declared File scope, accepted by the orchestrator because DW-1.6 requires that cross-reference to survive.
