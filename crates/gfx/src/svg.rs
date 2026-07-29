@@ -48,6 +48,14 @@ use crate::decode::{DecodeError, Limits};
 /// rather than a relative one.
 pub(crate) const MAX_SVG_BYTES: usize = 4 * 1024 * 1024;
 
+/// How much of a file is read to decide whether it is SVG.
+///
+/// One constant, used both to size the read and to bound the search, because
+/// two independent 1024s — one in the reader, one in the matcher — is a
+/// change that looks applied and is not: widen the buffer alone and
+/// [`looks_like_svg`] silently clamps back.
+const SNIFF_BYTES: usize = 1024;
+
 /// The largest parsed XML node count.
 ///
 /// `usvg` sets no limit of its own, so this is the whole of that bound. A
@@ -57,6 +65,53 @@ pub(crate) const MAX_SVG_BYTES: usize = 4 * 1024 * 1024;
 /// pathological one stops early.
 const MAX_XML_NODES: u32 = 200_000;
 
+/// Reads `path` as SVG source, if that is what it holds.
+///
+/// `Ok(None)` means "not SVG, carry on with the raster path". The sniff is on
+/// content, never on the extension, so a `.svg` holding a PNG decodes as a
+/// PNG and a `diagram.txt` holding SVG renders as a drawing.
+///
+/// Ingestion lives here rather than in [`crate::decode`] so that everything
+/// deciding what an SVG *is* — the sniff window, the byte ceiling, the
+/// encoding — sits next to the code that parses one. `decode`'s SVG knowledge
+/// is then a single call.
+///
+/// The prefix is sniffed as **bytes** and the source is read separately from
+/// the start, rather than the prefix being decoded and the remainder appended
+/// to it. That is not tidiness: `SNIFF_BYTES` is a byte offset, and an SVG
+/// with a multi-byte character straddling it would have had that character
+/// cut in half — the first part lossily replaced with U+FFFD and the
+/// continuation bytes failing the UTF-8 check on the remainder. A label in
+/// any non-ASCII script could land there.
+pub(crate) fn read_source(path: &std::path::Path) -> Result<Option<String>, DecodeError> {
+    use std::io::{Read as _, Seek as _};
+
+    crate::decode::ensure_regular_file(path)?;
+    let mut file = std::fs::File::open(path).map_err(DecodeError::Io)?;
+
+    let mut prefix = [0u8; SNIFF_BYTES];
+    let read = file.read(&mut prefix).map_err(DecodeError::Io)?;
+    if !looks_like_svg(&prefix[..read]) {
+        return Ok(None);
+    }
+
+    // Checked from the file's own length before reading, so an oversized
+    // drawing is never pulled into memory to discover it was too big. The
+    // `take` is not redundant with it: the file may grow between the two.
+    let len = file.metadata().map_err(DecodeError::Io)?.len();
+    if len > MAX_SVG_BYTES as u64 {
+        return Err(DecodeError::Malformed(format!(
+            "svg: {len} bytes, over the {MAX_SVG_BYTES}-byte limit"
+        )));
+    }
+    file.rewind().map_err(DecodeError::Io)?;
+    let mut source = String::new();
+    file.take(MAX_SVG_BYTES as u64)
+        .read_to_string(&mut source)
+        .map_err(|_| DecodeError::Malformed("svg: source is not valid UTF-8".to_string()))?;
+    Ok(Some(source))
+}
+
 /// Whether `prefix` looks like SVG source.
 ///
 /// Content sniffing, like every other format here — the extension is never
@@ -65,8 +120,8 @@ const MAX_XML_NODES: u32 = 200_000;
 /// the `<svg` tag itself within the prefix rather than trying to model the
 /// prologue. Anything claiming to be SVG but lacking an `<svg` element inside
 /// the first kilobyte is not one worth rendering.
-pub(crate) fn looks_like_svg(prefix: &[u8]) -> bool {
-    let head = &prefix[..prefix.len().min(1024)];
+fn looks_like_svg(prefix: &[u8]) -> bool {
+    let head = &prefix[..prefix.len().min(SNIFF_BYTES)];
     // `<svg` must be followed by a delimiter, or `<svgfoo` would match.
     head.windows(4)
         .enumerate()
@@ -94,6 +149,10 @@ pub(crate) fn looks_like_svg(prefix: &[u8]) -> bool {
 /// which is most of the SVG in real documents, and has its text converted to
 /// paths by the exporting tool anyway — would be a visible stall bought for
 /// nothing. [`needs_fonts`] is what makes those free.
+///
+/// Those numbers are perishable. Re-measure with
+/// `cargo test -p gfx --test svg_cost -- --ignored --nocapture` after bumping
+/// `resvg` or touching this strategy.
 fn fonts() -> Arc<usvg::fontdb::Database> {
     static FONTS: OnceLock<Arc<usvg::fontdb::Database>> = OnceLock::new();
     Arc::clone(FONTS.get_or_init(|| {
@@ -113,10 +172,16 @@ fn no_fonts() -> Arc<usvg::fontdb::Database> {
 ///
 /// SVG has exactly one way to render glyphs — a `<text>` element — so the
 /// absence of that substring is proof the font database will never be read.
-/// A `<tspan>` and a `<textPath>` are both only legal inside one, but they are
-/// checked anyway: the cost of being wrong in this direction is one
-/// unnecessary font load, and the cost of being wrong in the other is a
-/// diagram with no labels.
+/// `<tspan>` is checked as well because it is cheap; `<textPath>` needs no
+/// check of its own, since `<text` is a prefix of it. Narrowing the `<text`
+/// test to `"<text>"` or `"<text "` would therefore silently stop covering
+/// `<textPath>` — the assertion for it in
+/// `test_only_a_drawing_with_text_asks_for_fonts` passes by prefix, not on
+/// its own merits.
+///
+/// Erring toward loading is deliberate: the cost of a false positive is one
+/// unnecessary font load, and the cost of a false negative is a diagram with
+/// no labels.
 fn needs_fonts(source: &str) -> bool {
     source.contains("<text") || source.contains("<tspan")
 }
@@ -195,7 +260,7 @@ pub(crate) fn rasterize(
     source: &str,
     target_px: (u32, u32),
     limits: Limits,
-) -> Result<Rasterized, DecodeError> {
+) -> Result<image::DynamicImage, DecodeError> {
     let tree = parse(source)?;
     let (width, height) = dimensions(&tree, limits)?;
     let (fit_w, fit_h) = fit(width, height, target_px.0.max(1), target_px.1.max(1));
@@ -220,24 +285,7 @@ pub(crate) fn rasterize(
     let buffer = image::RgbaImage::from_raw(fit_w, fit_h, pixmap.take()).ok_or_else(|| {
         DecodeError::Malformed("svg: rasterized buffer did not match its own size".to_string())
     })?;
-    Ok(Rasterized {
-        source: (width, height),
-        image: image::DynamicImage::ImageRgba8(buffer),
-    })
-}
-
-/// A rendered drawing and the size it was drawn *at*.
-///
-/// The two are reported separately because they are different facts and the
-/// caller needs both: `DecodedImage::source_width` is documented as the
-/// source's own dimensions before any scaling, and for a vector drawing the
-/// rasterized buffer is never those — it is the fitted box. Returning only
-/// the image would silently make a 120x60 drawing report itself as 40x20,
-/// which is what happened before this type existed.
-pub(crate) struct Rasterized {
-    /// The drawing's declared canvas, before fitting.
-    pub source: (u32, u32),
-    pub image: image::DynamicImage,
+    Ok(image::DynamicImage::ImageRgba8(buffer))
 }
 
 /// `(width, height)` scaled to fit inside `(max_w, max_h)` without changing
@@ -289,6 +337,39 @@ mod tests {
         assert!(!looks_like_svg(buried.as_bytes()));
     }
 
+    /// A multi-byte character sitting across the sniff boundary survives.
+    ///
+    /// Regression: the source used to be assembled as "lossily decode the
+    /// sniff prefix, then append the rest", which cut whatever character
+    /// straddled byte 1024 in half — the leading bytes became U+FFFD and the
+    /// continuation bytes failed the UTF-8 check on the remainder, so a
+    /// perfectly valid drawing was refused as "not valid UTF-8". Any
+    /// non-ASCII label long enough to reach the boundary could land there.
+    #[test]
+    fn test_a_character_straddling_the_sniff_boundary_survives() {
+        // Pad so a 3-byte character starts at byte SNIFF_BYTES - 1.
+        let head = r##"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><desc>"##;
+        let pad = "a".repeat(SNIFF_BYTES - 1 - head.len());
+        let source = format!("{head}{pad}\u{4e16}</desc></svg>");
+        assert_eq!(
+            source.as_bytes()[SNIFF_BYTES - 1],
+            "\u{4e16}".as_bytes()[0],
+            "the fixture must actually straddle the boundary"
+        );
+
+        let dir = std::env::temp_dir().join(format!("stele-svg-straddle-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("straddle.svg");
+        std::fs::write(&path, &source).expect("write");
+
+        let read = read_source(&path)
+            .expect("reads")
+            .expect("is recognised as svg");
+        assert_eq!(read, source, "the source came back altered");
+        assert_eq!(probe(&read, Limits::default()).expect("probes"), (10, 10));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn test_a_drawing_probes_at_its_declared_size() {
         assert_eq!(probe(CIRCLE, Limits::default()).expect("probes"), (120, 60));
@@ -296,23 +377,17 @@ mod tests {
 
     #[test]
     fn test_rasterizing_fits_the_target_box_and_keeps_the_aspect_ratio() {
-        let out = rasterize(CIRCLE, (60, 60), Limits::default()).expect("renders");
+        let img = rasterize(CIRCLE, (60, 60), Limits::default()).expect("renders");
         // 120x60 into a 60x60 box is 60x30, not 60x60 — the letterbox in
         // `decode` adds the empty rows, and it is the only thing that should.
-        assert_eq!((out.image.width(), out.image.height()), (60, 30));
-        assert_eq!(
-            out.source,
-            (120, 60),
-            "the declared canvas is reported as-is"
-        );
+        assert_eq!((img.width(), img.height()), (60, 30));
     }
 
     #[test]
     fn test_the_pixmap_never_exceeds_the_target_however_large_the_drawing() {
         let huge = r##"<svg xmlns="http://www.w3.org/2000/svg" width="8000" height="8000"><rect width="8000" height="8000" fill="red"/></svg>"##;
-        let out = rasterize(huge, (32, 32), Limits::default()).expect("renders");
-        assert_eq!((out.image.width(), out.image.height()), (32, 32));
-        assert_eq!(out.source, (8000, 8000));
+        let img = rasterize(huge, (32, 32), Limits::default()).expect("renders");
+        assert_eq!((img.width(), img.height()), (32, 32));
     }
 
     #[test]
@@ -378,12 +453,45 @@ mod tests {
         let labelled = r##"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="60">
             <text x="4" y="40" font-size="40" fill="#ffffff">HHHH</text>
         </svg>"##;
-        let out = rasterize(labelled, (200, 60), Limits::default()).expect("renders");
-        let rgba = out.image.to_rgba8();
+        let img = rasterize(labelled, (200, 60), Limits::default()).expect("renders");
+        let rgba = img.to_rgba8();
         let inked = rgba.pixels().filter(|p| p.0[3] > 0).count();
         assert!(
             inked > 200,
             "expected glyph coverage, found {inked} inked pixels — fonts are not reaching text"
+        );
+    }
+
+    /// The two input caps and the output cap must stay in a stated
+    /// relationship, not merely each be a number.
+    ///
+    /// `decode` has
+    /// `test_dw_6_3_no_input_the_dimension_cap_admits_can_exceed_the_allocation_cap`
+    /// for exactly this on the raster side: it pins the *conjunction*, so
+    /// raising one cap alone fails loudly. This is the vector counterpart.
+    /// The arithmetic it guards: `MAX_SVG_BYTES` of source can expand about
+    /// 255x through entity references before `roxmltree` refuses, so the
+    /// largest text this will ever hold is ~1 GiB — which is why the byte cap
+    /// cannot be raised casually, and why the node cap has to bite first for a
+    /// document that is merely wide rather than deeply referenced.
+    #[test]
+    fn test_the_input_caps_cannot_outgrow_the_output_cap() {
+        const ROXMLTREE_MAX_EXPANSION: u64 = 255;
+        let worst_expanded = MAX_SVG_BYTES as u64 * ROXMLTREE_MAX_EXPANSION;
+        assert!(
+            worst_expanded <= 2 * 1024 * 1024 * 1024,
+            "a fully expanded source ({worst_expanded} bytes) must stay inside a \
+             budget a terminal reader can survive — raising MAX_SVG_BYTES moves this"
+        );
+
+        // Every node costs bytes in the source, so the byte cap must be able
+        // to reach the node cap; a node cap that could never be hit would be
+        // decoration. `<g/>` is the shortest element that makes a node.
+        let smallest_node_bytes = "<g/>".len() as u64;
+        assert!(
+            MAX_SVG_BYTES as u64 >= u64::from(MAX_XML_NODES) * smallest_node_bytes,
+            "MAX_XML_NODES is unreachable within MAX_SVG_BYTES — one of the two \
+             caps is doing nothing"
         );
     }
 

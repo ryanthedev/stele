@@ -643,7 +643,7 @@ impl GfxMediaSink {
     fn transmit_and_place(
         &mut self,
         node_id: NodeId,
-        png: &[u8],
+        raster: &gfx::decode::DecodedImage,
         target: (u32, u32),
         reserved: &Reserved,
         rect: CellRect,
@@ -657,14 +657,13 @@ impl GfxMediaSink {
             .peek(node_id)
             .map(|resident| resident.id)
             .unwrap_or_else(|| self.alloc_id());
-        let raster_px = png_pixel_size(png).unwrap_or(target);
-        self.emitter.transmit(id, png, out);
+        self.emitter.transmit(id, &raster.png, out);
         // Recorded before it is placed, not after: `place_box` is what marks
         // a node visible, and it can only do that for a node it can find.
         let pinned: HashSet<NodeId> = self.placed.iter().copied().collect();
         let freed = self.cache.insert(
             node_id,
-            Resident::new(id, target, raster_px, png.len() as u64),
+            Resident::new(id, target, raster.raster_px, raster.png.len() as u64),
             &pinned,
         );
         for evicted in freed {
@@ -711,7 +710,7 @@ impl GfxMediaSink {
                 return self.degrade_to_text(sanitize(&alt), rect, out);
             }
         };
-        if !self.transmit_and_place(node_id, &decoded.png, target, reserved, rect, out) {
+        if !self.transmit_and_place(node_id, &decoded, target, reserved, rect, out) {
             return self.degrade_to_text(sanitize(&alt), rect, out);
         }
         Resolved::Graphics
@@ -956,26 +955,6 @@ fn crop_source(
         width: w,
         height: bottom.saturating_sub(top).max(1),
     })
-}
-
-/// Reads `(width, height)` out of a PNG's IHDR chunk, which the format
-/// requires to be the first chunk immediately after the 8-byte signature.
-///
-/// Measured rather than assumed. The two raster producers used to disagree —
-/// `gfx::decode::decode_and_scale` resized to the requested target exactly,
-/// while `math::render_fitted` rasterized at a fixed em and only matched the
-/// target's *aspect* — and cropping is in raster pixels, so guessing mis-cropped
-/// every formula. Both now finish in the same `gfx::decode` letterbox and land
-/// on the target, but the measurement is what makes that a *checked* fact at
-/// the seam rather than an assumption inherited from two crates away.
-fn png_pixel_size(png: &[u8]) -> Option<(u32, u32)> {
-    const SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
-    if png.len() < 24 || !png.starts_with(SIGNATURE) || &png[12..16] != b"IHDR" {
-        return None;
-    }
-    let width = u32::from_be_bytes(png[16..20].try_into().ok()?);
-    let height = u32::from_be_bytes(png[20..24].try_into().ok()?);
-    (width > 0 && height > 0).then_some((width, height))
 }
 
 fn plain_text_of(children: &[Inline]) -> String {
@@ -2335,6 +2314,28 @@ mod tests {
         png_pixel_size(&png)
     }
 
+    /// The pixel size of a PNG, read from its IHDR.
+    ///
+    /// Test-only, and it belongs here rather than in the sink. Production
+    /// used to call this to discover how big the raster it had just been
+    /// handed was — with a `.unwrap_or(target)` guess when the parse failed —
+    /// because `gfx::DecodedImage` reported the *source* file's dimensions
+    /// and not the output's. `gfx` reports `raster_px` now, so nothing in
+    /// this crate parses PNG any more.
+    ///
+    /// A test reading the bytes is a different thing entirely: these tests
+    /// assert on what reached the wire, and the wire is base64 PNG. Believing
+    /// the sink's own arithmetic here would be assuming the thing under test.
+    fn png_pixel_size(png: &[u8]) -> Option<(u32, u32)> {
+        const SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
+        if png.len() < 24 || !png.starts_with(SIGNATURE) || &png[12..16] != b"IHDR" {
+            return None;
+        }
+        let width = u32::from_be_bytes(png[16..20].try_into().ok()?);
+        let height = u32::from_be_bytes(png[20..24].try_into().ok()?);
+        (width > 0 && height > 0).then_some((width, height))
+    }
+
     /// The `c=`/`r=` (cell box) of every `a=p` put in `buf`.
     fn placed_cell_boxes(buf: &[u8]) -> Vec<(u16, u16)> {
         let text = String::from_utf8_lossy(buf);
@@ -2778,8 +2779,6 @@ mod tests {
 
     #[test]
     fn test_png_pixel_size_reads_the_ihdr_and_rejects_non_png_bytes() {
-        let dir = scratch_dir("ihdr");
-        let path = dir.join("m.png");
         let img = image::RgbaImage::from_pixel(37, 91, image::Rgba([0, 0, 0, 255]));
         let mut bytes = Vec::new();
         image::DynamicImage::ImageRgba8(img)
@@ -2787,10 +2786,6 @@ mod tests {
                 &mut std::io::Cursor::new(&mut bytes),
                 image::ImageFormat::Png,
             )
-            .unwrap();
-        std::fs::File::create(&path)
-            .unwrap()
-            .write_all(&bytes)
             .unwrap();
         assert_eq!(png_pixel_size(&bytes), Some((37, 91)));
         assert_eq!(png_pixel_size(b"not a png at all, truly"), None);

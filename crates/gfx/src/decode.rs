@@ -1,9 +1,11 @@
 //! Bounded local image decode: a header-only dimension probe (no full pixel
 //! decode at layout time), a full `Limits`-bounded decode+scale for painting,
 //! and an in-memory [`letterbox_png`] for a raster some other crate produced
-//! (a `crates/math` formula). All three share one decode and one letterbox, so
-//! the bounds and the "exactly the target box" guarantee are the same property
-//! stated once, not three promises that can drift apart.
+//! (a `crates/math` formula). The two decoding entry points share one decode
+//! and one letterbox, so the bounds and the "exactly the target box"
+//! guarantee are the same property stated once rather than two promises that
+//! can drift apart; the probe shares the file barricade and the limits but
+//! neither decodes nor letterboxes.
 //!
 //! Every input here is hostile until proven otherwise (DW-6.3): a malformed
 //! file, a truncated file, or a valid-looking header claiming a
@@ -35,10 +37,19 @@ use image::ImageReader;
 
 use crate::svg;
 
-/// Bounds on what this crate will decode. Applied to both the header-only
-/// probe and the full decode, so a bomb-dimension header is rejected before
-/// anything downstream (a layout box reservation, a pixel buffer
-/// allocation) is ever sized from it.
+/// Bounds on the **output raster**: how many pixels this crate will ever hand
+/// back. Applied to both the probe and the full decode, so a bomb-dimension
+/// header is rejected before anything downstream (a layout box reservation, a
+/// pixel buffer allocation) is ever sized from it.
+///
+/// It does not bound the **input document**, and a caller tightening these for
+/// a constrained deployment should know that. Pixels and XML nodes are not
+/// commensurate, so the vector path's input caps — `svg::MAX_SVG_BYTES` and
+/// `svg::MAX_XML_NODES` — are compile-time constants there rather than knobs
+/// here; asking a caller to tune a node budget in the same struct as a pixel
+/// budget would be asking them to reason about something they cannot see.
+/// `svg::test_the_input_caps_cannot_outgrow_the_output_cap` is what keeps the
+/// two sides in a stated relationship.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
     /// No decoded (or header-reported) dimension may exceed this on either
@@ -122,20 +133,28 @@ impl std::fmt::Display for DecodeError {
 
 impl std::error::Error for DecodeError {}
 
-/// A decoded image, scaled and letterboxed onto the caller's requested target
-/// cell-pixel size, re-encoded as PNG.
+/// A raster ready to transmit: PNG bytes and the pixel size those bytes
+/// actually are.
 ///
-/// The dimension fields are named for what they are — the **source file's**
-/// dimensions, before any scaling — because the obvious reading of a bare
-/// `width`/`height` next to a `png` field is "the raster's size", and that is
-/// the one thing they are not. A caller that needs the transmitted raster's
-/// pixel size must read it from `png` (or know it equals the `target_px` it
-/// asked for).
+/// Both fields describe the **output**, and that is the whole design of this
+/// type. It used to report the *source file's* dimensions instead — a fact no
+/// caller in the workspace ever read — while the one thing its only consumer
+/// needed, the transmitted raster's size, was left to be recovered from the
+/// bytes. So it was: `crates/stele`'s media sink grew a PNG IHDR parser and a
+/// `.unwrap_or(target)` fallback to guess what this type already knew. Two
+/// crates ended up knowing PNG's header layout, and the guarantee that the
+/// raster equals the requested box lived only in prose the caller declined to
+/// trust.
+///
+/// A caller that wants the source's own dimensions asks
+/// [`probe_dimensions`], which is cheaper and on the same path.
 #[derive(Debug, Clone)]
 pub struct DecodedImage {
-    pub source_width: u32,
-    pub source_height: u32,
     pub png: Vec<u8>,
+    /// The PNG's real pixel size. Equal to the requested `target_px` with
+    /// each axis floored at 1 — [`letterbox_onto`] is the single place that
+    /// decides it, so this is that decision reported rather than re-measured.
+    pub raster_px: (u32, u32),
 }
 
 /// Opens `path` as an image reader — **after** settling, by `stat`, that it
@@ -190,48 +209,12 @@ fn opened(
 /// fixed here. A second reader of document-supplied paths is exactly the
 /// fifth call site that argument predicted, so it gets the same guard rather
 /// than its own copy of one.
-fn ensure_regular_file(path: &Path) -> Result<(), DecodeError> {
+pub(crate) fn ensure_regular_file(path: &Path) -> Result<(), DecodeError> {
     let meta = std::fs::metadata(path).map_err(DecodeError::Io)?;
     if !meta.is_file() {
         return Err(DecodeError::NotAFile(path.to_path_buf()));
     }
     Ok(())
-}
-
-/// Reads `path` as SVG source if that is what it is.
-///
-/// `Ok(None)` means "this is not an SVG, carry on with the raster path" — the
-/// sniff is on content, never on the extension, so a `.svg` holding a PNG
-/// decodes as a PNG and a `diagram.txt` holding SVG renders as a drawing.
-///
-/// Bounded twice over: the file is refused before reading if it is larger
-/// than [`svg::MAX_SVG_BYTES`], so a huge file is never pulled into memory to
-/// discover it was too big, and the read is capped anyway in case the file
-/// grew between the two.
-fn read_svg_source(path: &Path) -> Result<Option<String>, DecodeError> {
-    use std::io::Read as _;
-
-    ensure_regular_file(path)?;
-    let mut file = std::fs::File::open(path).map_err(DecodeError::Io)?;
-
-    let mut prefix = [0u8; 1024];
-    let read = file.read(&mut prefix).map_err(DecodeError::Io)?;
-    if !svg::looks_like_svg(&prefix[..read]) {
-        return Ok(None);
-    }
-
-    let len = file.metadata().map_err(DecodeError::Io)?.len();
-    if len > svg::MAX_SVG_BYTES as u64 {
-        return Err(DecodeError::Malformed(format!(
-            "svg: {len} bytes, over the {}-byte limit",
-            svg::MAX_SVG_BYTES
-        )));
-    }
-    let mut source = String::from_utf8_lossy(&prefix[..read]).into_owned();
-    file.take(svg::MAX_SVG_BYTES as u64)
-        .read_to_string(&mut source)
-        .map_err(|_| DecodeError::Malformed("svg: source is not valid UTF-8".to_string()))?;
-    Ok(Some(source))
 }
 
 /// The in-memory twin of [`opened`]. Same `limits`, applied the same way and
@@ -244,18 +227,26 @@ fn opened_bytes(bytes: &[u8], limits: Limits) -> Result<ImageReader<Cursor<&[u8]
     Ok(reader)
 }
 
-/// Header-only dimension probe: reads just enough of `path` to learn its
-/// pixel dimensions, without decoding any pixel data. Used by `ImageSizer`
-/// at layout time, where a full decode of a potentially large/hostile image
+/// Dimension probe: reads just enough of `path` to learn its pixel
+/// dimensions, without decoding any pixel data. Used by `ImageSizer` at
+/// layout time, where a full decode of a potentially large/hostile image
 /// would be wasted work (the image may never scroll into view) — this is
 /// the "no full decode at layout time" the phase requires.
+///
+/// **SVG is the exception, and it is not a cheap one.** A vector drawing has
+/// no header to read: learning its size means parsing the whole document and
+/// building a `usvg` tree. That is still far less work than rasterizing it,
+/// which is the distinction layout actually cares about — but a *text-bearing*
+/// drawing also loads the system font database here, once per process, and
+/// that measured ~480 ms. It lands on whichever thread calls layout. See
+/// `svg::fonts`.
 ///
 /// Rejects (returns `Err`, never panics) on: an unreadable path, an
 /// unrecognized/malformed format, and a header that claims dimensions
 /// `limits` would reject — a decompression-bomb *header* never gets a
 /// chance to reserve a giant layout box.
 pub fn probe_dimensions(path: &Path, limits: Limits) -> Result<(u32, u32), DecodeError> {
-    if let Some(source) = read_svg_source(path)? {
+    if let Some(source) = svg::read_source(path)? {
         return svg::probe(&source, limits);
     }
     let reader = opened(path, limits)?;
@@ -292,25 +283,11 @@ pub fn decode_and_scale(
     // `DynamicImage`, and `letterbox_onto` is the single place that decides
     // what a transmitted raster's pixel dimensions are. An SVG that
     // letterboxed itself would be a second answer to that question.
-    // The reported source size is the *input's* own, never the buffer's —
-    // they are the same number for a raster and deliberately different for a
-    // vector, which is fitted to the target before a pixel is allocated.
-    let (source_width, source_height, img) = match read_svg_source(path)? {
-        Some(source) => {
-            let out = svg::rasterize(&source, target_px, limits)?;
-            (out.source.0, out.source.1, out.image)
-        }
-        None => {
-            let img = decode_within_limits(|| opened(path, limits), limits)?;
-            (img.width(), img.height(), img)
-        }
+    let img = match svg::read_source(path)? {
+        Some(source) => svg::rasterize(&source, target_px, limits)?,
+        None => decode_within_limits(|| opened(path, limits), limits)?,
     };
-    let png = letterbox_onto(&img, target_px)?;
-    Ok(DecodedImage {
-        source_width,
-        source_height,
-        png,
-    })
+    letterbox_onto(&img, target_px)
 }
 
 /// Letterboxes an **already-encoded** raster held in memory onto `target_px`,
@@ -333,7 +310,7 @@ pub fn letterbox_png(
     png: &[u8],
     target_px: (u32, u32),
     limits: Limits,
-) -> Result<Vec<u8>, DecodeError> {
+) -> Result<DecodedImage, DecodeError> {
     let img = decode_within_limits(|| opened_bytes(png, limits), limits)?;
     letterbox_onto(&img, target_px)
 }
@@ -371,14 +348,20 @@ where
 fn letterbox_onto(
     img: &image::DynamicImage,
     target_px: (u32, u32),
-) -> Result<Vec<u8>, DecodeError> {
+) -> Result<DecodedImage, DecodeError> {
     let (target_w, target_h) = (target_px.0.max(1), target_px.1.max(1));
     let letterboxed = letterbox(&img.to_rgba8(), target_w, target_h);
     let mut png = Vec::new();
     image::DynamicImage::ImageRgba8(letterboxed)
         .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
         .map_err(|e| DecodeError::Malformed(e.to_string()))?;
-    Ok(png)
+    // The size is reported from the same two numbers the canvas was built
+    // from, so "the raster is exactly the target box" is a fact the caller
+    // receives rather than a claim it has to re-measure to believe.
+    Ok(DecodedImage {
+        png,
+        raster_px: (target_w, target_h),
+    })
 }
 
 /// Scales `src` down/up to fit *inside* `target_w` x `target_h` preserving its
@@ -682,13 +665,22 @@ mod tests {
         assert!(matches!(result, Err(DecodeError::Io(_))));
     }
 
+    /// A 2x2 source asked for a 24x48 box comes back as 24x48 — and says so.
+    ///
+    /// The reported size and the PNG's own size are checked separately. They
+    /// cannot disagree today, because one function decides both, and that is
+    /// exactly the invariant worth pinning: `raster_px` is a promise another
+    /// crate crops against without re-reading the bytes.
     #[test]
     fn test_decode_and_scale_produces_png_at_target_pixel_size() {
         let path = write_file("scale", &valid_tiny_png());
         let decoded = decode_and_scale(&path, (24, 48), Limits::default()).unwrap();
-        assert_eq!((decoded.source_width, decoded.source_height), (2, 2));
-        let (w, h) = probe_reencoded_dimensions(&decoded.png);
-        assert_eq!((w, h), (24, 48));
+        assert_eq!(decoded.raster_px, (24, 48), "the reported size is the box");
+        assert_eq!(
+            probe_reencoded_dimensions(&decoded.png),
+            decoded.raster_px,
+            "the reported size is the png's own"
+        );
         std::fs::remove_file(&path).ok();
     }
 
@@ -815,11 +807,11 @@ mod tests {
             let out = letterbox_png(&bytes, target, Limits::default())
                 .unwrap_or_else(|e| panic!("{sw}x{sh} -> {target:?}: {e}"));
             assert_eq!(
-                probe_reencoded_dimensions(&out),
+                probe_reencoded_dimensions(&out.png),
                 target,
                 "{sw}x{sh} must land exactly on {target:?}"
             );
-            let raster = image::load_from_memory(&out).unwrap().to_rgba8();
+            let raster = image::load_from_memory(&out.png).unwrap().to_rgba8();
             assert_eq!(
                 opaque_extent(&raster),
                 ink,
@@ -1049,20 +1041,23 @@ mod tests {
 
             let decoded = decode_and_scale(&path, (8, 8), Limits::default())
                 .unwrap_or_else(|e| panic!("{format:?} did not decode: {e:?}"));
-            assert_eq!(
-                (decoded.source_width, decoded.source_height),
-                (32, 16),
-                "{format:?} reported the wrong source size"
-            );
             // The emitted raster is always PNG and always exactly the target
             // box, whatever went in — that is the guarantee `protocol.rs`
-            // downstream is written against.
+            // downstream is written against. Asserted twice on purpose: once
+            // on what the type *reports*, once on what the bytes *are*, so a
+            // `raster_px` that drifted from the PNG it describes fails here
+            // rather than in another crate's crop arithmetic.
+            assert_eq!(
+                decoded.raster_px,
+                (8, 8),
+                "{format:?} reported the wrong raster size"
+            );
             let raster = image::load_from_memory(&decoded.png)
                 .unwrap_or_else(|e| panic!("{format:?} emitted an unreadable png: {e:?}"));
             assert_eq!(
                 (raster.width(), raster.height()),
-                (8, 8),
-                "{format:?} did not land on the target box"
+                decoded.raster_px,
+                "{format:?}: the reported raster size is not the png's own"
             );
             let _ = std::fs::remove_file(&path);
         }
@@ -1166,7 +1161,7 @@ mod tests {
                 "{name} did not probe as SVG"
             );
             let decoded = decode_and_scale(&path, (40, 40), Limits::default()).expect("decodes");
-            assert_eq!((decoded.source_width, decoded.source_height), (120, 60));
+            assert_eq!(decoded.raster_px, (40, 40));
             let raster = image::load_from_memory(&decoded.png).expect("a readable png");
             assert_eq!(
                 (raster.width(), raster.height()),

@@ -144,7 +144,7 @@ pub struct ImageSizer {
     /// This is the one place cell geometry affects what the *reader* sees
     /// rather than only how sharp it is. `cols`/`rows` here become the box's
     /// aspect ratio, `layout::block::emit_box` fits that aspect to the content
-    /// column, and `gfx::decode::letterbox` then letterboxes the picture into
+    /// column, and `gfx::decode::decode_and_scale` then letterboxes the picture into
     /// whatever shape it was given — so a wrong cell size shows up as bands of
     /// dead space around the image, not as a blurry image.
     cell_px: (u32, u32),

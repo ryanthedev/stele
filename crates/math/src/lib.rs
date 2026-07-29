@@ -1141,7 +1141,7 @@ mod tests {
             let wire =
                 gfx::decode::letterbox_png(math_png.as_bytes(), target, gfx::Limits::default())
                     .unwrap_or_else(|e| panic!("{file}: {} failed to letterbox: {e}", short(tex)));
-            let (w, h) = decode_png_dims(&wire);
+            let (w, h) = decode_png_dims(&wire.png);
             assert_eq!(
                 (w, h),
                 target,
@@ -1155,7 +1155,7 @@ mod tests {
                 f64::from(target.1) / f64::from(h),
             );
 
-            let raster = rgba_of(&wire, w, h);
+            let raster = rgba_of(&wire.png, w, h);
             let ink = ink_extent(w, &raster).unwrap_or_else(|| {
                 panic!(
                     "{file}: {} letterboxed to {w}x{h} with not one pixel of ink",
