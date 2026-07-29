@@ -7,28 +7,51 @@
 //! threats are different. A raster bomb is a header claiming a huge size, and
 //! `image` refuses it. An SVG has three separate ways to be hostile:
 //!
-//!   1. **Entity expansion** (billion laughs). Bounded, but not by us:
-//!      `roxmltree`'s `LoopDetector` caps reference *depth* at 10 and total
-//!      references resolved per root reference at 255, so expansion is linear
-//!      in the source — about 255x — rather than exponential. Read from
-//!      `roxmltree-0.21.1/src/parse.rs:500`, not assumed. Paired with
-//!      [`MAX_SVG_BYTES`] that makes the expanded document bounded outright.
-//!   2. **Node count.** `usvg` parses with `nodes_limit` at its default of
-//!      `u32::MAX` — no limit at all (`usvg-0.47.0/src/parser/mod.rs:147`).
-//!      That is why this module does not call `usvg::Tree::from_data`: it
-//!      parses the XML itself with [`MAX_XML_NODES`] set and hands the
-//!      finished document to `Tree::from_xmltree`, which is the seam `usvg`
-//!      exposes for exactly this.
+//!   1. **Entity expansion** (billion laughs). Not bounded by `roxmltree`, and
+//!      an earlier version of this file was wrong to say it was. Its
+//!      `LoopDetector` caps *depth* at 10 and references at 255 **per root
+//!      reference** — and explicitly allows an unlimited number of root
+//!      references (`roxmltree-0.21.1/src/parse.rs:531`, "Allow infinite
+//!      amount of references at zero depth"). Worse, `nodes_limit` never
+//!      fires on it: consecutive references become one text node plus an
+//!      unbounded `after_text` vector that is finally `join`ed into a single
+//!      `String` (`parse.rs:599`). Measured: 76 KiB of source declaring one
+//!      64 KiB entity and referencing it 4096 times expands to 256 MiB and
+//!      takes **4.7 seconds**, parsing successfully. Both figures scale with
+//!      the source, so the real growth is quadratic, and at [`MAX_SVG_BYTES`]
+//!      it is terabytes. [`refuse_internal_subset`] is what actually stops it.
+//!   2. **Node count.** [`MAX_XML_NODES`] bounds elements. `usvg` has caps of
+//!      its own on this path — 1,000,000 elements
+//!      (`usvg-0.47.0/src/parser/mod.rs:36`) and `<use>` depth 1024
+//!      (`svgtree/parse.rs:182`) — so this is a tightening rather than the
+//!      only bound, five times lower and applied a stage earlier. The reason
+//!      to keep parsing the XML here rather than calling
+//!      `usvg::Tree::from_data` is that `from_data` fixes `nodes_limit` at
+//!      `u32::MAX` with no way to change it
+//!      (`usvg-0.47.0/src/parser/mod.rs:147`), and `from_xmltree` is the seam
+//!      that lets a caller set one.
 //!   3. **Canvas size.** A `viewBox` can claim any dimensions it likes. The
 //!      declared size is checked against `Limits` like a raster header, and
 //!      then ignored for allocation purposes anyway — see [`rasterize`],
 //!      which never makes a pixmap bigger than the caller's target box.
+//!   4. **Wall time**, which none of the above bounds. `<use>` expansion is
+//!      exponential in the source and stops only at `usvg`'s 1,000,000
+//!      elements: measured, 808 bytes of nested `<use>` costs 60 ms, and each
+//!      two levels of nesting doubles it. Node and byte caps cannot see this
+//!      because the source really is tiny. [`within_time_cap`] is the answer,
+//!      and it is the one `crates/highlight` already reached for — see
+//!      `HIGHLIGHT_TIME_CAP`. It matters here for the same reason it matters
+//!      there and one more: this runs at *layout* time, and `ImageSizer` does
+//!      not cache the probe, so an expensive drawing is re-paid on every
+//!      relayout — every fold, resize and theme swap.
 //!
 //! What this does *not* accept, deliberately: `.svgz`. Decompressing it is
 //! `usvg::Tree::from_data`'s job, and that entry point is the one that parses
 //! with no node limit. Keeping the hardened seam means keeping the text one.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, mpsc};
+use std::thread;
+use std::time::Duration;
 
 // `usvg` and `tiny_skia` are reached through `resvg` rather than depended on
 // directly, so their versions cannot drift out of step with it — `from_xmltree`
@@ -55,6 +78,57 @@ pub(crate) const MAX_SVG_BYTES: usize = 4 * 1024 * 1024;
 /// change that looks applied and is not: widen the buffer alone and
 /// [`looks_like_svg`] silently clamps back.
 const SNIFF_BYTES: usize = 1024;
+
+/// Refuses a document that declares its own XML entities.
+///
+/// This is the whole defence against entity expansion, because `roxmltree`
+/// is not one — see the module doc for the measurement. Custom entities can
+/// only be declared in a DOCTYPE's *internal subset*, the `[ ... ]` between
+/// `<!DOCTYPE svg` and its closing `>`, so refusing that construct refuses
+/// the entire class.
+///
+/// A DOCTYPE **without** an internal subset stays legal, which is the reason
+/// this is a scan and not `allow_dtd: false`. Illustrator and older Inkscape
+/// emit `<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" ...>` on files that
+/// are otherwise perfectly ordinary, and those carry no threat: an external
+/// DTD is never fetched, since `ParsingOptions::default()` leaves
+/// `entity_resolver` at `None` (`roxmltree-0.21.1/src/parse.rs:371`).
+///
+/// Scanned only up to the root element, which is where a DOCTYPE must appear
+/// anyway. A `<!DOCTYPE` inside a comment in the prologue would be a false
+/// positive; that costs one unusual file a render, where a false negative
+/// costs the reader their terminal.
+fn refuse_internal_subset(source: &str) -> Result<(), DecodeError> {
+    let prologue = match source.find("<svg").or_else(|| source.find("<SVG")) {
+        Some(root) => &source[..root],
+        None => source,
+    };
+    let Some(doctype) = prologue.find("<!DOCTYPE") else {
+        return Ok(());
+    };
+    // The internal subset opens with `[` before the declaration's own `>`.
+    let rest = &prologue[doctype..];
+    let end = rest.find('>').unwrap_or(rest.len());
+    if rest[..end].contains('[') {
+        return Err(DecodeError::Malformed(
+            "svg: declares its own XML entities, which this refuses to expand".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Wall-clock budget for turning one drawing into pixels.
+///
+/// Deliberately the same number as `highlight::HIGHLIGHT_TIME_CAP`, and for
+/// the same reason: it must never trip on a real document, only on input
+/// engineered to be slow. A real diagram parses and renders in single-digit
+/// milliseconds; the measured pathological case is 60 ms at eight levels of
+/// `<use>` nesting and doubles from there, so this refuses at roughly ten
+/// levels and passes everything a person would ever draw.
+///
+/// The font load is kept outside this budget — see [`rasterize`] — because it
+/// is a fixed process-wide cost, not work a document can inflate.
+const RENDER_TIME_CAP: Duration = Duration::from_millis(250);
 
 /// The largest parsed XML node count.
 ///
@@ -89,9 +163,22 @@ pub(crate) fn read_source(path: &std::path::Path) -> Result<Option<String>, Deco
     crate::decode::ensure_regular_file(path)?;
     let mut file = std::fs::File::open(path).map_err(DecodeError::Io)?;
 
+    // Filled in a loop rather than with one `read`. `File::read` is allowed
+    // to return short, and std does not retry `EINTR`, so a single call could
+    // hand back a fraction of the prologue — and a prologue cut before its
+    // `<svg` sniffs as "not an SVG" and degrades the drawing to alt text with
+    // no error anywhere. Rare, silent, and cheap to rule out.
     let mut prefix = [0u8; SNIFF_BYTES];
-    let read = file.read(&mut prefix).map_err(DecodeError::Io)?;
-    if !looks_like_svg(&prefix[..read]) {
+    let mut filled = 0;
+    while filled < prefix.len() {
+        match file.read(&mut prefix[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(DecodeError::Io(e)),
+        }
+    }
+    if !looks_like_svg(&prefix[..filled]) {
         return Ok(None);
     }
 
@@ -121,15 +208,55 @@ pub(crate) fn read_source(path: &std::path::Path) -> Result<Option<String>, Deco
 /// prologue. Anything claiming to be SVG but lacking an `<svg` element inside
 /// the first kilobyte is not one worth rendering.
 fn looks_like_svg(prefix: &[u8]) -> bool {
-    let head = &prefix[..prefix.len().min(SNIFF_BYTES)];
-    // `<svg` must be followed by a delimiter, or `<svgfoo` would match.
-    head.windows(4)
-        .enumerate()
-        .filter(|(_, w)| w.eq_ignore_ascii_case(b"<svg"))
-        .any(|(i, _)| {
-            head.get(i + 4)
+    contains_element(&prefix[..prefix.len().min(SNIFF_BYTES)], b"svg")
+}
+
+/// Whether `haystack` opens an element whose *local* name is `local`, with or
+/// without a namespace prefix.
+///
+/// The prefix is the point. SVG is a namespaced format and `usvg` resolves
+/// elements by namespace plus local name, never by literal spelling
+/// (`usvg-0.47.0/src/parser/svgtree/parse.rs:139`) — so `<svg:svg>` and
+/// `<s:text>` are an ordinary drawing and an ordinary label to it, while a
+/// plain `contains("<svg")` sees neither. Both used to fail here: a prefixed
+/// root degraded silently to alt text, and a prefixed `<text>` lost every
+/// glyph because the font database was never loaded for it.
+///
+/// The name must end at a delimiter, so `<svgfoo` does not match `svg`. What
+/// this deliberately does not do is check that the prefix is *bound* to the
+/// SVG namespace — that needs a parse, and this runs before one. Being wrong
+/// that way costs a non-SVG XML file one refused parse; being wrong the other
+/// way cost a real drawing its labels.
+fn contains_element(haystack: &[u8], local: &[u8]) -> bool {
+    let matches_at = |rest: &[u8]| {
+        rest.len() >= local.len()
+            && rest[..local.len()].eq_ignore_ascii_case(local)
+            && rest
+                .get(local.len())
                 .is_none_or(|b| b.is_ascii_whitespace() || *b == b'>' || *b == b'/')
-        })
+    };
+    haystack.iter().enumerate().any(|(open, byte)| {
+        if *byte != b'<' {
+            return false;
+        }
+        let after = &haystack[open + 1..];
+        if matches_at(after) {
+            return true;
+        }
+        // `prefix:local`. An NCName is short and has no `<` or space in it,
+        // so a colon further out belongs to something else entirely.
+        match after.iter().position(|b| *b == b':') {
+            Some(colon)
+                if (1..=64).contains(&colon)
+                    && after[..colon]
+                        .iter()
+                        .all(|b| b.is_ascii_alphanumeric() || *b == b'-' || *b == b'_') =>
+            {
+                matches_at(&after[colon + 1..])
+            }
+            _ => false,
+        }
+    })
 }
 
 /// The font set SVG text is shaped with, loaded once for the life of the
@@ -172,18 +299,21 @@ fn no_fonts() -> Arc<usvg::fontdb::Database> {
 ///
 /// SVG has exactly one way to render glyphs — a `<text>` element — so the
 /// absence of that substring is proof the font database will never be read.
-/// `<tspan>` is checked as well because it is cheap; `<textPath>` needs no
-/// check of its own, since `<text` is a prefix of it. Narrowing the `<text`
-/// test to `"<text>"` or `"<text "` would therefore silently stop covering
-/// `<textPath>` — the assertion for it in
-/// `test_only_a_drawing_with_text_asks_for_fonts` passes by prefix, not on
-/// its own merits.
+/// Matched through [`contains_element`], so a namespace-prefixed `<s:text>`
+/// counts. It did not before, and a prefixed drawing lost every label to a
+/// `log::warn` nobody sees.
 ///
 /// Erring toward loading is deliberate: the cost of a false positive is one
 /// unnecessary font load, and the cost of a false negative is a diagram with
 /// no labels.
 fn needs_fonts(source: &str) -> bool {
-    source.contains("<text") || source.contains("<tspan")
+    let bytes = source.as_bytes();
+    // `<textPath>` is only legal inside a `<text>`, so matching `text` covers
+    // it — but it is listed because the coverage is incidental, and narrowing
+    // this later would drop it silently.
+    contains_element(bytes, b"text")
+        || contains_element(bytes, b"tspan")
+        || contains_element(bytes, b"textPath")
 }
 
 /// Parses `source` into a `usvg` tree under this module's limits.
@@ -193,12 +323,28 @@ fn needs_fonts(source: &str) -> bool {
 /// `usvg::Tree::from_str` is not called. `from_str` builds its own
 /// `ParsingOptions` with `nodes_limit` unset, and there is no way to reach in
 /// and change it.
-fn parse(source: &str) -> Result<usvg::Tree, DecodeError> {
+/// Whether a parse needs glyphs, which only rasterizing does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fonts {
+    /// Shape text into paths if the drawing has any.
+    IfPresent,
+    /// Never load the font database.
+    ///
+    /// [`probe`] passes this, and it is not an optimisation — it is a
+    /// statement about where a size comes from. `usvg::Tree::size()` is
+    /// derived from the root element's `width`/`height`/`viewBox` attributes
+    /// and never from text extents, so glyphs cannot move the answer. Loading
+    /// them to compute it would spend ~480 ms, on the layout thread, on a
+    /// number already sitting in an attribute.
+    Never,
+}
+
+fn parse(source: &str, fonts_needed: Fonts) -> Result<usvg::Tree, DecodeError> {
+    refuse_internal_subset(source)?;
     let xml_options = roxmltree::ParsingOptions {
-        // A DOCTYPE is left allowed on purpose. Refusing it would harden
-        // nothing this does not already bound — expansion is capped by
-        // `roxmltree`'s own loop detector — and would reject the many real
-        // SVGs that older versions of Illustrator and Inkscape emit with one.
+        // A plain DOCTYPE is left allowed so the many real SVGs that ship one
+        // still render; what makes that safe is `refuse_internal_subset`
+        // above, not anything `roxmltree` does.
         allow_dtd: true,
         nodes_limit: MAX_XML_NODES,
         ..Default::default()
@@ -206,16 +352,43 @@ fn parse(source: &str) -> Result<usvg::Tree, DecodeError> {
     let document = roxmltree::Document::parse_with_options(source, xml_options)
         .map_err(|e| DecodeError::Malformed(format!("svg: {e}")))?;
 
+    let want_fonts = fonts_needed == Fonts::IfPresent && needs_fonts(source);
     let options = usvg::Options {
-        fontdb: if needs_fonts(source) {
-            fonts()
-        } else {
-            no_fonts()
-        },
+        fontdb: if want_fonts { fonts() } else { no_fonts() },
         ..Default::default()
     };
     usvg::Tree::from_xmltree(&document, &options)
         .map_err(|e| DecodeError::Malformed(format!("svg: {e}")))
+}
+
+/// Runs `work` on a worker thread and gives up on it after
+/// [`RENDER_TIME_CAP`].
+///
+/// The abandoned thread finishes and drops its result harmlessly — nothing
+/// waits on it. That is the same trade `highlight::highlight_with_timeout`
+/// makes, and the same reason: short of signal-based preemption it is the
+/// only way to bound wall time regardless of what a dependency does inside
+/// its own call stack. `usvg` and `resvg` offer no cancellation hook.
+///
+/// Unlike the highlighter there is no size threshold below which this runs
+/// inline, because there is no size below which an SVG is cheap: the whole
+/// point of the `<use>` bomb is that it is 808 bytes long.
+fn within_time_cap<T, F>(work: F) -> Result<T, DecodeError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, DecodeError> + Send + 'static,
+{
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(work());
+    });
+    match rx.recv_timeout(RENDER_TIME_CAP) {
+        Ok(result) => result,
+        Err(_) => Err(DecodeError::Malformed(format!(
+            "svg: gave up after {} ms — too complex to draw",
+            RENDER_TIME_CAP.as_millis()
+        ))),
+    }
 }
 
 /// The SVG's declared pixel size, for layout to reserve a box from.
@@ -225,8 +398,8 @@ fn parse(source: &str) -> Result<usvg::Tree, DecodeError> {
 /// means parsing it. Parsing is still far cheaper than rasterizing, which is
 /// the distinction the layout-time probe actually cares about.
 pub(crate) fn probe(source: &str, limits: Limits) -> Result<(u32, u32), DecodeError> {
-    let tree = parse(source)?;
-    dimensions(&tree, limits)
+    let owned = source.to_string();
+    within_time_cap(move || dimensions(&parse(&owned, Fonts::Never)?, limits))
 }
 
 /// A tree's size as whole pixels, checked against `limits`.
@@ -261,7 +434,29 @@ pub(crate) fn rasterize(
     target_px: (u32, u32),
     limits: Limits,
 ) -> Result<image::DynamicImage, DecodeError> {
-    let tree = parse(source)?;
+    // Warmed *outside* the cap, deliberately. The font load is a one-time,
+    // process-wide, ~480 ms cost bounded by how many fonts are installed —
+    // nothing a document controls — so counting it against a per-drawing
+    // budget would refuse the first labelled diagram of every session and
+    // then render it fine on the second. The cap exists to bound work an
+    // attacker chooses, and this is not that work.
+    //
+    // Found by `test_text_in_a_drawing_is_actually_drawn`, which failed with
+    // "gave up after 250 ms" the moment the cap went in — while the comment
+    // on the cap claimed it wrapped the render and not the font load.
+    if needs_fonts(source) {
+        let _ = fonts();
+    }
+    let owned = source.to_string();
+    within_time_cap(move || rasterize_now(&owned, target_px, limits))
+}
+
+fn rasterize_now(
+    source: &str,
+    target_px: (u32, u32),
+    limits: Limits,
+) -> Result<image::DynamicImage, DecodeError> {
+    let tree = parse(source, Fonts::IfPresent)?;
     let (width, height) = dimensions(&tree, limits)?;
     let (fit_w, fit_h) = fit(width, height, target_px.0.max(1), target_px.1.max(1));
 
@@ -329,6 +524,19 @@ mod tests {
         );
 
         assert!(!looks_like_svg(b"<svgfoo>"), "`<svg` needs a delimiter");
+        // Namespace-prefixed spellings are what `usvg` actually resolves, and
+        // what some Batik and older-editor toolchains emit. A prefixed root
+        // used to sniff as "not an SVG" and degrade silently to alt text.
+        assert!(looks_like_svg(
+            br#"<svg:svg xmlns:svg="http://www.w3.org/2000/svg">"#
+        ));
+        assert!(looks_like_svg(
+            br#"<ns0:svg xmlns:ns0="http://www.w3.org/2000/svg"/>"#
+        ));
+        assert!(
+            !looks_like_svg(b"<a:notsvg>"),
+            "the local name still has to match"
+        );
         assert!(!looks_like_svg(b"\x89PNG\r\n\x1a\n"));
         assert!(!looks_like_svg(b""));
         // An `<svg` past the sniff window is not one this will find, and that
@@ -492,6 +700,115 @@ mod tests {
             MAX_SVG_BYTES as u64 >= u64::from(MAX_XML_NODES) * smallest_node_bytes,
             "MAX_XML_NODES is unreachable within MAX_SVG_BYTES — one of the two \
              caps is doing nothing"
+        );
+    }
+
+    /// The wide entity bomb, which the earlier defence did not stop.
+    ///
+    /// This is the shape the old `test_an_entity_bomb_is_refused_rather_than_expanded`
+    /// missed: that fixture nests entities inside *one* root reference, which
+    /// `roxmltree`'s 255-per-root cap does catch. Repeat the reference instead
+    /// and the cap never applies, because it is explicitly disabled at depth
+    /// zero. Measured before the fix: 76 KiB of source, 256 MiB of expansion,
+    /// 4.7 seconds, and a successful parse.
+    ///
+    /// Kept small enough to be harmless if the guard ever regresses — 16 MiB
+    /// and a fraction of a second rather than the numbers above.
+    #[test]
+    fn test_a_wide_entity_bomb_is_refused() {
+        let value = "A".repeat(16 * 1024);
+        let mut source =
+            format!("<?xml version=\"1.0\"?>\n<!DOCTYPE svg [ <!ENTITY a \"{value}\"> ]>\n");
+        source.push_str(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\"><desc>",
+        );
+        for _ in 0..1024 {
+            source.push_str("&a;");
+        }
+        source.push_str("</desc></svg>");
+
+        let err = probe(&source, Limits::default()).expect_err("a wide entity bomb is refused");
+        assert!(
+            matches!(&err, DecodeError::Malformed(m) if m.contains("own XML entities")),
+            "{err:?}"
+        );
+    }
+
+    /// A DOCTYPE with no internal subset still renders.
+    ///
+    /// The entity guard is a scan rather than `allow_dtd: false` precisely so
+    /// this keeps working: Illustrator and older Inkscape put one on files
+    /// that are otherwise ordinary, and an external DTD is never fetched.
+    #[test]
+    fn test_a_plain_doctype_is_still_accepted() {
+        let source = concat!(
+            "<?xml version=\"1.0\"?>\n",
+            "<!DOCTYPE svg PUBLIC \"-//W3C//DTD SVG 1.1//EN\" ",
+            "\"http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd\">\n",
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"40\" height=\"20\"/>"
+        );
+        assert_eq!(probe(source, Limits::default()).expect("parses"), (40, 20));
+    }
+
+    /// The time cap, on the one axis no byte or node count can see.
+    ///
+    /// Nested `<use>` is exponential in the source: measured, 808 bytes at
+    /// eight levels costs 60 ms and every two further levels doubles it, with
+    /// nothing stopping it before `usvg`'s 1,000,000 elements. Sixteen levels
+    /// is ~65k leaves — comfortably past the budget, comfortably inside every
+    /// other limit, and about a kilobyte of source.
+    #[test]
+    fn test_an_expansion_bomb_is_refused_on_time_rather_than_size() {
+        let mut source = String::from(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"64\" height=\"64\"><defs>\
+             <g id=\"l0\"><rect width=\"4\" height=\"4\"/></g>",
+        );
+        for i in 1..=16 {
+            source.push_str(&format!(
+                "<g id=\"l{i}\"><use href=\"#l{}\"/><use href=\"#l{}\"/></g>",
+                i - 1,
+                i - 1
+            ));
+        }
+        source.push_str("</defs><use href=\"#l16\"/></svg>");
+        assert!(
+            source.len() < 2_048,
+            "the fixture must stay tiny — that is the whole point"
+        );
+
+        let started = std::time::Instant::now();
+        let err = rasterize(&source, (32, 32), Limits::default())
+            .expect_err("an expansion bomb is refused");
+        assert!(
+            matches!(&err, DecodeError::Malformed(m) if m.contains("too complex")),
+            "{err:?}"
+        );
+        assert!(
+            started.elapsed() < RENDER_TIME_CAP * 8,
+            "the cap did not actually bound the wait: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// `probe` must never load fonts — a drawing's size comes from its root
+    /// attributes, not from text extents. Asserted by timing rather than by
+    /// inspection: the font load is ~480 ms, so a probe that stayed under the
+    /// render cap cannot have done one.
+    #[test]
+    fn test_probing_a_labelled_drawing_does_not_load_fonts() {
+        let labelled = r##"<svg xmlns="http://www.w3.org/2000/svg" width="300" height="80">
+            <text x="10" y="40" font-size="20">a label that would need shaping</text>
+        </svg>"##;
+        let started = std::time::Instant::now();
+        assert_eq!(
+            probe(labelled, Limits::default()).expect("probes"),
+            (300, 80)
+        );
+        assert!(
+            started.elapsed() < RENDER_TIME_CAP,
+            "probing took {:?} — it loaded the font database for a size it reads \
+             off an attribute",
+            started.elapsed()
         );
     }
 
