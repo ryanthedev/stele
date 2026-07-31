@@ -1,4 +1,12 @@
 /target
 **/*.rs.bk
 .DS_Store
-.code-foundations/wave-worktrees/
+
+# Agent working directories. `.claude/worktrees/` holds live git worktrees, so
+# committing this path would nest one checkout inside another.
+.claude/
+
+# Planning, discovery and review artifacts from the build process. Kept on
+# disk, deliberately not published: they are a working record, not part of the
+# project. Present in history up to d72d7c4.
+.code-foundations/
