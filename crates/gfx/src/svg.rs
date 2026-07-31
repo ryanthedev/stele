@@ -137,22 +137,135 @@ const SNIFF_BYTES: usize = 1024;
 /// DTD is never fetched, since `ParsingOptions::default()` leaves
 /// `entity_resolver` at `None` (`roxmltree-0.21.1/src/parse.rs:371`).
 ///
-/// Scanned only up to the root element, which is where a DOCTYPE must appear
-/// anyway. A `<!DOCTYPE` inside a comment in the prologue would be a false
-/// positive; that costs one unusual file a render, where a false negative
-/// costs the reader their terminal.
+/// The UTF-8 encoding of U+FEFF. `roxmltree` skips one before it reads
+/// anything else (`roxmltree-0.21.1/src/tokenizer.rs:298`), so a guard that
+/// did not would start its walk on a byte matching no production and conclude
+/// the document declares nothing.
+const BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
+
+/// Refusal for a prologue construct that opens and never closes. Distinct from
+/// the entity message on purpose: nothing was read that declares anything, and
+/// saying otherwise would assert something this never saw.
+const UNCLOSED_PROLOGUE: &str =
+    "svg: the prologue does not close, so what it declares cannot be read";
+
+/// Byte offset of the document's DOCTYPE declaration, or `None` if it has
+/// none — XML production 22, the half of this guard that used to be guessed.
+///
+/// The old answer was `source.find("<svg")` for the prologue's end and then
+/// `find("<!DOCTYPE")` inside it, and both halves were wrong in the same
+/// direction. `<!--<svg-->` truncated the prologue so the declaration after
+/// it was never scanned; `<!-- <!DOCTYPE x> -->` supplied a harmless decoy for
+/// `find` to stop on. Eleven bytes of the first turned `Err(Malformed)` into
+/// `Ok((10, 10))` with the entity text expanded, and no cap caught it: the
+/// byte and node caps see a tiny file, and [`RENDER_TIME_CAP`] bounds the
+/// caller's wait rather than the abandoned thread's allocation.
+///
+/// So this stops guessing and follows the grammar. Production 22 is `prolog
+/// ::= XMLDecl? Misc* (doctypedecl Misc*)?` with `Misc ::= Comment | PI | S`,
+/// and a DOCTYPE is therefore admissible at exactly one place: after the
+/// declaration, after any run of comments, instructions and whitespace, and
+/// before anything else. A `<!DOCTYPE` anywhere else — inside a comment, after
+/// the root element — is not a declaration to `roxmltree` either, and cannot
+/// declare an entity.
+///
+/// Deliberately shaped against `roxmltree-0.21.1/src/tokenizer.rs:parse`
+/// rather than against the specification directly, because it is `roxmltree`
+/// that will do the expanding. It skips a UTF-8 BOM first (`tokenizer.rs:298`),
+/// admits the declaration only as a literal `<?xml ` including the space
+/// (`tokenizer.rs:303`), runs `Misc*`, then tests for `<!DOCTYPE`. Matching
+/// its procedure is what makes this exact instead of merely careful: being
+/// *stricter* than the parser costs an unusual file a render, but being
+/// looser costs the reader their terminal.
+///
+/// The declaration and a processing instruction close differently, and the
+/// difference is another `SystemLiteral`-shaped trap. `roxmltree` reads the
+/// declaration as attributes, so `encoding="x?>y"` holds an ordinary `?>` and
+/// the declaration runs on past it — while a PI (production 16) really does
+/// end at the first `?>`, quotes and all. Each is walked its own way. They can
+/// never be confused, because `parse_pi` rejects `<?xml ` outright
+/// (`tokenizer.rs:371`).
+///
+/// Anything that opens and does not close — a comment, an instruction, the
+/// declaration — is refused rather than skipped past. At that point the walk
+/// cannot say where the prologue ends, so it cannot say the document declares
+/// nothing.
+fn doctype_offset(source: &str) -> Result<Option<usize>, DecodeError> {
+    /// What XML calls `S` (production 3), and what `roxmltree`'s
+    /// `is_xml_space` accepts — not Rust's `is_ascii_whitespace`, which also
+    /// takes a form feed the parser would stop on.
+    fn is_xml_space(byte: u8) -> bool {
+        matches!(byte, b' ' | b'\t' | b'\r' | b'\n')
+    }
+
+    /// Index just past `close`, searching from `from`.
+    fn past(bytes: &[u8], from: usize, close: &[u8]) -> Result<usize, DecodeError> {
+        bytes[from..]
+            .windows(close.len())
+            .position(|window| window == close)
+            .map(|at| from + at + close.len())
+            .ok_or_else(|| DecodeError::Malformed(UNCLOSED_PROLOGUE.to_string()))
+    }
+
+    let bytes = source.as_bytes();
+    let mut at = if bytes.starts_with(BOM) { BOM.len() } else { 0 };
+
+    // The declaration, if there is one, and only in first position — which is
+    // the only place `roxmltree` will read one.
+    if bytes[at..].starts_with(b"<?xml ") {
+        let mut quote: Option<u8> = None;
+        let mut scan = at + 6;
+        loop {
+            let Some(&byte) = bytes.get(scan) else {
+                return Err(DecodeError::Malformed(UNCLOSED_PROLOGUE.to_string()));
+            };
+            match (quote, byte) {
+                (Some(open), b) if b == open => quote = None,
+                (Some(_), _) => {}
+                (None, b'"' | b'\'') => quote = Some(byte),
+                (None, b'?') if bytes[scan + 1..].starts_with(b">") => {
+                    scan += 2;
+                    break;
+                }
+                (None, _) => {}
+            }
+            scan += 1;
+        }
+        at = scan;
+    }
+
+    // Misc*, then whatever the prologue was leading up to.
+    loop {
+        while bytes.get(at).is_some_and(|&b| is_xml_space(b)) {
+            at += 1;
+        }
+        let rest = &bytes[at..];
+        if rest.starts_with(b"<!--") {
+            at = past(bytes, at + 4, b"-->")?;
+        } else if rest.starts_with(b"<?") {
+            at = past(bytes, at + 2, b"?>")?;
+        } else if rest.starts_with(b"<!DOCTYPE") {
+            return Ok(Some(at));
+        } else {
+            // The root element, or something neither this nor `roxmltree`
+            // will make sense of. Either way no DOCTYPE precedes it.
+            return Ok(None);
+        }
+    }
+}
+
+/// Where the declaration *is* is [`doctype_offset`]'s problem, and it is a
+/// separate one. This walk models production 28 — the declaration's interior.
+/// Locating it is production 22, the prologue, and reading one correctly buys
+/// nothing if the other is guessed at.
 fn refuse_internal_subset(source: &str) -> Result<(), DecodeError> {
-    let prologue = match source.find("<svg").or_else(|| source.find("<SVG")) {
-        Some(root) => &source[..root],
-        None => source,
-    };
-    let Some(doctype) = prologue.find("<!DOCTYPE") else {
+    let Some(doctype) = doctype_offset(source)? else {
         return Ok(());
     };
     // Walked as bytes: every delimiter here is ASCII and no UTF-8
     // continuation byte is, so this cannot land inside a character.
     let mut quote: Option<u8> = None;
-    for &byte in &prologue.as_bytes()[doctype..] {
+    for &byte in &source.as_bytes()[doctype..] {
         match (quote, byte) {
             (Some(open), b) if b == open => quote = None,
             (Some(_), _) => {}
@@ -962,6 +1075,148 @@ mod tests {
             matches!(&err, DecodeError::Malformed(m) if m.contains("own XML entities")),
             "{err:?}"
         );
+    }
+
+    /// Builds the same hostile drawing as [`subset_behind`], with `prologue`
+    /// placed in front of the DOCTYPE. Every caller below is asking one
+    /// question: does what sits *before* the declaration change whether the
+    /// declaration is found?
+    fn subset_behind_prologue(prologue: &str) -> String {
+        format!(
+            "{prologue}\
+             <!DOCTYPE svg [ <!ENTITY a \"AAAAAAAAAAAAAAAA\"> ]>\n\
+             <svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\">\
+             <desc>&a;</desc></svg>"
+        )
+    }
+
+    /// A `<svg` inside a prologue comment truncated the scanned region, so the
+    /// real DOCTYPE two lines later was never looked at. Eleven bytes.
+    ///
+    /// This is the family the Phase 1b security review found and this session
+    /// reproduced: `Err(Malformed)` became `Ok((10, 10))` with the entity text
+    /// expanded. It is a defect in how the declaration is *located* (XML
+    /// production 22), not in how its interior is read (production 28) — the
+    /// interior walk was already exact.
+    #[test]
+    fn test_dw_1b_7_a_root_element_inside_a_prologue_comment_hides_no_doctype() {
+        let err = refusal_of(&subset_behind_prologue("<!--<svg-->\n"));
+        assert!(
+            matches!(&err, DecodeError::Malformed(m) if m.contains("own XML entities")),
+            "{err:?}"
+        );
+    }
+
+    /// The other half of the same family: a commented-out decoy declaration
+    /// ahead of the real one. A scan that takes the *first* `<!DOCTYPE` in the
+    /// prologue reads the decoy, finds it harmless, and never reaches the one
+    /// that declares entities.
+    #[test]
+    fn test_dw_1b_7_a_commented_decoy_doctype_does_not_shadow_the_real_one() {
+        let err = refusal_of(&subset_behind_prologue("<!-- <!DOCTYPE x> -->\n"));
+        assert!(
+            matches!(&err, DecodeError::Malformed(m) if m.contains("own XML entities")),
+            "{err:?}"
+        );
+    }
+
+    /// `?>` inside a quoted pseudo-attribute of the XML declaration.
+    ///
+    /// `roxmltree` parses the declaration as attributes
+    /// (`tokenizer.rs:parse_declaration`), so a `?>` inside `encoding="…"` is
+    /// an ordinary character and the declaration runs on to the real `?>`
+    /// after it. A walk that ends the declaration at the first `?>` stops
+    /// short, breaks out of the prologue mid-string, and never sees the
+    /// DOCTYPE — the `SystemLiteral` bypass again, one production up.
+    ///
+    /// A *processing instruction* is the opposite (production 16: `'<?'
+    /// PITarget (S (Char* - (Char* '?>' Char*)))? '?>'`) and really does end
+    /// at the first `?>`, which is why only the declaration is walked this
+    /// way. `parse_pi` additionally rejects `<?xml ` outright
+    /// (`tokenizer.rs:371`), so the two can never be confused.
+    ///
+    /// Unlike its two neighbours above, this was never a live bypass. The old
+    /// scan searched the whole prologue for `<!DOCTYPE` and was therefore
+    /// blind to where the declaration ended; the hole is in the
+    /// *replacement*, which walks the prologue in order and could stop inside
+    /// a string. It fails against a first-`?>` version of that walk, which is
+    /// the only reason it is worth its lines.
+    #[test]
+    fn test_dw_1b_7_a_quoted_pi_close_in_the_declaration_hides_no_doctype() {
+        let err = refusal_of(&subset_behind_prologue(
+            "<?xml version=\"1.0\" encoding=\"x?>y\"?>\n",
+        ));
+        assert!(
+            matches!(&err, DecodeError::Malformed(m) if m.contains("own XML entities")),
+            "{err:?}"
+        );
+    }
+
+    /// `roxmltree` skips a UTF-8 BOM before anything else
+    /// (`tokenizer.rs:298`), so a guard that does not skip it starts its walk
+    /// on a byte that matches no production and concludes there is no DOCTYPE.
+    ///
+    /// Also not a live bypass against the old scan, and for the same reason as
+    /// the declaration test below: `find` did not care what preceded the
+    /// declaration. This pins the replacement.
+    #[test]
+    fn test_dw_1b_7_a_byte_order_mark_does_not_hide_the_doctype() {
+        let err = refusal_of(&subset_behind_prologue("\u{feff}"));
+        assert!(
+            matches!(&err, DecodeError::Malformed(m) if m.contains("own XML entities")),
+            "{err:?}"
+        );
+    }
+
+    /// The whole point of scanning rather than `allow_dtd: false`: the
+    /// ordinary Illustrator/Inkscape prologue still renders. Comment, PI,
+    /// declaration and a subset-free DOCTYPE, all in front of a real drawing.
+    #[test]
+    fn test_dw_1b_7_an_ordinary_prologue_still_renders() {
+        let source = concat!(
+            "\u{feff}<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
+            "<!-- Generator: Adobe Illustrator 27.0.0 -->\n",
+            "<?xml-stylesheet href=\"x.css\" type=\"text/css\"?>\n",
+            "<!DOCTYPE svg PUBLIC \"-//W3C//DTD SVG 1.1//EN\" ",
+            "\"http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd\">\n",
+            "<!-- and a trailing comment -->\n",
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"40\" height=\"20\"/>"
+        );
+        assert_eq!(probe(source, Limits::default()).expect("parses"), (40, 20));
+    }
+
+    /// An unterminated comment or PI leaves the walk unable to say where the
+    /// prologue ends, and therefore unable to say whether a DOCTYPE follows.
+    /// It refuses, for the same reason an unterminated literal does.
+    #[test]
+    fn test_dw_1b_7_an_unterminated_prologue_item_is_refused() {
+        for prologue in ["<!-- never closed\n", "<?pi never closed\n"] {
+            let source = format!(
+                "{prologue}<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\"/>"
+            );
+            let err = refuse_internal_subset(&source).expect_err("an open prologue is refused");
+            assert!(
+                matches!(&err, DecodeError::Malformed(m) if m.contains("prologue")),
+                "{prologue:?} -> {err:?}"
+            );
+        }
+    }
+
+    /// Every truncation of a hostile *prologue*, the production-22 counterpart
+    /// of the production-28 prefix sweep above. The walk indexes bytes across
+    /// four constructs now; none of them may run off the end.
+    #[test]
+    fn test_dw_1b_7_no_prefix_of_a_hostile_prologue_walks_out_of_bounds() {
+        let hostile = subset_behind_prologue(
+            "<?xml version=\"1.0\" encoding=\"x?>y\"?><!--<svg--><?pi <!DOCTYPE q>?>",
+        );
+        assert!(
+            hostile.is_ascii(),
+            "prefixes must split on character bounds"
+        );
+        for end in 0..=hostile.len() {
+            let _ = refuse_internal_subset(&hostile[..end]);
+        }
     }
 
     /// The time cap, on the one axis no byte or node count can see.
