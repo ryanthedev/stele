@@ -1,0 +1,126 @@
+name: Release
+
+# Cut a release by pushing a tag: `git tag v0.1.0 && git push origin v0.1.0`.
+# CI (`ci.yml`) is what proves the tree is green; this workflow only packages
+# what is already on the tagged commit, so tag a commit that has passed CI.
+on:
+  push:
+    tags: ["v*"]
+  # Lets the packaging be exercised without cutting a release — the upload
+  # step is skipped when there is no tag to attach artifacts to.
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
+          # Deliberately not `ubuntu-latest`: a binary linked against a newer
+          # glibc will not start on an older distro, and the runner label is
+          # the only place that choice gets made. 22.04 is glibc 2.35.
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+
+      # Reads the pinned channel out of rust-toolchain.toml, so the release
+      # binary is built with the same compiler the tests ran under.
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Build
+        run: cargo build --release --locked -p stele
+
+      # The same assertion ci.yml makes on every push, repeated here because
+      # this is the artifact people actually download: a release binary that
+      # needs a library the user does not have fails at exec time, and the
+      # only place to catch that is where it is produced.
+      - name: Assert no non-system dynamic dependencies
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          ldd target/release/stele
+          bad=$(ldd target/release/stele | grep -viE '(linux-vdso|libc\.so|libm\.so|libgcc_s\.so|libpthread\.so|libdl\.so|librt\.so|ld-linux|=> */lib|statically linked|not a dynamic executable)' || true)
+          if [ -n "$bad" ]; then
+            echo "Unexpected dynamic dependency:"
+            echo "$bad"
+            exit 1
+          fi
+
+      - name: Smoke-test the binary
+        run: |
+          set -euo pipefail
+          ./target/release/stele --version
+          ./target/release/stele --help > /dev/null
+          # Only that the binary executes and its CLI parses. Rendering a
+          # document cannot be checked here: the viewer needs a terminal, and
+          # even `stele -` reads its keys from /dev/tty, which a runner has
+          # none of. The suite covers the render path; this covers the thing
+          # the suite cannot — that what was packaged actually runs on a
+          # machine that did not build it.
+
+      - name: Package
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          [ "$GITHUB_REF_TYPE" = tag ] || version="$(git rev-parse --short=7 HEAD)"
+          name="stele-${version}-${{ matrix.target }}"
+          mkdir -p "dist/${name}"
+          cp target/release/stele "dist/${name}/"
+          cp README.md LICENSE "dist/${name}/"
+          tar czf "dist/${name}.tar.gz" -C dist "${name}"
+          echo "archive=dist/${name}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: ${{ steps.package.outputs.archive }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          ls -la
+          sha256sum *.tar.gz | tee SHA256SUMS
+
+      # `gh` rather than a third-party release action: it is already on the
+      # runner and authenticated, and this keeps the number of actions that
+      # can write to the repo at the ones GitHub ships.
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            --verify-tag \
+            dist/*.tar.gz dist/SHA256SUMS
