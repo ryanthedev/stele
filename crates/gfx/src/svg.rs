@@ -1010,24 +1010,37 @@ mod tests {
     /// The whole point of the candidate order: a machine that already resolved
     /// keeps the font it had. Pinning is allowed to rescue a miss, never to
     /// move a hit — otherwise every macOS render would silently change
-    /// typeface to fix a Linux bug.
+    /// typeface to fix a Linux bug. Asserted as the rule rather than the
+    /// outcome, so it holds on whatever machine runs it: the name each generic
+    /// ends up with must be the *first* candidate this machine actually has,
+    /// and every list starts with the name `fontdb` already defaulted to.
+    ///
+    /// Deliberately reads the warmed database rather than loading a second
+    /// one. `load_system_fonts` costs about half a second, tests share a
+    /// process, and [`RENDER_TIME_CAP`] is 250 ms of wall clock — a test that
+    /// scans the system fonts again is a test that makes every timing-bounded
+    /// test in this binary flakier.
     #[test]
-    fn test_pinning_leaves_a_family_that_already_resolved_alone() {
+    fn test_each_generic_takes_the_first_candidate_this_machine_has() {
         let db = fonts();
-        let resolved = db.family_name(&usvg::fontdb::Family::Serif).to_string();
-        let mut fresh = usvg::fontdb::Database::new();
-        fresh.load_system_fonts();
-        let default_name = fresh.family_name(&usvg::fontdb::Family::Serif).to_string();
-        let default_resolved = fresh
-            .query(&usvg::fontdb::Query {
-                families: &[usvg::fontdb::Family::Serif],
-                ..Default::default()
-            })
-            .is_some();
-        if default_resolved {
+        let present: std::collections::BTreeSet<String> = db
+            .faces()
+            .flat_map(|face| face.families.iter().map(|(name, _)| name.clone()))
+            .collect();
+
+        for (family, candidates) in [
+            (usvg::fontdb::Family::Serif, SERIF_FAMILIES),
+            (usvg::fontdb::Family::SansSerif, SANS_SERIF_FAMILIES),
+            (usvg::fontdb::Family::Monospace, MONOSPACE_FAMILIES),
+        ] {
+            let Some(first_present) = candidates.iter().find(|name| present.contains(**name))
+            else {
+                continue;
+            };
             assert_eq!(
-                resolved, default_name,
-                "pinning moved serif off a name that already worked"
+                db.family_name(&family),
+                *first_present,
+                "{family:?} passed over {first_present:?}, which this machine has"
             );
         }
     }
