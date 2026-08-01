@@ -594,13 +594,6 @@ fn needs_fonts(source: &str) -> bool {
         || contains_element(bytes, b"textPath")
 }
 
-/// Parses `source` into a `usvg` tree under this module's limits.
-///
-/// The two-step parse — `roxmltree` first, `usvg::Tree::from_xmltree` second
-/// — is the whole point of this function and the reason
-/// `usvg::Tree::from_str` is not called. `from_str` builds its own
-/// `ParsingOptions` with `nodes_limit` unset, and there is no way to reach in
-/// and change it.
 /// Whether a parse needs glyphs, which only rasterizing does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Fonts {
@@ -617,6 +610,36 @@ enum Fonts {
     Never,
 }
 
+/// The font database a parse of `source` under `fonts_needed` will be given.
+///
+/// Split out of [`parse`] so the choice can be asserted rather than inferred.
+/// It is a pure function of its two arguments — no clock, no `OnceLock`
+/// warmth, no dependence on what else has run — which is the whole reason it
+/// exists: "`probe` loads no fonts" used to be pinned by timing the probe and
+/// checking it finished inside [`RENDER_TIME_CAP`], and that assertion could
+/// go quiet in two ways at once. `fonts()` is a process-wide `OnceLock` that
+/// another test in this binary warms, and on a machine with few fonts the load
+/// fits inside 250 ms anyway. A stopwatch cannot pin a fact that has no
+/// duration.
+///
+/// Returning the `Arc` rather than a bool keeps the assertion on the thing
+/// `parse` actually uses: a test can ask whether the database is empty, and
+/// no separate predicate can drift away from what is passed to `usvg`.
+fn fontdb_for(fonts_needed: Fonts, source: &str) -> Arc<usvg::fontdb::Database> {
+    if fonts_needed == Fonts::IfPresent && needs_fonts(source) {
+        fonts()
+    } else {
+        no_fonts()
+    }
+}
+
+/// Parses `source` into a `usvg` tree under this module's limits.
+///
+/// The two-step parse — `roxmltree` first, `usvg::Tree::from_xmltree` second
+/// — is the whole point of this function and the reason
+/// `usvg::Tree::from_str` is not called. `from_str` builds its own
+/// `ParsingOptions` with `nodes_limit` unset, and there is no way to reach in
+/// and change it.
 fn parse(source: &str, fonts_needed: Fonts) -> Result<usvg::Tree, DecodeError> {
     refuse_internal_subset(source)?;
     let xml_options = roxmltree::ParsingOptions {
@@ -630,9 +653,8 @@ fn parse(source: &str, fonts_needed: Fonts) -> Result<usvg::Tree, DecodeError> {
     let document = roxmltree::Document::parse_with_options(source, xml_options)
         .map_err(|e| DecodeError::Malformed(format!("svg: {e}")))?;
 
-    let want_fonts = fonts_needed == Fonts::IfPresent && needs_fonts(source);
     let options = usvg::Options {
-        fontdb: if want_fonts { fonts() } else { no_fonts() },
+        fontdb: fontdb_for(fonts_needed, source),
         ..Default::default()
     };
     usvg::Tree::from_xmltree(&document, &options)
@@ -669,6 +691,37 @@ where
     }
 }
 
+/// The font mode [`probe`] parses under, named so a test can assert it.
+const PROBE_FONTS: Fonts = Fonts::Never;
+
+/// The parse [`probe`] performs, with the font mode stated once rather than
+/// spelled at the call site.
+///
+/// The indirection is the point. It is not that a wrapper is safer than an
+/// argument — it is that this leaves exactly one place in non-test code where
+/// probe's font mode is written down, so changing it is an edit to a named,
+/// documented decision rather than swapping one enum variant among a call's
+/// arguments.
+///
+/// **What the tests below can and cannot catch.** They pin
+/// [`PROBE_FONTS`] and what [`fontdb_for`] does with it, so changing either
+/// fails. They cannot catch this function being bypassed — a `probe` rewritten
+/// to call `parse(&owned, Fonts::IfPresent)` directly passes every assertion
+/// in this module. That was measured, not assumed: the mutation was applied
+/// and the suite stayed green. The plan for this work claimed the mode and
+/// database assertions together would fail under it; they do not, because both
+/// read `PROBE_FONTS`, which such a rewrite leaves untouched.
+///
+/// Closing that would mean asserting on an effect rather than a value — that
+/// probing did not initialize the `fonts()` `OnceLock` — and the `OnceLock` is
+/// process-wide and warmed by other tests in this binary, so the assertion
+/// would depend on execution order. That is the exact defect this phase
+/// removed. A test cannot prove code calls it; the honest boundary is stated
+/// here rather than implied by a green suite.
+fn parse_for_probe(source: &str) -> Result<usvg::Tree, DecodeError> {
+    parse(source, PROBE_FONTS)
+}
+
 /// The SVG's declared pixel size, for layout to reserve a box from.
 ///
 /// This is the vector counterpart of the raster header probe, and it is
@@ -677,7 +730,7 @@ where
 /// the distinction the layout-time probe actually cares about.
 pub(crate) fn probe(source: &str, limits: Limits) -> Result<(u32, u32), DecodeError> {
     let owned = source.to_string();
-    within_time_cap(move || dimensions(&parse(&owned, Fonts::Never)?, limits))
+    within_time_cap(move || dimensions(&parse_for_probe(&owned)?, limits))
 }
 
 /// A tree's size as whole pixels, checked against `limits`.
@@ -1450,24 +1503,59 @@ mod tests {
     }
 
     /// `probe` must never load fonts — a drawing's size comes from its root
-    /// attributes, not from text extents. Asserted by timing rather than by
-    /// inspection: the font load is ~480 ms, so a probe that stayed under the
-    /// render cap cannot have done one.
+    /// attributes, not from text extents.
+    ///
+    /// This used to be asserted with a stopwatch: the font load is ~480 ms, so
+    /// a probe that finished inside [`RENDER_TIME_CAP`] was taken as proof it
+    /// had not done one. That assertion could go quiet two different ways.
+    /// `fonts()` is a process-wide `OnceLock`, and
+    /// [`test_text_in_a_drawing_is_actually_drawn`] warms it in this same
+    /// binary — so whether the load lands inside the probe depends on which
+    /// test won the race. And on a machine with few fonts installed the load
+    /// finishes inside 250 ms regardless, at which point the assertion holds
+    /// for a probe that *did* load fonts.
+    ///
+    /// The fact being pinned has no duration. `parse`'s database selection is
+    /// a function of `(Fonts, source)` and nothing else, so it is asserted as
+    /// one — on a drawing that genuinely has text, since a text-free drawing
+    /// would get an empty database under either mode and prove nothing.
+    ///
+    /// Both halves are load-bearing. The mode alone could be evaded by
+    /// inlining `Fonts::IfPresent` at the call site; the database alone could
+    /// be evaded by changing what [`fontdb_for`] returns. Neither mutation
+    /// passes both.
     #[test]
     fn test_probing_a_labelled_drawing_does_not_load_fonts() {
         let labelled = r##"<svg xmlns="http://www.w3.org/2000/svg" width="300" height="80">
             <text x="10" y="40" font-size="20">a label that would need shaping</text>
         </svg>"##;
-        let started = std::time::Instant::now();
+
+        assert!(
+            needs_fonts(labelled),
+            "the fixture must be a drawing that would otherwise want fonts, \
+             or this test passes for the wrong reason"
+        );
+        assert_eq!(
+            PROBE_FONTS,
+            Fonts::Never,
+            "probe must ask for the no-fonts mode"
+        );
+        assert!(
+            fontdb_for(PROBE_FONTS, labelled).is_empty(),
+            "the mode probe parses under still selected a populated font \
+             database for a drawing with text in it"
+        );
+
+        // The counterpart, so the assertion above cannot be satisfied by a
+        // `fontdb_for` that returns an empty database for everything.
+        assert!(
+            !fontdb_for(Fonts::IfPresent, labelled).is_empty(),
+            "the rasterize path must still get fonts for a labelled drawing"
+        );
+
         assert_eq!(
             probe(labelled, Limits::default()).expect("probes"),
             (300, 80)
-        );
-        assert!(
-            started.elapsed() < RENDER_TIME_CAP,
-            "probing took {:?} — it loaded the font database for a size it reads \
-             off an attribute",
-            started.elapsed()
         );
     }
 
