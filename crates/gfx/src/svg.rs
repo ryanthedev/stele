@@ -459,8 +459,112 @@ fn fonts() -> Arc<usvg::fontdb::Database> {
     Arc::clone(FONTS.get_or_init(|| {
         let mut db = usvg::fontdb::Database::new();
         db.load_system_fonts();
+        pin_generic_families(&mut db);
         Arc::new(db)
     }))
+}
+
+/// Candidates for each generic family, best first: the name `fontdb` already
+/// defaults to, then the platform's usual spelling of it, then the families a
+/// Linux box actually ships.
+///
+/// Ordering them this way means a machine that already resolved — every macOS
+/// and Windows one — keeps the exact font it had, and only a machine that
+/// would otherwise have rendered nothing changes behaviour.
+const SERIF_FAMILIES: &[&str] = &[
+    "Times New Roman",
+    "Times",
+    "Liberation Serif",
+    "DejaVu Serif",
+    "Noto Serif",
+    "FreeSerif",
+];
+const SANS_SERIF_FAMILIES: &[&str] = &[
+    "Arial",
+    "Helvetica",
+    "Liberation Sans",
+    "DejaVu Sans",
+    "Noto Sans",
+    "FreeSans",
+];
+const MONOSPACE_FAMILIES: &[&str] = &[
+    "Courier New",
+    "Menlo",
+    "Liberation Mono",
+    "DejaVu Sans Mono",
+    "Noto Sans Mono",
+    "FreeMono",
+];
+const CURSIVE_FAMILIES: &[&str] = &["Comic Sans MS", "Comic Neue", "URW Chancery L", "Z003"];
+const FANTASY_FAMILIES: &[&str] = &[
+    "Impact",
+    "Papyrus",
+    "Herculanum",
+    "URW Gothic",
+    "Copperplate",
+];
+
+/// Point each generic family at one this machine actually has.
+///
+/// `fontdb::Database::new` hardcodes the Microsoft names — serif is
+/// "Times New Roman", sans-serif "Arial" — and `load_system_fonts` loads faces
+/// without revising them. `query` returns `None` on a family miss rather than
+/// substituting any face, and `usvg` asks for `[Name("Times New Roman"),
+/// Serif]` on unstyled text, where `Serif` resolves to that same absent name.
+/// Both legs miss, and the drawing renders with every label silently dropped —
+/// which [`test_text_in_a_drawing_is_actually_drawn`] calls the worst outcome
+/// for the documents SVG is used for, and which is the *default* state of a
+/// Linux machine. It shipped that way until CI ran on one.
+///
+/// Neither of the two obvious fixes works, and both were tried in a container
+/// before this one was written: installing fonts on the runner leaves the
+/// query still missing, because the name is what is absent, not the faces; and
+/// `fontdb`'s `fontconfig` feature resolves serif to `FreeSerif`, which is
+/// itself not installed on a stock image.
+///
+/// [`test_text_in_a_drawing_is_actually_drawn`]: tests::test_text_in_a_drawing_is_actually_drawn
+fn pin_generic_families(db: &mut usvg::fontdb::Database) {
+    let present: std::collections::BTreeSet<String> = db
+        .faces()
+        .flat_map(|face| face.families.iter().map(|(name, _)| name.clone()))
+        .collect();
+
+    // No faces at all is not a naming problem, and renaming cannot rescue it.
+    // Leaving the defaults alone keeps that failure looking like what it is
+    // rather than like a font nobody can find.
+    let Some(fallback) = present.first() else {
+        return;
+    };
+
+    // Any loaded family beats a name known to miss: a label in the wrong
+    // typeface is legible, and a label that never rasterizes is not. `present`
+    // is ordered, so the choice is the same on every run of a given machine
+    // rather than whatever the face iterator happened to yield first.
+    let pick = |candidates: &[&str]| -> String {
+        candidates
+            .iter()
+            .find(|name| present.contains(**name))
+            .map_or_else(|| fallback.clone(), |name| (*name).to_string())
+    };
+
+    let sans_serif = pick(SANS_SERIF_FAMILIES);
+    // Cursive and fantasy fall back to the resolved sans-serif rather than to
+    // `fallback`: a machine with no decorative face installed is far likelier
+    // to want its body font than the alphabetically first thing on disk.
+    let cursive = CURSIVE_FAMILIES
+        .iter()
+        .find(|name| present.contains(**name))
+        .map_or_else(|| sans_serif.clone(), |name| (*name).to_string());
+    let fantasy = FANTASY_FAMILIES
+        .iter()
+        .find(|name| present.contains(**name))
+        .map_or_else(|| sans_serif.clone(), |name| (*name).to_string());
+
+    db.set_serif_family(pick(SERIF_FAMILIES));
+    db.set_monospace_family(pick(MONOSPACE_FAMILIES));
+    db.set_sans_serif_family(sans_serif);
+    db.set_cursive_family(cursive);
+    db.set_fantasy_family(fantasy);
 }
 
 /// The empty database a text-free drawing parses against.
@@ -853,6 +957,79 @@ mod tests {
             inked > 200,
             "expected glyph coverage, found {inked} inked pixels — fonts are not reaching text"
         );
+    }
+
+    /// The generic families are the half of the font path that has no fallback
+    /// underneath it: `query` answers `None` on a miss, so a generic pointing
+    /// at an absent name is not a degraded render but no render. The test above
+    /// catches that for serif alone, and only through the ink it fails to
+    /// leave; this names each generic and asks the database directly, so a
+    /// machine that resolves body text but drops every `font-family: monospace`
+    /// label says which one broke.
+    #[test]
+    fn test_every_generic_family_resolves_on_this_machine() {
+        let db = fonts();
+        for family in [
+            usvg::fontdb::Family::Serif,
+            usvg::fontdb::Family::SansSerif,
+            usvg::fontdb::Family::Monospace,
+            usvg::fontdb::Family::Cursive,
+            usvg::fontdb::Family::Fantasy,
+        ] {
+            let name = db.family_name(&family).to_string();
+            let hit = db.query(&usvg::fontdb::Query {
+                families: &[family],
+                ..Default::default()
+            });
+            assert!(
+                hit.is_some(),
+                "{family:?} resolves to {name:?}, which no loaded face answers to — \
+                 text asking for it renders nothing"
+            );
+        }
+    }
+
+    /// A database with no faces is a different failure from a database whose
+    /// generics are misnamed, and pinning must not disguise the first as the
+    /// second: there is nothing to point at, so the defaults stay put.
+    #[test]
+    fn test_an_empty_database_is_left_with_its_defaults() {
+        let mut db = usvg::fontdb::Database::new();
+        let before = db.family_name(&usvg::fontdb::Family::Serif).to_string();
+        pin_generic_families(&mut db);
+        assert_eq!(db.family_name(&usvg::fontdb::Family::Serif), before);
+        assert!(
+            db.query(&usvg::fontdb::Query {
+                families: &[usvg::fontdb::Family::Serif],
+                ..Default::default()
+            })
+            .is_none()
+        );
+    }
+
+    /// The whole point of the candidate order: a machine that already resolved
+    /// keeps the font it had. Pinning is allowed to rescue a miss, never to
+    /// move a hit — otherwise every macOS render would silently change
+    /// typeface to fix a Linux bug.
+    #[test]
+    fn test_pinning_leaves_a_family_that_already_resolved_alone() {
+        let db = fonts();
+        let resolved = db.family_name(&usvg::fontdb::Family::Serif).to_string();
+        let mut fresh = usvg::fontdb::Database::new();
+        fresh.load_system_fonts();
+        let default_name = fresh.family_name(&usvg::fontdb::Family::Serif).to_string();
+        let default_resolved = fresh
+            .query(&usvg::fontdb::Query {
+                families: &[usvg::fontdb::Family::Serif],
+                ..Default::default()
+            })
+            .is_some();
+        if default_resolved {
+            assert_eq!(
+                resolved, default_name,
+                "pinning moved serif off a name that already worked"
+            );
+        }
     }
 
     /// The two input caps must stay in a stated relationship, not merely each
