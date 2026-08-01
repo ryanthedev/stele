@@ -872,6 +872,26 @@ mod tests {
     /// The tests above assert that classification refuses; this one asserts
     /// that the refusal happens *upstream of the opener*, which is the part a
     /// reordering could break while every other test stayed green.
+    ///
+    /// **`../../etc/passwd` is deliberately not in this batch, and re-adding
+    /// it would be a mistake twice over.** It was here until CI first ran on
+    /// Linux, and it never asserted anything: the batch is refused by
+    /// classification, but a traversal is refused only when it fails to
+    /// resolve, and whether it resolves is decided by how deep
+    /// `std::env::temp_dir()` happens to be. On macOS that is
+    /// `/var/folders/…/T/`, so two `..` land in a directory that does not
+    /// exist and `canonicalize` fails; on Linux it is `/tmp`, so the same
+    /// string canonicalizes to the real `/etc/passwd` and the document opens.
+    /// The case was green on one platform by accident of path depth.
+    ///
+    /// It was also the opposite of this module's policy, which states that
+    /// `../` outside the document's directory is "a legitimate target rather
+    /// than an attack" and that there is "no directory jail here" — a policy
+    /// [`test_dw_6_5_a_traversal_path_that_resolves_to_a_readable_file_opens`]
+    /// exists to defend. Traversal reaches nothing an absolute path could not
+    /// already reach, since `/etc/hosts` is followable by the same policy.
+    /// A local path cannot reach the opener at all, which is what this test is
+    /// about.
     #[test]
     fn test_dw_6_5_no_hostile_destination_ever_reaches_the_opener_seam() {
         let dir = scratch_dir("opener-seam");
@@ -890,7 +910,6 @@ mod tests {
             "; rm -rf /",
             "$(reboot)",
             "`id`",
-            "../../etc/passwd",
             "#fragment",
             "",
         ] {
