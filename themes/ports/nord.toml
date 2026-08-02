@@ -67,7 +67,11 @@ front_matter = "#8f9ab5"
 overflow = "#8f9ab5"
 search_match = "#ebcb8b"
 search_current = "#d08770"
+line_number = "#7b88a1"
+line_number_current = "#eceff4"
+gutter_border = "#8f9ab5"
 code_block_bg = "#2e3440"
+current_line_bg = "#3b4252"
 
 # Naming any of these hands the theme the whole code block — see
 # docs/theming.md.

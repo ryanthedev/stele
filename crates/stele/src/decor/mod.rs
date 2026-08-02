@@ -137,7 +137,20 @@ fn structural_style(semantic: Semantic) -> Style {
         | Semantic::FrontMatter
         | Semantic::OverflowIndicator
         | Semantic::ListMarker
-        | Semantic::Strikethrough => dim,
+        | Semantic::Strikethrough
+        | Semantic::LineNumber
+        | Semantic::GutterBorder => dim,
+        // The reading line on the themeless path is the *absence* of dim in a
+        // column that is otherwise entirely dim. That is a real difference and
+        // the only one available: `reverse` is spent on link selection, and
+        // bold would move the digits (see `highlight::theme`'s arm).
+        //
+        // What this path cannot do is paint the band — `CurrentLine` is a
+        // colour and there are none here. So with no theme, the reading line
+        // is marked by its number and its separator brightening, and by
+        // nothing else. Stated rather than worked around: a `reverse` band
+        // across the page would be the one loud thing on a monochrome screen.
+        Semantic::LineNumberCurrent | Semantic::CurrentLine => Style::default(),
         Semantic::Text | Semantic::TaskMarker | Semantic::CodeBlock => Style::default(),
     }
 }
@@ -335,7 +348,11 @@ mod tests {
                 | Semantic::FrontMatter
                 | Semantic::OverflowIndicator
                 | Semantic::SearchMatch
-                | Semantic::SearchCurrent => {}
+                | Semantic::SearchCurrent
+                | Semantic::LineNumber
+                | Semantic::LineNumberCurrent
+                | Semantic::GutterBorder
+                | Semantic::CurrentLine => {}
                 // Deliberately absent from the list below, for the reason
                 // given in `highlight::theme`'s matching guard: it is defined
                 // to resolve like `Heading(n)` minus the wash, so a
@@ -367,6 +384,10 @@ mod tests {
             Semantic::OverflowIndicator,
             Semantic::SearchMatch,
             Semantic::SearchCurrent,
+            Semantic::LineNumber,
+            Semantic::LineNumberCurrent,
+            Semantic::GutterBorder,
+            Semantic::CurrentLine,
         ];
         all.extend((1..=6u8).map(Semantic::Heading));
         all.extend(

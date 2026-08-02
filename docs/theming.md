@@ -43,6 +43,7 @@ flag and start stele again.
 | `appearance` | `"dark"` or `"light"`. Decides which built-in your theme lays over, and therefore every colour you did *not* set. Defaults to `dark` with a warning. |
 | `[colors]` | Markdown role name → `#rrggbb` or `#rgb`. All optional. |
 | `[syntax]` | Syntax role name → colour. All optional, but see [Syntax colours](#syntax-colours) — this table is all-or-nothing in practice. |
+| `[layout]` | Geometry, not colour: padding, the gutter, the reading line. All optional — see [The page](#the-page). |
 
 `appearance` is the one people skip and shouldn't. A theme that sets six
 colours inherits twenty-seven, and they have to come from the right end of the
@@ -90,6 +91,86 @@ WCAG's 3:1 non-text floor instead of the 4.5:1 asked of text.
 | `overflow` | *structural* — the `…` clip indicator |
 | `search_match` | Text matching the active search |
 | `search_current` | The match you are currently on |
+| `line_number` | *structural* — a row's number in the gutter |
+| `line_number_current` | *structural* — the number on the reading line |
+| `gutter_border` | *structural* — the rule between the gutter and the page |
+| `current_line_bg` | **A background, not a foreground.** The band under the reading line — see [The reading line](#the-reading-line). |
+
+## The page
+
+One table, and it is the only part of a theme file that is not a palette:
+
+```toml
+[layout]
+padding_left = 2
+padding_right = 2
+line_numbers = true
+```
+
+Every key is optional and every default is the frame stele drew before any of
+this existed, so a theme that leaves `[layout]` out looks exactly as it always
+did.
+
+| Key | Default | Means |
+|---|---|---|
+| `padding_left`, `padding_right` | `0` | Dead cells either side of the page. Nothing is ever painted in them, and they sit *outside* the reading line's band — desk, not page. |
+| `padding_top`, `padding_bottom` | `0` | Blank rows above and below the document. The status row is below all of it either way. |
+| `line_numbers` | `false` | A number per rendered row, in a gutter down the left. |
+| `gutter_gap` | `1` | Cells between the gutter's separator and the first character of the page. |
+| `current_line` | `true` | Paint the band under the reading line. |
+| `scrolloff` | `0` | Rows kept between the reading line and the edge of the page before it scrolls. |
+
+Padding is capped at 64 cells a side, `gutter_gap` at 8 and `scrolloff` at 32.
+A value outside its range is clamped and reported rather than dropped: someone
+who wrote `padding_left = 200` wants a wide margin, and the widest available is
+a better reading of that than none.
+
+A terminal too narrow to hold the page plus its furniture gets **none** of the
+furniture rather than a squeezed version of it. The threshold is 24 cells of
+content, the same floor `--max-width` clamps against.
+
+### Line numbers count rendered rows
+
+Not source lines. stele renders markdown, and a rendered row is what it can
+actually address: `scroll` is an index into rendered rows, the position
+percentage is computed from them, `g` and `G` move between them. The number in
+the gutter names the same thing the rest of the viewer names.
+
+It follows that the numbers *move* when the window is resized, because the rows
+did. It also follows that an eight-row image consumes eight numbers — which
+looks wasteful until you remember the number is a scroll coordinate, and the
+image really does occupy eight rows of scroll.
+
+`#` toggles the gutter for one session, and `--line-numbers` turns it on for
+one run whatever the theme says.
+
+### The reading line
+
+A pager has no cursor, so before anything could be highlighted stele had to
+grow one. The **reading line** is it: the line every motion addresses, with the
+viewport following it rather than the other way round.
+
+That is a real change in how `j` behaves. A line key — `j`, `k`, the arrows —
+moves the reader, and the page does not move until the reader reaches its
+bottom edge. A page key — `PgDn`, `Ctrl-f`, `Ctrl-d` — moves the page and takes
+the reader along, exactly as it always did. `G` now reaches the last *line*
+rather than the last screen.
+
+The reading line exists whether or not it is painted. Setting
+`current_line = false` hides the band and changes no motion, because a key that
+means different things depending on a display setting is worse than either
+meaning.
+
+`current_line_bg` is the band's colour, and it wins over everything it covers —
+including a code block's own slab. A fence whose middle row loses the slab
+colour still reads as a fence; a reading line you cannot find is the feature
+not working.
+
+**Over an image it cannot win.** A kitty raster is composited above the text
+layer, so on an image row the band covers the gutter, the padding, and whatever
+content cells the picture does not fill. That is why the gutter's separator
+takes the reading line's colour too — on a row full of picture, the separator
+and the number are the only cells left that can say where you are.
 
 ## Syntax colours
 

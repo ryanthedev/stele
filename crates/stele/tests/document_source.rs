@@ -157,8 +157,16 @@ fn test_dw_2_2_an_external_write_repaints_within_a_poll_interval_and_keeps_the_t
     // blank layout line, so an odd scroll offset would put a blank row at the
     // top and "the same block is still on top" would be a claim about
     // whitespace.
+    //
+    // `j` moves the reading line and the page only follows once the reading
+    // line reaches its bottom edge, so scrolling the page by `SCROLL_LINES`
+    // costs one press per content row first. That is arithmetic about this
+    // 24-row pty, not about the anchor this test is here for.
+    const SCROLL_LINES: usize = 12;
+    const CONTENT_ROWS: usize = 23; // 24 rows, less the status line.
+    let presses = CONTENT_ROWS + SCROLL_LINES - 1;
     drain_to_quiet(master);
-    pty.type_bytes(b"jjjjjjjjjjj");
+    pty.type_bytes(&vec![b'j'; presses - 1]);
     drain_to_quiet(master);
     pty.type_bytes(b"j");
     let before = read_one_frame(master, REPAINT_DEADLINE);

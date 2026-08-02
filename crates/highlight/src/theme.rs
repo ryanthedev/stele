@@ -172,6 +172,15 @@ impl Theme {
         // monochrome in practice however it got that way.
         let attrs = match semantic {
             Semantic::Heading(level) => heading_attrs(level, fg.is_none()),
+            // The gutter's dim is the built-in's, not the theme's. SGR faint
+            // is not a colour, it is an instruction to blend toward the
+            // background, so it lands on top of whatever hex the author wrote
+            // and moves it — `resolve_capture` makes exactly this trade for a
+            // named comment colour, and for the same reason. The built-in
+            // gutter is the terminal's own foreground and was picked knowing
+            // it would be dimmed; `line_number = "#7a6a5c"` was picked to be
+            // `#7a6a5c`, and it is measured against the page as written.
+            Semantic::LineNumber | Semantic::GutterBorder if fg.is_some() => Style::default(),
             other => semantic_attrs(other),
         };
         // The H1 wash. Gated on `fg` rather than on the color mode for the
@@ -192,6 +201,11 @@ impl Theme {
             // gate on `fg` would mean the slab only ever appeared for someone
             // who had already themed the text on it.
             Semantic::CodeBlock => self.background_for(semantic, code_wash(self.variant)),
+            // The reading band, gated the same way and for the same reason:
+            // it has no palette slot, so a gate on `fg` would mean the band
+            // only appeared to someone who had already themed something that
+            // does not exist.
+            Semantic::CurrentLine => self.background_for(semantic, current_line_wash(self.variant)),
             _ => None,
         };
         Style { fg, bg, ..attrs }
@@ -291,6 +305,16 @@ fn semantic_attrs(semantic: Semantic) -> Style {
         Semantic::AlertTitle(_) => bold,
         Semantic::Emph | Semantic::ImageAlt | Semantic::MathTex => italic,
         Semantic::Link | Semantic::FootnoteRef => underline,
+        // The gutter is chrome and answers to the reading line, not to
+        // itself: the ordinary number is dim so a column of digits does not
+        // compete with the prose beside it, and the current one drops the dim
+        // rather than adding bold, because bold moves a digit's advance width
+        // in some fonts and a gutter whose numbers shift as you scroll is
+        // worse than a gutter that only changes colour.
+        Semantic::LineNumber | Semantic::GutterBorder => dim,
+        Semantic::LineNumberCurrent => Style::default(),
+        // A background paints no glyph, so it has no attributes to carry.
+        Semantic::CurrentLine => Style::default(),
         // Kept identical to the themeless table in `crates/stele/src/decor`,
         // and for that table's reason rather than this one's: under
         // `ColorMode::NoColor` these attributes are all a reader gets here
@@ -413,7 +437,25 @@ fn semantic_role_index(semantic: Semantic) -> Option<usize> {
         | Semantic::Emph
         | Semantic::Strikethrough
         | Semantic::CodeBlock
-        | Semantic::MathTex => {
+        | Semantic::MathTex
+        // The gutter takes no slot, and that is a decision rather than an
+        // omission. `build_palette` is a golden-angle sweep through hue space
+        // — it hands out colours chosen to be unlike each other, which is
+        // right for twenty kinds of token and wrong for a column of digits
+        // down the side of the page. A generated hue there would be a
+        // magenta gutter on a theme with no magenta in it.
+        //
+        // `None` sends all three to the terminal's own foreground, the same
+        // place `Text` goes, and [`semantic_attrs`] separates them with the
+        // one attribute that costs no colour: the ordinary number and the
+        // separator are dim, the reading line's number is not. On a page whose
+        // every other glyph is dim, undimmed *is* the highlight.
+        | Semantic::LineNumber
+        | Semantic::LineNumberCurrent
+        | Semantic::GutterBorder
+        // A surface, not ink: `CurrentLine` resolves through
+        // `background_for` and never through the palette.
+        | Semantic::CurrentLine => {
             return None;
         }
     })
@@ -448,7 +490,8 @@ pub fn role_count() -> usize {
 }
 
 /// How many roles sit past the capture block: `SearchMatch` and
-/// `SearchCurrent`.
+/// `SearchCurrent`. The gutter roles are not among them — see
+/// [`semantic_role_index`] for why chrome takes no palette slot.
 const TRAILING_ROLES: usize = 2;
 
 /// WCAG 2.1's contrast floor for normal-size text (1.4.3).
@@ -477,7 +520,19 @@ pub fn is_structural(semantic: Semantic) -> bool {
         | Semantic::BlockquoteMarker
         | Semantic::ListMarker
         | Semantic::TaskMarker
-        | Semantic::OverflowIndicator => true,
+        | Semantic::OverflowIndicator
+        // A line number is digits, and digits are read — but they are read
+        // the way a ruler is read, glanced at to place something else. Held
+        // to the furniture bar so a theme can keep the gutter quiet without
+        // stele warning about it; a gutter as loud as the prose is the
+        // failure mode worth designing against here.
+        | Semantic::LineNumber
+        | Semantic::LineNumberCurrent
+        | Semantic::GutterBorder => true,
+        // A background has no contrast ratio of its own — what has to stay
+        // legible is what gets painted *on* it, which `ThemeFile::lint`
+        // measures separately.
+        Semantic::CurrentLine => false,
         Semantic::Text
         | Semantic::Heading(_)
         | Semantic::HeadingRung(_)
@@ -575,6 +630,9 @@ pub const THEMEABLE_ROLES: &[&str] = &[
     "overflow",
     "search_match",
     "search_current",
+    "line_number",
+    "line_number_current",
+    "gutter_border",
 ];
 
 /// The name a theme file uses for `semantic`, or `None` when the role is
@@ -628,8 +686,16 @@ pub fn role_name(semantic: Semantic) -> Option<&'static str> {
         Semantic::OverflowIndicator => "overflow",
         Semantic::SearchMatch => "search_match",
         Semantic::SearchCurrent => "search_current",
+        Semantic::LineNumber => "line_number",
+        Semantic::LineNumberCurrent => "line_number_current",
+        Semantic::GutterBorder => "gutter_border",
         // Follows `Heading` rather than carrying a name of its own.
         Semantic::HeadingRung(_) => return None,
+        // Themeable, but as `current_line_bg` through `background_from_name`
+        // — the same split `CodeBlock` has, where the foreground name and the
+        // background name are two different keys onto one role. This function
+        // answers only for foregrounds, and this role has none.
+        Semantic::CurrentLine => return None,
     })
 }
 
@@ -674,27 +740,34 @@ pub fn semantic_from_name(name: &str) -> Option<Semantic> {
         "overflow" => Semantic::OverflowIndicator,
         "search_match" => Semantic::SearchMatch,
         "search_current" => Semantic::SearchCurrent,
+        "line_number" => Semantic::LineNumber,
+        "line_number_current" => Semantic::LineNumberCurrent,
+        "gutter_border" => Semantic::GutterBorder,
         _ => return None,
     })
 }
 
 /// Names in `[colors]` that set a *background* rather than a foreground.
 ///
-/// One today, and the suffix is load-bearing: `code_block` is the colour of
-/// code the highlighter did not claim, `code_block_bg` is the slab both it and
-/// every syntax colour sit on. A theme sets them independently, so they cannot
-/// be one name.
+/// Two, and the `_bg` suffix is load-bearing on the first: `code_block` is the
+/// colour of code the highlighter did not claim, `code_block_bg` is the slab
+/// both it and every syntax colour sit on. A theme sets them independently, so
+/// they cannot be one name. `current_line_bg` carries the suffix for
+/// consistency rather than for disambiguation — there is no `current_line`
+/// foreground and there will not be one, because the reading line's *text* is
+/// whatever the document put there.
 ///
 /// These live in `[colors]` alongside the foregrounds rather than in a table of
 /// their own. A third table would be a third thing to explain for one key, and
 /// a theme author asking "what colour is the code block" is not thinking about
 /// which channel it lands in.
-pub const BACKGROUND_ROLES: &[&str] = &["code_block_bg"];
+pub const BACKGROUND_ROLES: &[&str] = &["code_block_bg", "current_line_bg"];
 
 /// The role a `[colors]` background name refers to, or `None` if none does.
 pub fn background_from_name(name: &str) -> Option<Semantic> {
     match name {
         "code_block_bg" => Some(Semantic::CodeBlock),
+        "current_line_bg" => Some(Semantic::CurrentLine),
         _ => None,
     }
 }
@@ -1056,6 +1129,32 @@ fn code_wash(variant: Variant) -> Color {
     }
 }
 
+/// The band under the reading line.
+///
+/// Louder than [`code_wash`] and for the opposite reason. The code slab marks
+/// an extent that is *there whether or not you are looking at it*, so it has
+/// to survive twenty lines of syntax colour without shifting any of them. This
+/// band marks one row, it moves as the reader moves, and it is the only thing
+/// on screen saying where they are — it can afford to be seen. 1.34:1 against
+/// the dark reference, 1.16:1 against the light.
+///
+/// Still neutral rather than hued, and that is not for the slab's reason.
+/// This band runs under whatever the row happens to hold — a heading, a table
+/// border, a line of highlighted Rust — so a tint would land on a different
+/// set of colours every time the reader pressed `j`. Grey lands on all of
+/// them the same way.
+///
+/// Deliberately not derived from `code_wash` by arithmetic. The two are
+/// stacked on the same row whenever the reading line is inside a fence, and
+/// two numbers that must stay apart are better written apart than computed
+/// from one another and hoped over.
+fn current_line_wash(variant: Variant) -> Color {
+    match variant {
+        Variant::Dark => Color::new(0x2b, 0x2d, 0x3d),
+        Variant::Light => Color::new(0xea, 0xea, 0xef),
+    }
+}
+
 /// One rung of the heading color ramp.
 fn heading_ramp_color(rung: usize, variant: Variant) -> Color {
     let (hue, saturation, lightnesses) = match variant {
@@ -1299,7 +1398,16 @@ mod tests {
                 | Semantic::FrontMatter
                 | Semantic::OverflowIndicator
                 | Semantic::SearchMatch
-                | Semantic::SearchCurrent => {}
+                | Semantic::SearchCurrent
+                | Semantic::LineNumber
+                | Semantic::LineNumberCurrent
+                | Semantic::GutterBorder
+                // Present in the list below but colourless by construction:
+                // the gutter roles and `CurrentLine` all resolve to no
+                // palette entry, so the distinctness sweep skips them where
+                // it skips `Text`. Named here so a later decision to give the
+                // gutter a slot has to come back through this guard.
+                | Semantic::CurrentLine => {}
                 // Deliberately absent from the list below. `HeadingRung(n)`
                 // resolves to the same palette slot as `Heading(n)` on
                 // purpose — it is that rung's color minus the wash — so
@@ -1332,6 +1440,10 @@ mod tests {
             Semantic::OverflowIndicator,
             Semantic::SearchMatch,
             Semantic::SearchCurrent,
+            Semantic::LineNumber,
+            Semantic::LineNumberCurrent,
+            Semantic::GutterBorder,
+            Semantic::CurrentLine,
         ];
         for level in 1..=6 {
             v.push(Semantic::Heading(level));

@@ -21,6 +21,7 @@ stele README.md
 | **Math** | `$…$` and `$$…$$` via RaTeX, degrading to a Unicode text grid and then to the TeX source |
 | **Diagrams** | Mermaid fences, as Unicode box drawing |
 | **Themes** | One TOML file, no installer — see [docs/theming.md](docs/theming.md) |
+| **The page** | Line numbers, margins and a highlighted reading line, all set in that same file |
 
 ## Requirements
 
@@ -81,10 +82,10 @@ Save a theme at `~/.config/stele/theme.toml` and it is picked up every run.
 | Key | Action |
 |---|---|
 | `q`, `Ctrl-C` | Quit |
-| `j` / `k`, `↓` / `↑` | Scroll a line |
+| `j` / `k`, `↓` / `↑` | Move the reading line |
 | `Ctrl-D` / `Ctrl-U` | Half page |
 | `Ctrl-F` / `Ctrl-B`, `PgDn` / `PgUp` | Full page |
-| `g` / `G`, `Home` / `End` | Top / bottom |
+| `g` / `G`, `Home` / `End` | First / last line |
 | `[[` / `]]` | Previous / next heading |
 | `/`, then `n` / `N` | Search, next / previous match |
 | `t` | Table of contents; `Enter` to jump |
@@ -94,6 +95,7 @@ Save a theme at `~/.config/stele/theme.toml` and it is picked up every run.
 | `z` | Fold the heading at the cursor |
 | `R` / `M` | Expand / collapse all folds |
 | `T` | Toggle theme |
+| `#` | Toggle line numbers |
 | `m` | Toggle mouse capture |
 | `Ctrl-G` | File info |
 

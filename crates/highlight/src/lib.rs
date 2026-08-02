@@ -45,7 +45,7 @@ pub use theme::{
     semantic_from_name, variant_from_osc11_reply,
 };
 pub use theme_file::{
-    ThemeError, ThemeFile, ThemeWarning, syntax_role_names, themeable_role_names,
+    LAYOUT_SETTINGS, ThemeError, ThemeFile, ThemeWarning, syntax_role_names, themeable_role_names,
 };
 
 pub use layout::{HeadingCase, StyleId, heading_case};

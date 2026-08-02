@@ -20,6 +20,20 @@ appearance = "dark"
 # be 33-ways distinct once quantized. Truecolor terminals — which is what
 # stele targets — show every colour here exactly as written.
 
+# Geometry rather than colour, and the only table here that is not a palette.
+# Ember is the file that demonstrates it; foundry and lichen leave it out
+# entirely, which is also a complete theme — every key below has a default and
+# the default is the frame stele drew before any of this existed.
+#
+# Two cells of desk on each side, and the reading line's band on. The gutter is
+# off: numbers are a thing you turn on when you want them (`#`), not a thing a
+# theme should decide you want.
+[layout]
+padding_left = 2
+padding_right = 2
+line_numbers = false
+current_line = true
+
 [colors]
 # Warm rather than neutral: paper held near a fire, not under a tube.
 text = "#dbcec0"
@@ -69,6 +83,15 @@ overflow = "#a46346"
 search_match = "#efcb39"
 search_current = "#f87c56"
 
+# The gutter. Chrome, and held to WCAG's 3:1 non-text floor rather than the
+# 4.5:1 asked of prose — a column of digits as loud as the paragraph beside it
+# is the failure mode worth designing against. The reading line's number is the
+# one exception and takes the H1 flame, because it is the only thing on the
+# page saying where you are.
+line_number = "#846f5d"
+line_number_current = "#ff9147"
+gutter_border = "#7d6753"
+
 # The slab a fenced code block sits on, so a reader can see where the code
 # stops. coal a shade above the page — warm, like everything else here.
 #
@@ -76,6 +99,12 @@ search_current = "#f87c56"
 # is everything painted on it, which is what stele measures the [syntax]
 # table against once this is set.
 code_block_bg = "#242021"
+
+# The band under the reading line — the second surface stele paints, and the
+# only one that moves. A shade warmer and lighter than the code slab so the two
+# are still tellable apart when the reader is standing inside a fence, which is
+# the one place they are stacked.
+current_line_bg = "#2d2523"
 
 # Syntax colours, for fenced blocks a highlighter claims. Setting even one of
 # these hands stele the whole block: anything left unset falls back to `text`

@@ -64,6 +64,25 @@ pub struct Cli {
     /// ones would be the wrong kindness. See `crate::theme_source`.
     #[arg(long, value_name = "FILE")]
     pub theme: Option<PathBuf>,
+
+    /// Numbers every rendered row in a gutter down the left of the page.
+    ///
+    /// Overrides `line_numbers` in the theme's `[layout]` table, so a theme
+    /// that turns the gutter off cannot stop you asking for it on this run.
+    /// The numbers count *rendered* rows, not source lines — see
+    /// `docs/theming.md`.
+    #[arg(long)]
+    pub line_numbers: bool,
+
+    /// Strips every piece of furniture for this run: no padding, no gutter,
+    /// no band under the reading line, whatever the theme says.
+    ///
+    /// The escape hatch for piping, for recording a clean screenshot, and for
+    /// the reader who wants the page and nothing else. Wins over
+    /// `--line-numbers` if both are given, because "none of it" is the more
+    /// specific request.
+    #[arg(long)]
+    pub no_chrome: bool,
 }
 
 /// A combination of flags that parse individually but cannot mean anything

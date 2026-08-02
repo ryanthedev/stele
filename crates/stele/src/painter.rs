@@ -36,6 +36,168 @@ pub struct CellPos {
     pub y: u16,
 }
 
+/// The gutter's separator: one BOX DRAWINGS LIGHT VERTICAL between the
+/// numbers and the page.
+///
+/// It is not decoration. On a row whose content cells belong to a kitty
+/// raster, this glyph and the number beside it are the only cells the band can
+/// reach — so the separator changing colour is what says "the reader is here"
+/// when an image is standing where the band would be. See
+/// `docs/spikes/gutter.md`.
+const GUTTER_SEPARATOR: &str = "│";
+
+/// Cells the separator and the space before it consume, on top of the digits
+/// and [`layout::Chrome::gutter_gap`].
+const SEPARATOR_CELLS: u16 = 2;
+
+/// The narrowest number column, so a short document's gutter is not one cell
+/// wide and does not change width for the first nine rows of a long one.
+const MIN_LINE_NUMBER_DIGITS: u16 = 2;
+
+/// Where the page sits inside the viewport, and what furniture it carries.
+///
+/// The resolved form of [`layout::Chrome`]: chrome is what a theme *asked*
+/// for, a `Page` is what this viewport can actually give it, with the gutter
+/// measured and the reading line already turned into a line index. The
+/// painter takes the second and never sees the first, which is what keeps
+/// "does this terminal have room" out of the paint loop.
+///
+/// [`Page::full`] is the geometry stele drew before any of this existed, and
+/// every entry point that does not take a `Page` uses it — so a caller who
+/// wants no furniture cannot accidentally get some.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Page {
+    /// Top-left cell of the page inside the content viewport: the padding
+    /// above and to the left of it, in other words. Nothing is ever painted
+    /// outside this except the blanking that keeps stale glyphs off the desk.
+    pub origin: CellPos,
+    /// Cells the gutter occupies — digits, the separator, and the gap — or
+    /// `0` when there is no gutter. The document's first cell is at
+    /// `origin.x + gutter`.
+    pub gutter: u16,
+    /// Cells the document's own column occupies, gutter excluded.
+    pub content: u16,
+    /// Rows of document the page shows. `size.height` minus vertical padding.
+    pub rows: u16,
+    /// The reading line as an **absolute tree line index**, not a viewport
+    /// row, and `None` when the band is switched off. Absolute for the reason
+    /// every other overlay here is: scrolling must not move the highlight onto
+    /// different text.
+    pub cursor: Option<usize>,
+    /// Whether the gutter shows a number per row. Independent of `gutter`
+    /// being non-zero only in the degenerate case of a zero-width gutter,
+    /// which [`Page::new`] does not produce.
+    pub line_numbers: bool,
+    /// Cells of the gutter given to the digits, so the gap is what is left
+    /// after them and the separator. Carried rather than re-derived at paint
+    /// time because [`gutter_width`] is the one function allowed to decide it
+    /// — the caller lays the document out against its answer, and a second
+    /// derivation is a second chance to disagree with that.
+    pub digits: u16,
+}
+
+impl Page {
+    /// The whole viewport, no furniture, no reading line — what every
+    /// `frame_*` entry point that predates the gutter still paints.
+    pub fn full(size: Size) -> Page {
+        Page {
+            origin: CellPos { x: 0, y: 0 },
+            gutter: 0,
+            content: size.width,
+            rows: size.height,
+            cursor: None,
+            line_numbers: false,
+            digits: 0,
+        }
+    }
+
+    /// The page `chrome` asks for in a `size` viewport showing `line_count`
+    /// rendered rows.
+    ///
+    /// `chrome` is expected to have been through [`layout::Chrome::fit`]
+    /// already — this does the arithmetic, not the affordability check, and
+    /// the two are separate because the width the caller laid the document out
+    /// at has to come from the same gutter measurement this uses. A `Page`
+    /// built from a wider gutter than the one layout was given would paint the
+    /// document a cell into its own right margin.
+    pub fn new(chrome: layout::Chrome, size: Size, line_count: usize, cursor: usize) -> Page {
+        let gutter = gutter_width(chrome, line_count);
+        let content = size
+            .width
+            .saturating_sub(chrome.horizontal(gutter))
+            .min(size.width);
+        Page {
+            origin: CellPos {
+                x: chrome.padding.left.min(size.width),
+                y: chrome.padding.top.min(size.height),
+            },
+            gutter,
+            content,
+            rows: size.height.saturating_sub(chrome.vertical()),
+            cursor: chrome.current_line.then_some(cursor),
+            line_numbers: chrome.line_numbers,
+            digits: if chrome.line_numbers {
+                digits(line_count)
+            } else {
+                0
+            },
+        }
+    }
+
+    /// The band's extent: the gutter plus the document column. Right padding
+    /// is *not* in it — padding is the desk the page sits on, and a band that
+    /// ran into it would make the page look wider than it is on exactly one
+    /// row. See `docs/spikes/gutter.md`.
+    fn band_width(&self) -> u16 {
+        self.gutter.saturating_add(self.content)
+    }
+
+    /// Column the document's own first cell sits at.
+    fn text_x(&self) -> u16 {
+        self.origin.x.saturating_add(self.gutter)
+    }
+
+    /// Whether `index` is the row the reader is on.
+    fn is_cursor(&self, index: usize) -> bool {
+        self.cursor == Some(index)
+    }
+}
+
+/// Cells a gutter needs for a document of `line_count` rendered rows.
+///
+/// Digits, a space, the separator, and the configured gap. Zero when the theme
+/// asked for no numbers: with nothing to separate, a separator would be a
+/// vertical rule down the side of the page for its own sake, and a reader who
+/// wants the page moved off the terminal edge has `padding_left` for that.
+///
+/// Public because the caller has to subtract this from the viewport *before*
+/// laying the document out, and then hand the same answer to [`Page::new`].
+/// Deriving it twice from the same two inputs is what keeps the two agreeing.
+pub fn gutter_width(chrome: layout::Chrome, line_count: usize) -> u16 {
+    if !chrome.line_numbers {
+        return 0;
+    }
+    digits(line_count)
+        .saturating_add(SEPARATOR_CELLS)
+        .saturating_add(chrome.gutter_gap)
+}
+
+/// Decimal digits in `line_count`, floored at [`MIN_LINE_NUMBER_DIGITS`].
+///
+/// Counted on the line *count* rather than the largest index painted, so the
+/// gutter is the same width on the first screen as on the last. A gutter that
+/// grew a cell as the reader scrolled past line 99 would shift the entire
+/// document sideways mid-read.
+fn digits(line_count: usize) -> u16 {
+    let mut digits = 1u16;
+    let mut remaining = line_count.max(1);
+    while remaining >= 10 {
+        remaining /= 10;
+        digits = digits.saturating_add(1);
+    }
+    digits.max(MIN_LINE_NUMBER_DIGITS)
+}
+
 /// A cell rectangle a [`crate::media::MediaSink`] paints into.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CellRect {
@@ -171,6 +333,16 @@ struct RowOverlays<'a> {
     /// The inclusive `LineItem` index range of the selected link's run group
     /// on this line, if the selected link paints here at all (DW-6.1).
     selected_items: Option<(usize, usize)>,
+    /// The reading line's background, when this row is the reading line.
+    ///
+    /// The third overlay, and the one that composes differently from the other
+    /// two. A search span replaces a run's *role* and a selection sets an
+    /// attribute on top of it; the band replaces every run's *background*,
+    /// including a code block's own slab. It has to win there — a fence whose
+    /// middle row keeps the slab is a reading line the reader cannot find, and
+    /// a fence whose middle row loses it is still obviously a fence, because
+    /// the syntax colours never moved.
+    band: Option<Color>,
 }
 
 impl RowOverlays<'_> {
@@ -358,10 +530,40 @@ impl Painter {
         overlays: FrameOverlays<'_>,
         out: &mut dyn Write,
     ) -> io::Result<()> {
-        let spans = visible_spans(tree, scroll, size.height, overlays.search);
+        self.frame_page(tree, scroll, size, Page::full(size), status, overlays, out)
+    }
+
+    /// [`Painter::frame_with_overlays`] on a [`Page`] rather than on the whole
+    /// viewport: padding around the document, a line-number gutter beside it,
+    /// and a band under the row the reader is on.
+    ///
+    /// The real implementation, and the only one that reads `page`. Every
+    /// other `frame_*` entry point is this call with [`Page::full`], which is
+    /// what makes "a caller who asks for no furniture gets none" true by
+    /// construction rather than by everyone remembering to pass zeroes.
+    ///
+    /// `size` is still the whole content viewport and not the page: the status
+    /// row is positioned from it, and so is the blanking that keeps stale
+    /// glyphs out of the padding. `page` says which part of it the document
+    /// gets.
+    #[allow(clippy::too_many_arguments)] // Seven, and each is a distinct axis
+    // of one frame: what to paint, where in the document, how big the terminal
+    // is, how much of it the page gets, the status row, the overlays, and the
+    // sink. Bundling any pair would name a thing that is not a thing.
+    pub fn frame_page(
+        &mut self,
+        tree: &LayoutTree,
+        scroll: usize,
+        size: Size,
+        page: Page,
+        status: &StatusLine,
+        overlays: FrameOverlays<'_>,
+        out: &mut dyn Write,
+    ) -> io::Result<()> {
+        let spans = visible_spans(tree, scroll, page.rows, overlays.search);
         out.write_all(SYNC_BEGIN)?;
         let painted = self
-            .frame_body(tree, scroll, size, &spans, overlays.selected, out)
+            .frame_body(tree, scroll, size, page, &spans, overlays.selected, out)
             .and_then(|()| self.paint_status_row(status, size, out));
         let closed = out.write_all(SYNC_END).and_then(|()| out.flush());
         painted.and(closed)
@@ -463,11 +665,13 @@ impl Painter {
     /// The body of [`frame`](Self::frame), between the synchronized-update
     /// begin and end. Split out so every `?` in here is caught by the caller
     /// rather than escaping past the closing sequence.
+    #[allow(clippy::too_many_arguments)] // See `frame_page`.
     fn frame_body(
         &mut self,
         tree: &LayoutTree,
         scroll: usize,
         size: Size,
+        page: Page,
         spans: &BTreeMap<usize, Vec<Span>>,
         selected: &[LinkSpan],
         out: &mut dyn Write,
@@ -476,24 +680,55 @@ impl Painter {
         // reset per-frame state and sweep placements whose node has scrolled
         // out of view entirely (no `paint` fires for those).
         self.media.begin_frame(out);
-        // Columns the *last* viewport row consumed. The build stamp shares
-        // that row with the document, so this is what decides whether there
-        // is room for it (see `paint_build_stamp`).
-        let mut last_row_cols: u16 = 0;
-        for row in 0..size.height {
+        // The band's colour, resolved once per frame rather than per row. It
+        // is one `Decor` lookup either way, but resolving it here is also what
+        // says it cannot vary down the page.
+        let band = self
+            .decor
+            .resolve(StyleId::Semantic(Semantic::CurrentLine))
+            .bg;
+        // Rows of padding above and below the page. Blanked rather than left
+        // alone for the reason the overlay blanks its own tail: whatever was
+        // there last frame is still there until something writes over it, and
+        // after a resize that is a strip of the previous, taller document.
+        for row in 0..page.origin.y.min(size.height) {
             write!(out, "\x1b[{};1H", row + 1)?;
+            out.write_all(CLEAR_TO_EOL)?;
+        }
+        for row in page.origin.y.saturating_add(page.rows)..size.height {
+            write!(out, "\x1b[{};1H", row + 1)?;
+            out.write_all(CLEAR_TO_EOL)?;
+        }
+        // Columns the *last* page row consumed, measured from column 0 of the
+        // terminal rather than from the page. The build stamp shares that row
+        // with the document and is positioned against the viewport's right
+        // edge, so the comparison has to be in the viewport's coordinates
+        // (see `paint_build_stamp`).
+        let mut last_row_cols: u16 = 0;
+        for row in 0..page.rows {
+            let screen_row = page.origin.y.saturating_add(row);
+            if screen_row >= size.height {
+                break;
+            }
+            write!(out, "\x1b[{};1H", screen_row + 1)?;
             let idx = scroll.saturating_add(row as usize);
+            let cursor = page.is_cursor(idx);
+            // Left padding is written as spaces rather than skipped over. A
+            // `CUP` past it would leave whatever the terminal had in those
+            // cells — the previous frame's first characters, after a scroll —
+            // sitting in the margin.
+            self.pad_left(page, out)?;
             if idx < tree.line_count()
                 && let Some(line) = tree.lines(idx..idx + 1).next()
             {
-                if row + 1 == size.height {
+                if row + 1 == page.rows {
                     last_row_cols = match line {
                         // A media box's cells belong to the terminal's
                         // compositor, not to us: nothing here can say whether
                         // the stamp would land above or below the raster. Claim
                         // the whole row so the stamp stands down.
                         Line::Reserved(_) => size.width,
-                        _ => line.width().min(size.width),
+                        _ => page.text_x().saturating_add(line.width()).min(size.width),
                     };
                 }
                 // Both overlays are addressed by *absolute line index*, not
@@ -506,12 +741,188 @@ impl Painter {
                         .iter()
                         .find(|span| span.line == idx)
                         .map(|span| (span.first_item, span.last_item)),
+                    band: cursor.then_some(band).flatten(),
                 };
-                self.paint_line(line, row, size, overlays, out)?;
+                self.paint_gutter(page, Some(idx), overlays.band, out)?;
+                self.paint_line(line, screen_row, page, overlays, out)?;
+                self.pad_band(page, line.width(), overlays.band, out)?;
+            } else {
+                // Past the end of the document. The gutter still paints — as
+                // blanks, not as a number — because the reading line can be
+                // the last row of a document shorter than the viewport, and a
+                // band that stopped at the text would end mid-page.
+                let band = cursor.then_some(band).flatten();
+                self.paint_gutter(page, None, band, out)?;
+                self.pad_band(page, 0, band, out)?;
+            }
+            // Before the erase, and only when this row wrote chrome: `\x1b[K`
+            // fills with the current background on any terminal with BCE, so
+            // an unreset band would run to the right edge of the screen and
+            // undo the whole point of `Page::band_width`. A row that painted
+            // no chrome has already been closed by `paint_items`, and adding a
+            // second reset here would put a redundant `\x1b[0m` on every row
+            // of every frame — including the frames of a reader who never
+            // turned any of this on.
+            if page.gutter > 0 || page.origin.x > 0 || page.is_cursor(idx) {
+                out.write_all(SGR_RESET)?;
             }
             out.write_all(CLEAR_TO_EOL)?;
         }
-        self.paint_build_stamp(size, last_row_cols, out)
+        self.paint_build_stamp(size, page, last_row_cols, out)
+    }
+
+    /// Writes the page's left padding as spaces at the current cursor.
+    ///
+    /// No SGR: these cells are outside the band and outside every run, so they
+    /// carry the terminal's own background, which is the definition of desk.
+    fn pad_left(&mut self, page: Page, out: &mut dyn Write) -> io::Result<()> {
+        if page.origin.x == 0 {
+            return Ok(());
+        }
+        out.write_all(SGR_RESET)?;
+        write_spaces(page.origin.x, out)
+    }
+
+    /// Fills the band from where the document's text stopped to the page's
+    /// right edge.
+    ///
+    /// Only ever writes on the reading line — off it there is no band, and a
+    /// row of spaces would be indistinguishable from one except in the bytes,
+    /// where it would be a hundred cells of nothing per frame.
+    fn pad_band(
+        &mut self,
+        page: Page,
+        text_width: u16,
+        band: Option<Color>,
+        out: &mut dyn Write,
+    ) -> io::Result<()> {
+        let Some(band) = band else { return Ok(()) };
+        let painted = page.gutter.saturating_add(text_width.min(page.content));
+        let Some(remaining) = page.band_width().checked_sub(painted).filter(|n| *n > 0) else {
+            return Ok(());
+        };
+        write_sgr(
+            out,
+            &Style {
+                bg: Some(band),
+                ..Style::default()
+            },
+        )?;
+        write_spaces(remaining, out)
+    }
+
+    /// Paints the gutter for one page row: the number, right-aligned, then the
+    /// separator and the gap.
+    ///
+    /// `index` is the tree line this row shows, or `None` past the end of the
+    /// document — where the gutter still occupies its cells so the band keeps
+    /// its shape, but numbers nothing, because there is no row there to number.
+    ///
+    /// The number's *role* is what carries the reading line, not just the
+    /// band: on a row whose content cells are under a kitty raster the band is
+    /// invisible, and the separator and digits are the only cells left that
+    /// can say the reader is here.
+    fn paint_gutter(
+        &mut self,
+        page: Page,
+        index: Option<usize>,
+        band: Option<Color>,
+        out: &mut dyn Write,
+    ) -> io::Result<()> {
+        if page.gutter == 0 {
+            return Ok(());
+        }
+        if !page.line_numbers {
+            // A gutter with no numbers is still cells the band must cover.
+            return self.paint_blank_gutter(page, band, out);
+        }
+        // Whatever the gutter has left once the digits and the separator are
+        // taken out. Derived rather than carried, so it cannot disagree with
+        // the width the document was laid out against.
+        let gap = page
+            .gutter
+            .saturating_sub(page.digits)
+            .saturating_sub(SEPARATOR_CELLS);
+        let width = usize::from(page.digits);
+        let label = match index {
+            // 1-based: the first rendered row is line 1, because a reader
+            // counting rows starts at one and `g` goes to the top.
+            Some(index) => format!("{:>width$}", index.saturating_add(1)),
+            None => " ".repeat(width),
+        };
+        let current = index.is_some_and(|index| page.is_cursor(index));
+        let number_role = if current {
+            Semantic::LineNumberCurrent
+        } else {
+            Semantic::LineNumber
+        };
+        // Clipped to the digit column. `digits` is derived from the same line
+        // count this number comes from, so it fits by construction — the clip
+        // is what makes that a fact rather than an argument, and it is the
+        // difference between an off-by-one in the derivation costing a
+        // truncated number and costing every glyph on the row its column.
+        let (label, _) = clip_to_width(&label, &self.width_engine, page.digits);
+        self.paint_chrome(number_role, &label, band, out)?;
+        // The separator takes the reading line's colour too. It is one cell
+        // and it is the cell nearest the text, so on a narrow gutter it does
+        // more work than the digits.
+        let separator_role = if current {
+            Semantic::LineNumberCurrent
+        } else {
+            Semantic::GutterBorder
+        };
+        self.paint_chrome(separator_role, " ", band, out)?;
+        self.paint_chrome(separator_role, GUTTER_SEPARATOR, band, out)?;
+        if gap > 0 {
+            self.paint_chrome(
+                Semantic::LineNumber,
+                &" ".repeat(usize::from(gap)),
+                band,
+                out,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The gutter's cells with nothing in them, so a band still spans the page
+    /// when a theme asked for the reading line but not the numbers.
+    fn paint_blank_gutter(
+        &mut self,
+        page: Page,
+        band: Option<Color>,
+        out: &mut dyn Write,
+    ) -> io::Result<()> {
+        self.paint_chrome(
+            Semantic::LineNumber,
+            &" ".repeat(usize::from(page.gutter)),
+            band,
+            out,
+        )
+    }
+
+    /// One run of gutter text in `role`'s style, with the band's background
+    /// underneath it when the reader is on this row.
+    ///
+    /// Chrome goes out through the same [`Decor`] seam and the same
+    /// [`write_sgr`] the document does, rather than through hardcoded escapes,
+    /// so `NO_COLOR` strips the gutter exactly as it strips everything else
+    /// and a theme reaches it exactly as it reaches a table border.
+    fn paint_chrome(
+        &mut self,
+        role: Semantic,
+        text: &str,
+        band: Option<Color>,
+        out: &mut dyn Write,
+    ) -> io::Result<()> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        let mut style = self.decor.resolve(StyleId::Semantic(role));
+        if let Some(band) = band {
+            style.bg = Some(band);
+        }
+        write_sgr(out, &style)?;
+        out.write_all(text.as_bytes())
     }
 
     /// Paints the build's commit sha dim in the bottom-right corner.
@@ -535,6 +946,7 @@ impl Painter {
     fn paint_build_stamp(
         &mut self,
         size: Size,
+        page: Page,
         last_row_cols: u16,
         out: &mut dyn Write,
     ) -> io::Result<()> {
@@ -553,27 +965,43 @@ impl Painter {
         if size.width.saturating_sub(last_row_cols) <= width {
             return Ok(());
         }
-        write!(out, "\x1b[{};{}H", size.height, size.width - width + 1)?;
+        // The stamp's row is the last row of the *page*, not of the viewport.
+        // With bottom padding those differ, and the stamp belongs on the row
+        // whose free space `last_row_cols` measured — put it below that and it
+        // would land in the margin, next to nothing, having been suppressed or
+        // not by a collision test for a different row.
+        let stamp_row = u32::from(page.origin.y)
+            .saturating_add(u32::from(page.rows))
+            .min(u32::from(size.height))
+            .max(1);
+        write!(out, "\x1b[{};{}H", stamp_row, size.width - width + 1)?;
         write!(out, "\x1b[2m")?;
         out.write_all(stamp.as_bytes())?;
         out.write_all(SGR_RESET)?;
         Ok(())
     }
 
+    /// `row` is the **screen** row, already offset by the page's top padding —
+    /// media placements are addressed in the terminal's coordinates, not the
+    /// page's, so a rect built from a page-relative row would put every image
+    /// `padding_top` rows too high.
     fn paint_line(
         &mut self,
         line: &Line,
         row: u16,
-        size: Size,
+        page: Page,
         overlays: RowOverlays<'_>,
         out: &mut dyn Write,
     ) -> io::Result<()> {
         match line {
-            Line::Items(items) => self.paint_items(items, row, size.width, overlays, out),
+            Line::Items(items) => self.paint_items(items, row, page, overlays, out),
             // A reserved media row carries no text runs: no searchable text
             // (see `app::append_line_text`) and no link runs, so neither
-            // overlay can address it.
-            Line::Reserved(line) => self.paint_reserved(line, row, size, out),
+            // overlay can address it. The band is the exception and reaches it
+            // anyway — a reserved row is a row the reader can be standing on,
+            // and the gutter beside it has already been painted in the band's
+            // colour by the time this runs.
+            Line::Reserved(line) => self.paint_reserved(line, row, page, overlays.band, out),
         }
     }
 
@@ -594,18 +1022,19 @@ impl Painter {
         &mut self,
         line: &ReservedLine,
         row: u16,
-        size: Size,
+        page: Page,
+        band: Option<Color>,
         out: &mut dyn Write,
     ) -> io::Result<()> {
         let reserved = &line.boxed;
         let mut painted_any = false;
         let mut col: u16 = 0;
         for run in &line.prefix {
-            let remaining = size.width.saturating_sub(col);
+            let remaining = page.content.saturating_sub(col);
             if remaining == 0 {
                 break;
             }
-            let painted = self.paint_run(run, remaining, 0, &[], false, out)?;
+            let painted = self.paint_run(run, remaining, 0, &[], false, band, out)?;
             col = col.saturating_add(painted.width);
             painted_any |= painted.wrote_text;
             if painted.line_full {
@@ -620,19 +1049,32 @@ impl Painter {
         // not painted across it. `x` comes from the laid-out prefix width
         // rather than from what actually got painted, so the box lands in the
         // same column whether or not a narrow viewport clipped the gutter.
-        let x = line.prefix_width();
-        if x >= size.width {
+        //
+        // Offset by the page: layout measured the prefix against the content
+        // column, and the sink positions in the terminal's own coordinates. A
+        // rect that skipped this puts the raster over the gutter, which is the
+        // one place on the row a raster must never land — the gutter is what
+        // marks the reading line where the band cannot reach.
+        let x = page.text_x().saturating_add(line.prefix_width());
+        if line.prefix_width() >= page.content {
             // The whole box is off the right edge of this (narrower than
-            // laid-out) viewport. Painting nothing beats placing at column 0.
+            // laid-out) page. Painting nothing beats placing at column 0.
             return Ok(());
         }
         let rows_left = reserved.rows.saturating_sub(reserved.row);
-        let rows_to_viewport_bottom = size.height.saturating_sub(row);
+        let rows_to_page_bottom = page
+            .origin
+            .y
+            .saturating_add(page.rows)
+            .saturating_sub(row)
+            .max(1);
         let rect = CellRect {
             x,
             y: row,
-            width: reserved.cols.min(size.width - x),
-            height: rows_left.min(rows_to_viewport_bottom).max(1),
+            width: reserved
+                .cols
+                .min(page.content.saturating_sub(line.prefix_width())),
+            height: rows_left.min(rows_to_page_bottom).max(1),
         };
         self.media.paint(reserved, rect, out);
         Ok(())
@@ -649,7 +1091,7 @@ impl Painter {
         &mut self,
         items: &[LineItem],
         row: u16,
-        width: u16,
+        page: Page,
         overlays: RowOverlays<'_>,
         out: &mut dyn Write,
     ) -> io::Result<()> {
@@ -657,15 +1099,22 @@ impl Painter {
         let mut byte = 0usize;
         let mut painted_any = false;
         for (index, item) in items.iter().enumerate() {
-            let remaining = width.saturating_sub(col);
+            let remaining = page.content.saturating_sub(col);
             if remaining == 0 {
                 break;
             }
             let reverse = overlays.selects(index);
             match item {
                 LineItem::Run(run) => {
-                    let painted =
-                        self.paint_run(run, remaining, byte, overlays.spans, reverse, out)?;
+                    let painted = self.paint_run(
+                        run,
+                        remaining,
+                        byte,
+                        overlays.spans,
+                        reverse,
+                        overlays.band,
+                        out,
+                    )?;
                     byte += run.text.len();
                     col = col.saturating_add(painted.width);
                     painted_any |= painted.wrote_text;
@@ -675,13 +1124,21 @@ impl Painter {
                 }
                 LineItem::Box(reserved) => {
                     let cols = reserved.cols.min(remaining);
-                    self.paint_inline_box(reserved, col, row, cols, out)?;
+                    // Offset into the terminal's coordinates for the same
+                    // reason `paint_reserved` is: the sink places by absolute
+                    // cell, and `col` counts from the page's own left edge.
+                    let x = page.text_x().saturating_add(col);
+                    self.paint_inline_box(reserved, x, row, cols, out)?;
                     col = col.saturating_add(cols);
                     painted_any = true;
                 }
             }
         }
-        if painted_any {
+        // The band leaves the SGR state carrying a background, and the caller
+        // fills the rest of the page with it — so the reset that used to close
+        // every line now happens there instead, once, after the fill. Off the
+        // reading line nothing changed.
+        if painted_any && overlays.band.is_none() {
             out.write_all(SGR_RESET)?;
         }
         Ok(())
@@ -702,6 +1159,13 @@ impl Painter {
     /// as a match, and still reads as selected. It has to come after
     /// `write_sgr` because that opens with an unconditional reset, which
     /// would wipe a reverse attribute set ahead of it.
+    ///
+    /// `band` is the third overlay and the one that replaces rather than
+    /// composes: on the reading line every run's background becomes the band's,
+    /// whatever the run's own role said. See [`RowOverlays::band`].
+    #[allow(clippy::too_many_arguments)] // Six of these are the run and the
+    // three overlays that can restyle it; splitting them would name a bundle
+    // that exists only to shorten this list.
     fn paint_run(
         &mut self,
         run: &Run,
@@ -709,9 +1173,10 @@ impl Painter {
         base: usize,
         spans: &[Span],
         reverse: bool,
+        band: Option<Color>,
         out: &mut dyn Write,
     ) -> io::Result<PaintedRun> {
-        if let Some(painted) = self.paint_slab_pad(run, remaining, reverse, out)? {
+        if let Some(painted) = self.paint_slab_pad(run, remaining, reverse, band, out)? {
             return Ok(painted);
         }
         let expanded = self.expand(run);
@@ -758,7 +1223,10 @@ impl Painter {
             if let Some(seq) = &link_open {
                 out.write_all(seq.as_bytes())?;
             }
-            let style = self.decor.resolve(expanded_run.style_id);
+            let mut style = self.decor.resolve(expanded_run.style_id);
+            if let Some(band) = band {
+                style.bg = Some(band);
+            }
             write_sgr(out, &style)?;
             if reverse {
                 out.write_all(SGR_REVERSE)?;
@@ -801,6 +1269,7 @@ impl Painter {
         run: &Run,
         remaining: u16,
         reverse: bool,
+        band: Option<Color>,
         out: &mut dyn Write,
     ) -> io::Result<Option<PaintedRun>> {
         const SPACES: &[u8; 256] = &[b' '; 256];
@@ -812,7 +1281,13 @@ impl Painter {
         }
         let want = run.text.len();
         let cells = want.min(usize::from(remaining));
-        let style = self.decor.resolve(run.style_id);
+        let mut style = self.decor.resolve(run.style_id);
+        // The reading line takes the slab's own pad too — this run *is* the
+        // code block's background, and leaving it behind would put a notch of
+        // slab colour in the middle of the band.
+        if let Some(band) = band {
+            style.bg = Some(band);
+        }
         write_sgr(out, &style)?;
         if reverse {
             out.write_all(SGR_REVERSE)?;
@@ -1160,6 +1635,22 @@ pub(crate) fn item_columns(
 /// rest of a cached frame's paint cost put together, and the largest single
 /// item left once the highlight cache removed the tree-sitter parse
 /// (DW-4.7). The bytes are assembled straight into `out` instead.
+/// Writes `count` spaces at the current cursor in the current SGR state.
+///
+/// Chunked against a fixed buffer rather than allocating a `String`, for the
+/// reason `paint_slab_pad` does the same: this runs once per padded row of
+/// every frame, and a frame is a repaint of the whole viewport.
+fn write_spaces(count: u16, out: &mut dyn Write) -> io::Result<()> {
+    const SPACES: &[u8; 256] = &[b' '; 256];
+    let mut left = usize::from(count);
+    while left > 0 {
+        let chunk = left.min(SPACES.len());
+        out.write_all(&SPACES[..chunk])?;
+        left -= chunk;
+    }
+    Ok(())
+}
+
 fn write_sgr(out: &mut dyn Write, style: &Style) -> io::Result<()> {
     out.write_all(SGR_RESET)?;
     // The reset alone *is* the plain style, and plain is the common case

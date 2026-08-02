@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::{env, fmt, fs, io};
 
 use highlight::{ColorMode, Theme, ThemeError, ThemeFile, Variant};
+use layout::Chrome;
 
 /// Where a theme lives when the user has not named one.
 const CONFIG_RELATIVE_PATH: &str = "stele/theme.toml";
@@ -183,6 +184,22 @@ impl ThemeSource {
     /// Whether a user theme's colours are currently applied.
     pub fn user_active(&self) -> bool {
         self.user_active && self.file.is_some()
+    }
+
+    /// The furniture the loaded theme asked for, or the default when there is
+    /// no theme file.
+    ///
+    /// Read from the file whether or not [`user_active`](Self::user_active) is
+    /// set, which is the one place geometry deliberately parts company with
+    /// colour. `T` swaps a palette; it is a lighting change, and a reader who
+    /// hits it because the room got bright is not asking for their gutter to
+    /// disappear and every line on the page to move two cells left. The
+    /// colours the gutter is painted *in* still follow `T` like everything
+    /// else, because those are colours.
+    pub fn chrome(&self) -> Chrome {
+        self.file
+            .as_ref()
+            .map_or_else(Chrome::default, |f| f.chrome)
     }
 
     /// Problems to surface, worst-first is not meaningful here so they stay

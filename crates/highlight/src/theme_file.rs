@@ -36,6 +36,8 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
+use layout::{Chrome, Padding};
+
 use crate::color::Color;
 use crate::hazard::strip_display_hazards;
 use crate::role;
@@ -61,6 +63,15 @@ pub struct ThemeFile {
     pub appearance: Variant,
     /// The colours the file actually set.
     pub overrides: ThemeOverrides,
+    /// The `[layout]` table: padding, gutter, reading line. Geometry rather
+    /// than colour, and the one part of a theme file that is not a palette.
+    ///
+    /// It is here because it is the same kind of promise the colours are — you
+    /// send someone a file and their page looks like yours — and because the
+    /// alternative, a second config file for four integers, is a second thing
+    /// to find, name and document. Every key is optional; the default is the
+    /// frame stele drew before any of this existed.
+    pub chrome: Chrome,
 }
 
 /// The one way parsing fails outright: nothing could be salvaged.
@@ -125,6 +136,34 @@ pub enum ThemeWarning {
         first: &'static str,
         second: &'static str,
     },
+    /// A `[layout]` key whose value is a number outside the range it may take.
+    /// Clamped to the nearest end and honoured — the author asked for "a lot
+    /// of padding", and the largest amount available is a better reading of
+    /// that than none.
+    OutOfRange {
+        key: String,
+        value: i64,
+        min: i64,
+        max: i64,
+    },
+    /// A key under `[layout]` that names no setting.
+    UnknownSetting {
+        name: String,
+        suggestion: Option<&'static str>,
+    },
+    /// Text that would be unreadable on the band under the reading line.
+    ///
+    /// Its own role clears AA against the *page*, which is the check every
+    /// other colour gets and which says nothing about the one row where the
+    /// ground moves. A theme whose `current_line_bg` lands on top of its
+    /// `text` produces exactly one illegible row, wherever the reader is
+    /// standing — the hardest kind of contrast fault to attribute, because it
+    /// follows you.
+    LowContrastOnCurrentLine {
+        role: &'static str,
+        ratio: f64,
+        floor: f64,
+    },
     /// A `[syntax]` table that names some captures and not others.
     ///
     /// Not an error, and the distinction matters: naming one capture hands the
@@ -176,6 +215,31 @@ impl fmt::Display for ThemeWarning {
             ThemeWarning::Downsample256Collision { first, second } => write!(
                 f,
                 "`{first}` and `{second}` are identical in a 256-colour terminal"
+            ),
+            ThemeWarning::OutOfRange {
+                key,
+                value,
+                min,
+                max,
+            } => write!(
+                f,
+                "`{}` is {value} — clamped to {min}..={max}",
+                strip_display_hazards(key)
+            ),
+            ThemeWarning::UnknownSetting { name, suggestion } => {
+                write!(
+                    f,
+                    "unknown `[layout]` key `{}`",
+                    strip_display_hazards(name)
+                )?;
+                match suggestion {
+                    Some(close) => write!(f, " — did you mean `{close}`?"),
+                    None => Ok(()),
+                }
+            }
+            ThemeWarning::LowContrastOnCurrentLine { role, ratio, floor } => write!(
+                f,
+                "`{role}` is {ratio:.1}:1 against `current_line_bg` — under WCAG AA's {floor}:1"
             ),
             ThemeWarning::IncompleteSyntax {
                 named,
@@ -281,11 +345,14 @@ impl ThemeFile {
             });
         }
 
+        let chrome = chrome_table(&table, &mut warnings);
+
         Ok((
             ThemeFile {
                 name,
                 appearance,
                 overrides,
+                chrome,
             },
             warnings,
         ))
@@ -362,7 +429,55 @@ impl ThemeFile {
             }
         }
 
+        warnings.extend(self.lint_current_line(&named));
         warnings.extend(self.lint_syntax());
+        warnings
+    }
+
+    /// Contrast against the band under the reading line, for the roles that
+    /// can end up standing on it.
+    ///
+    /// A second pass rather than a wider first one, because it asks a
+    /// different question. The main check asks "is this colour legible on the
+    /// page"; this asks "is it still legible on the one row whose ground
+    /// moves". A theme can pass the first and fail this — `text` at 8:1
+    /// against the page and 1.9:1 against a band the author picked to be
+    /// bold — and the failure is the nastiest kind to report from a bug
+    /// report, because the illegible row is wherever the reader happens to be
+    /// standing and moves when they move.
+    ///
+    /// Only runs when the theme names `current_line_bg`. The built-in wash is
+    /// within 1.34:1 of the reference background by construction, so measuring
+    /// against it instead of the page would differ by less than the rounding
+    /// in the message and would fire on themes that set no band at all.
+    ///
+    /// Every role is measured, not just `text`: the reading line can land on a
+    /// heading, a table border or a footnote label just as easily, and a band
+    /// that eats exactly one of them is a band that looks broken once a
+    /// document happens to put that role under the cursor.
+    fn lint_current_line(
+        &self,
+        named: &[(&'static str, layout::Semantic, Color)],
+    ) -> Vec<ThemeWarning> {
+        let Some(band) = self.overrides.background(layout::Semantic::CurrentLine) else {
+            return Vec::new();
+        };
+        let mut warnings = Vec::new();
+        for (name, semantic, color) in named {
+            let floor = if is_structural(*semantic) {
+                AA_NON_TEXT
+            } else {
+                AA_NORMAL_TEXT
+            };
+            let ratio = contrast_ratio(*color, band);
+            if ratio < floor {
+                warnings.push(ThemeWarning::LowContrastOnCurrentLine {
+                    role: name,
+                    ratio,
+                    floor,
+                });
+            }
+        }
         warnings
     }
 
@@ -557,6 +672,126 @@ fn color_table<R>(
         }
     }
     resolved
+}
+
+/// Every key a theme file's `[layout]` table may set, in the order
+/// `docs/theming.md` lists them. Public surface, like [`THEMEABLE_ROLES`].
+pub const LAYOUT_SETTINGS: &[&str] = &[
+    "padding_left",
+    "padding_right",
+    "padding_top",
+    "padding_bottom",
+    "line_numbers",
+    "gutter_gap",
+    "current_line",
+    "scrolloff",
+];
+
+/// The widest padding a theme may ask for on one side.
+///
+/// Not a guess about taste — the clamp exists because this file is untrusted,
+/// and a `padding_left = 60000` is a `u16` away from arithmetic nobody
+/// reviewed. Sixty-four cells is past any real margin and short of anything
+/// that can overflow. It is not the *effective* limit in a narrow terminal:
+/// [`Chrome::fit`] drops the whole chrome long before this.
+const MAX_PADDING: i64 = 64;
+/// The widest gap between the gutter and the page. Past a handful of cells the
+/// numbers stop reading as a gutter and start reading as a second column.
+const MAX_GUTTER_GAP: i64 = 8;
+/// The most rows a reader may keep between the reading line and the edge.
+/// Larger values are silently equivalent to "keep it centred", which
+/// `scrolloff` reaching half the viewport already achieves.
+const MAX_SCROLLOFF: i64 = 32;
+
+/// Reads the `[layout]` table, defaulting every key it does not find.
+///
+/// The same never-fatal policy the colour tables follow, for the same reason:
+/// a theme is a file people share, and one bad value should cost that value
+/// and nothing else. A padding out of range is clamped rather than dropped —
+/// somebody who wrote `padding_left = 200` wants a wide margin, and the widest
+/// available is a better reading of that than none at all.
+fn chrome_table(table: &toml::Table, warnings: &mut Vec<ThemeWarning>) -> Chrome {
+    let mut chrome = Chrome::default();
+    let entries = match table.get("layout") {
+        Some(toml::Value::Table(entries)) => entries,
+        Some(_) => {
+            warnings.push(ThemeWarning::WrongType {
+                key: "layout".to_string(),
+                expected: "a table",
+            });
+            return chrome;
+        }
+        None => return chrome,
+    };
+
+    let mut padding = Padding::default();
+    for (key, value) in entries {
+        match key.as_str() {
+            "padding_left" => padding.left = cells(key, value, MAX_PADDING, warnings, 0),
+            "padding_right" => padding.right = cells(key, value, MAX_PADDING, warnings, 0),
+            "padding_top" => padding.top = cells(key, value, MAX_PADDING, warnings, 0),
+            "padding_bottom" => padding.bottom = cells(key, value, MAX_PADDING, warnings, 0),
+            "gutter_gap" => {
+                chrome.gutter_gap = cells(key, value, MAX_GUTTER_GAP, warnings, chrome.gutter_gap)
+            }
+            "scrolloff" => {
+                chrome.scrolloff = cells(key, value, MAX_SCROLLOFF, warnings, chrome.scrolloff)
+            }
+            "line_numbers" => chrome.line_numbers = flag(key, value, warnings, chrome.line_numbers),
+            "current_line" => chrome.current_line = flag(key, value, warnings, chrome.current_line),
+            _ => warnings.push(ThemeWarning::UnknownSetting {
+                name: key.clone(),
+                suggestion: closest(key, LAYOUT_SETTINGS),
+            }),
+        }
+    }
+    chrome.padding = padding;
+    chrome
+}
+
+/// One `[layout]` integer, clamped to `0..=max`. `fallback` on a wrong type,
+/// so a `padding_left = "2"` costs that key and leaves the rest of the table
+/// standing.
+fn cells(
+    key: &str,
+    value: &toml::Value,
+    max: i64,
+    warnings: &mut Vec<ThemeWarning>,
+    fallback: u16,
+) -> u16 {
+    let Some(raw) = value.as_integer() else {
+        warnings.push(ThemeWarning::WrongType {
+            key: key.to_string(),
+            expected: "a whole number of cells",
+        });
+        return fallback;
+    };
+    if raw < 0 || raw > max {
+        warnings.push(ThemeWarning::OutOfRange {
+            key: key.to_string(),
+            value: raw,
+            min: 0,
+            max,
+        });
+    }
+    // Safe by the clamp: `max` is well under `u16::MAX` at every call site.
+    raw.clamp(0, max) as u16
+}
+
+/// One `[layout]` boolean. TOML has a real boolean type, so `"true"` is a
+/// wrong type rather than a truthy string — a theme that meant `true` and
+/// quoted it should hear about it once instead of behaving unpredictably.
+fn flag(key: &str, value: &toml::Value, warnings: &mut Vec<ThemeWarning>, fallback: bool) -> bool {
+    match value.as_bool() {
+        Some(on) => on,
+        None => {
+            warnings.push(ThemeWarning::WrongType {
+                key: key.to_string(),
+                expected: "true or false",
+            });
+            fallback
+        }
+    }
 }
 
 /// The closest name in `candidates` to `name`, when one is close enough to be
@@ -1102,5 +1337,178 @@ text = "\u001B[5m#fff"
                 "theme_file.rs reaches for {forbidden} — crates/stele owns finding the file"
             );
         }
+    }
+
+    // ---- [layout] ---------------------------------------------------------
+
+    /// A file with no `[layout]` table is a complete theme, and the frame it
+    /// gets is the one stele drew before the table existed.
+    #[test]
+    fn test_a_theme_with_no_layout_table_keeps_the_default_frame() {
+        let (theme, warnings) =
+            ThemeFile::parse("appearance = \"dark\"\n[colors]\ntext = \"#c8d0e0\"\n")
+                .expect("parses");
+        assert_eq!(theme.chrome, Chrome::default());
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn test_every_layout_key_round_trips_into_the_chrome() {
+        let (theme, warnings) = ThemeFile::parse(
+            "appearance = \"dark\"\n\
+             [layout]\n\
+             padding_left = 3\n\
+             padding_right = 4\n\
+             padding_top = 1\n\
+             padding_bottom = 2\n\
+             line_numbers = true\n\
+             gutter_gap = 2\n\
+             current_line = false\n\
+             scrolloff = 5\n",
+        )
+        .expect("parses");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(
+            theme.chrome,
+            Chrome {
+                padding: Padding {
+                    left: 3,
+                    right: 4,
+                    top: 1,
+                    bottom: 2,
+                },
+                line_numbers: true,
+                gutter_gap: 2,
+                current_line: false,
+                scrolloff: 5,
+            }
+        );
+    }
+
+    /// Out of range is clamped and reported, not dropped.
+    ///
+    /// Somebody who wrote `padding_left = 200` wants a wide margin, and the
+    /// widest available is a better reading of that than none at all — the
+    /// same never-fatal policy a bad hex gets.
+    #[test]
+    fn test_an_out_of_range_padding_is_clamped_and_says_so() {
+        let (theme, warnings) =
+            ThemeFile::parse("appearance = \"dark\"\n[layout]\npadding_left = 200\n")
+                .expect("parses");
+        assert_eq!(theme.chrome.padding.left, 64);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| matches!(w, ThemeWarning::OutOfRange { key, value, .. }
+                    if key == "padding_left" && *value == 200)),
+            "{warnings:?}"
+        );
+    }
+
+    /// A negative value takes the same path. TOML has signed integers and a
+    /// `u16` does not, so this is the one clamp that would otherwise be a
+    /// conversion panic rather than a bad setting.
+    #[test]
+    fn test_a_negative_padding_clamps_to_zero_rather_than_wrapping() {
+        let (theme, warnings) =
+            ThemeFile::parse("appearance = \"dark\"\n[layout]\npadding_top = -8\n")
+                .expect("parses");
+        assert_eq!(theme.chrome.padding.top, 0);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| matches!(w, ThemeWarning::OutOfRange { .. })),
+            "{warnings:?}"
+        );
+    }
+
+    /// One bad key costs that key and nothing else, and the near miss is named
+    /// — a typo in a theme file is silent by nature, so the suggestion is most
+    /// of the fix.
+    #[test]
+    fn test_an_unknown_layout_key_is_reported_with_its_near_miss() {
+        let (theme, warnings) = ThemeFile::parse(
+            "appearance = \"dark\"\n[layout]\npadding_lft = 3\nline_numbers = true\n",
+        )
+        .expect("parses");
+        assert!(
+            theme.chrome.line_numbers,
+            "the rest of the table must still apply"
+        );
+        assert!(
+            warnings.iter().any(|w| matches!(
+                w,
+                ThemeWarning::UnknownSetting { name, suggestion: Some("padding_left") }
+                    if name == "padding_lft"
+            )),
+            "{warnings:?}"
+        );
+    }
+
+    /// TOML has a real boolean type, so a quoted one is a wrong type rather
+    /// than a truthy string: the author should hear about it once instead of
+    /// getting behaviour they cannot predict.
+    #[test]
+    fn test_a_quoted_boolean_is_a_wrong_type_and_leaves_the_default() {
+        let (theme, warnings) =
+            ThemeFile::parse("appearance = \"dark\"\n[layout]\nline_numbers = \"true\"\n")
+                .expect("parses");
+        assert!(!theme.chrome.line_numbers);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| matches!(w, ThemeWarning::WrongType { key, .. } if key == "line_numbers")),
+            "{warnings:?}"
+        );
+    }
+
+    /// A band the reader's own prose disappears into.
+    ///
+    /// `text` clears AA against the page here and fails against the band, which
+    /// is exactly the fault the ordinary contrast pass cannot see: it produces
+    /// one illegible row, wherever the reader is standing, and it follows them.
+    #[test]
+    fn test_a_band_that_swallows_the_body_text_is_reported() {
+        let (theme, _) = ThemeFile::parse(
+            "appearance = \"dark\"\n\
+             [colors]\n\
+             text = \"#c8d0e0\"\n\
+             current_line_bg = \"#c0c8d8\"\n",
+        )
+        .expect("parses");
+        let warnings = theme.lint();
+        assert!(
+            warnings.iter().any(|w| matches!(
+                w,
+                ThemeWarning::LowContrastOnCurrentLine { role: "text", .. }
+            )),
+            "a `current_line_bg` that eats `text` must be reported: {warnings:?}"
+        );
+        // And the page-relative check still passes, which is why the second
+        // pass has to exist at all.
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| matches!(w, ThemeWarning::LowContrast { role: "text", .. })),
+            "`text` is perfectly legible on the page — that is the point"
+        );
+    }
+
+    /// No band named, no second pass. The built-in wash is within 1.34:1 of
+    /// the reference background, so measuring against it would differ by less
+    /// than the rounding in the message and would fire on themes that set no
+    /// band at all.
+    #[test]
+    fn test_a_theme_that_names_no_band_gets_no_band_warnings() {
+        let (theme, _) = ThemeFile::parse("appearance = \"dark\"\n[colors]\ntext = \"#c8d0e0\"\n")
+            .expect("parses");
+        assert!(
+            !theme
+                .lint()
+                .iter()
+                .any(|w| matches!(w, ThemeWarning::LowContrastOnCurrentLine { .. })),
+            "{:?}",
+            theme.lint()
+        );
     }
 }

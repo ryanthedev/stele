@@ -236,7 +236,20 @@ fn fg_before(wire: &str, needle: &str) -> String {
         .unwrap_or_else(|| panic!("no truecolor fg SGR before {needle:?}: {wire:?}"));
     let rest = &prefix[start..];
     let end = rest.find('m').unwrap_or(rest.len());
-    rest[..end].to_string()
+    // Truncated at the *foreground*, dropping any background that follows it
+    // in the same SGR. The background under a heading is not theme-only: it is
+    // the H1 wash most of the time and the reading line's band when the reader
+    // is standing on it, and a search moves the reading line onto its match.
+    // Including it would make this test fail for the search working correctly,
+    // which is the opposite of what it is for.
+    let fg = &rest[..end];
+    match fg
+        .find(';')
+        .map(|_| fg.split(';').take(5).collect::<Vec<_>>())
+    {
+        Some(parts) if parts.len() == 5 => parts.join(";"),
+        _ => fg.to_string(),
+    }
 }
 
 /// Every printable key typed into a query must reach the query — including

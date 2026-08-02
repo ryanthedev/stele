@@ -10,12 +10,12 @@ use std::ops::Range;
 use ast::{BlockKind, Document, NodeId, NodeRef};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use layout::{
-    FoldState, IntrinsicSizer, LayoutConfig, LayoutTree, Line, LineItem, Outline, Run, Semantic,
-    StyleId, layout, layout_with_folds,
+    Chrome, FoldState, IntrinsicSizer, LayoutConfig, LayoutTree, Line, LineItem, Outline, Run,
+    Semantic, StyleId, layout, layout_with_folds,
 };
 use width::WidthEngine;
 
-use crate::painter::{SearchOverlay, Size, item_columns};
+use crate::painter::{self, Page, SearchOverlay, Size, item_columns};
 
 /// Mixed into [`AppState::fingerprint`] between lines so two blocks whose runs
 /// concatenate to the same bytes but break differently cannot hash alike.
@@ -404,6 +404,12 @@ pub enum ChromeAction {
     ExpandAllFolds,
     /// `M` — collapse every heading's section (DW-5.4).
     CollapseAllFolds,
+    /// `#` — show or hide the line-number gutter.
+    ///
+    /// A chrome action rather than an ordinary key because the gutter takes
+    /// cells the document was laid out into: turning it on rewraps the page,
+    /// exactly as `-` does, and that needs the `ctx` only the event loop has.
+    ToggleLineNumbers,
 }
 
 /// What the status row says when `Tab` has nothing to select, or when a
@@ -424,7 +430,29 @@ const WHEEL_LINES: isize = 3;
 pub struct AppState {
     tree: LayoutTree,
     scroll: usize,
+    /// **The reading line**: an absolute index into [`AppState::tree`], not a
+    /// viewport row.
+    ///
+    /// A pager has no cursor, so before anything could be highlighted one had
+    /// to be invented. This is it — the line every motion actually addresses,
+    /// with the viewport following it rather than the other way round. The
+    /// change of model is real and worth stating: `j` used to scroll and now
+    /// moves the reader, and a document taller than the screen does not budge
+    /// until the reading line reaches the bottom of it.
+    ///
+    /// It exists whether or not it is painted (`current_line = false` in a
+    /// theme hides the band and changes no motion), because a key that means
+    /// different things depending on a display setting is worse than either
+    /// meaning. Absolute rather than a viewport row so scrolling cannot slide
+    /// it onto different text, which is the same rule the search and
+    /// link-selection overlays follow.
+    cursor: usize,
     size: Size,
+    /// The furniture the theme asked for: padding, gutter, band, scrolloff.
+    /// Held here rather than passed per-frame because it decides the *layout*
+    /// width and the page height, so navigation arithmetic needs it as much as
+    /// painting does.
+    chrome: Chrome,
     mode: Mode,
     /// The first half of a two-keystroke motion (`]]` / `[[`), waiting for
     /// its twin. Not folded into [`Mode`]: `Mode` answers "what is on the
@@ -483,7 +511,9 @@ impl AppState {
         AppState {
             tree,
             scroll: 0,
+            cursor: 0,
             size,
+            chrome: Chrome::default(),
             mode: Mode::Normal,
             pending: None,
             toc_return_scroll: 0,
@@ -563,6 +593,7 @@ impl AppState {
             KeyCode::Char('z') => Some(ChromeAction::ToggleFold),
             KeyCode::Char('R') => Some(ChromeAction::ExpandAllFolds),
             KeyCode::Char('M') => Some(ChromeAction::CollapseAllFolds),
+            KeyCode::Char('#') => Some(ChromeAction::ToggleLineNumbers),
             _ => None,
         }
     }
@@ -907,8 +938,60 @@ impl AppState {
         self.relayout(ctx, width, size);
     }
 
+    /// The chrome this viewport can actually afford, with the gutter measured
+    /// against the document currently laid out.
+    ///
+    /// Everything geometric goes through here rather than through
+    /// [`AppState::chrome`] directly, so a terminal too narrow for furniture
+    /// is narrow in exactly one place instead of in every caller.
+    pub fn fitted_chrome(&self) -> Chrome {
+        let gutter = painter::gutter_width(self.chrome, self.tree.line_count());
+        self.chrome.fit(self.size.width, self.size.height, gutter)
+    }
+
+    /// The page the painter should draw this state into.
+    pub fn page(&self) -> Page {
+        Page::new(
+            self.fitted_chrome(),
+            self.size,
+            self.tree.line_count(),
+            self.cursor,
+        )
+    }
+
+    pub fn set_chrome(&mut self, chrome: Chrome) {
+        self.chrome = chrome;
+    }
+
+    /// The content column a terminal `terminal_width` cells wide leaves once
+    /// this state's chrome has taken its share.
+    ///
+    /// The **one** place a terminal width becomes a layout width. Everything
+    /// downstream — `content_width`, `+`/`-`, the anchor arithmetic — works in
+    /// content columns and never subtracts chrome again, which is what keeps
+    /// `+` widening the measure rather than fighting the gutter for the same
+    /// cells.
+    pub fn content_width_in(&self, terminal_width: u16) -> u16 {
+        let gutter = painter::gutter_width(self.chrome, self.tree.line_count());
+        let chrome = self
+            .chrome
+            .fit(terminal_width, self.size.height, gutter)
+            .horizontal(gutter);
+        terminal_width.saturating_sub(chrome).max(1)
+    }
+
+    pub fn chrome(&self) -> Chrome {
+        self.chrome
+    }
+
+    /// The reading line, as an absolute index into the tree.
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
     fn set_scroll(&mut self, value: usize) {
         self.scroll = value.min(self.max_scroll());
+        self.reseat_cursor();
     }
 
     fn scroll_by(&mut self, delta: isize) {
@@ -916,10 +999,132 @@ impl AppState {
         self.set_scroll((current + delta).max(0) as usize);
     }
 
-    /// One viewport's worth of lines: the step for `PgUp`/`PgDn` and for
+    /// Moves the reading line by `delta` and brings the viewport with it.
+    ///
+    /// The ordinary motion. `j` at the bottom of the screen scrolls because
+    /// the reading line ran out of viewport, not because `j` is a scroll key —
+    /// which is the whole difference between this model and the one it
+    /// replaced, and the reason the reader keeps their place when the document
+    /// is shorter than the screen.
+    fn move_cursor(&mut self, delta: isize) {
+        let last = self.last_line();
+        let target = (self.cursor as isize).saturating_add(delta).max(0) as usize;
+        self.cursor = target.min(last);
+        self.follow_cursor();
+    }
+
+    /// Moves the page by `delta` rows and carries the reading line with it.
+    ///
+    /// Distinct from [`AppState::move_cursor`], and the distinction is the
+    /// whole difference between a line key and a page key: `j` moves the
+    /// reader and lets the page follow, `PgDn` moves the page and takes the
+    /// reader along. Move the reading line a page and let the viewport chase
+    /// it and you get a page key that scrolls by one row — the reading line
+    /// lands on the bottom row, which is already visible, so nothing needs to
+    /// move. That is not what anyone pressing `PgDn` is asking for.
+    ///
+    /// At the end of the document the page stops and the reading line does
+    /// not: `Ctrl-f` on the last screen still walks to the final line, which
+    /// is the only way to reach it with a page key.
+    fn move_page(&mut self, delta: isize) {
+        let target = (self.cursor as isize).saturating_add(delta).max(0) as usize;
+        self.scroll_by(delta);
+        self.set_cursor(target);
+    }
+
+    /// Puts the reading line on `line` and brings the viewport with it.
+    fn set_cursor(&mut self, line: usize) {
+        self.cursor = line.min(self.last_line());
+        self.follow_cursor();
+    }
+
+    /// The last addressable line, or `0` for an empty document — which is also
+    /// where the reading line sits in one, since there is nowhere else.
+    fn last_line(&self) -> usize {
+        self.tree.line_count().saturating_sub(1)
+    }
+
+    /// Rows of document the page shows: the viewport less the theme's vertical
+    /// padding. One at minimum, so a viewport swallowed entirely by padding
+    /// still scrolls rather than dividing the reader's motions by zero.
+    fn content_rows(&self) -> usize {
+        usize::from(
+            self.size
+                .height
+                .saturating_sub(self.fitted_chrome().vertical())
+                .max(1),
+        )
+    }
+
+    /// Rows kept between the reading line and the edge of the page before it
+    /// scrolls, capped so it can never exceed half the page — past that the
+    /// two limits cross and the reading line would have nowhere legal to be.
+    fn scrolloff(&self) -> usize {
+        let rows = self.content_rows();
+        usize::from(self.fitted_chrome().scrolloff).min(rows.saturating_sub(1) / 2)
+    }
+
+    /// Scrolls the minimum needed to bring the reading line back into the
+    /// page, honouring [`AppState::scrolloff`].
+    ///
+    /// Minimum, not centred: a motion that only needs one row of scroll should
+    /// cost one row of scroll. Recentring on every `j` past the bottom edge is
+    /// what makes a pager feel like it is fighting the reader.
+    fn follow_cursor(&mut self) {
+        let rows = self.content_rows();
+        let off = self.scrolloff();
+        let highest_top = self.cursor.saturating_sub(off);
+        // The lowest top that still shows the reading line plus its margin.
+        let lowest_top = self
+            .cursor
+            .saturating_add(off)
+            .saturating_add(1)
+            .saturating_sub(rows);
+        let mut scroll = self.scroll;
+        if scroll > highest_top {
+            scroll = highest_top;
+        }
+        if scroll < lowest_top {
+            scroll = lowest_top;
+        }
+        // `max_scroll` can only pull the top *up*, which can only reveal more
+        // of the document below the reading line — so the clamp cannot undo
+        // the work above.
+        self.scroll = scroll.min(self.max_scroll());
+    }
+
+    /// Pulls the reading line back onto the page after the viewport moved
+    /// without it: a `Esc` out of the TOC, a relayout's anchor, a resize.
+    ///
+    /// The scrolloff margin is dropped at the document's ends, where there is
+    /// no context to keep: with the page at the very top the reading line may
+    /// sit on line 0, and at the very bottom on the last line. Without that
+    /// exception a reader who pressed `G` would land two rows short of the end
+    /// and have no way to reach it.
+    fn reseat_cursor(&mut self) {
+        let last = self.last_line();
+        let rows = self.content_rows();
+        let off = self.scrolloff();
+        let bottom = self.scroll.saturating_add(rows).saturating_sub(1).min(last);
+        let mut lowest = if self.scroll == 0 {
+            0
+        } else {
+            self.scroll.saturating_add(off)
+        };
+        let mut highest = if self.scroll >= self.max_scroll() {
+            last
+        } else {
+            bottom.saturating_sub(off)
+        };
+        lowest = lowest.min(bottom);
+        highest = highest.max(lowest).min(last);
+        self.cursor = self.cursor.clamp(lowest, highest);
+    }
+
+    /// One page's worth of lines: the step for `PgUp`/`PgDn` and for
     /// vim's `Ctrl-f`/`Ctrl-b`.
     fn page_size(&self) -> usize {
-        self.size.height.max(1) as usize
+        self.content_rows()
     }
 
     /// Half a viewport: the step for vim's `Ctrl-d`/`Ctrl-u`. Floored at one
@@ -943,7 +1148,13 @@ impl AppState {
             .first_line_of(block)
             .or_else(|| self.tree.outline().line_for_block(block));
         if let Some(line) = line {
+            // Scroll *and* reading line, in that order: a jump puts the block
+            // at the top of the page and the reader on its first row, which is
+            // the row they asked for. Setting only the scroll would leave the
+            // band wherever the last motion left it, several rows into a
+            // section the reader has not read yet.
             self.set_scroll(line);
+            self.set_cursor(line);
         }
     }
 
@@ -961,17 +1172,23 @@ impl AppState {
     /// clamps, and moves nothing. Silence there reads as a dropped keystroke.
     fn jump_heading(&mut self, forward: bool) {
         let outline = self.tree.outline();
+        // Stepped from the *reading line*, not from the page's top row. The
+        // two were the same thing until the reading line existed; now a reader
+        // three rows down a section and pressing `]]` means "the next heading
+        // after me", and answering from the top row would jump to the heading
+        // they are already standing under.
         let index = if forward {
-            outline.next_after(self.scroll)
+            outline.next_after(self.cursor)
         } else {
-            outline.previous_before(self.scroll)
+            outline.previous_before(self.cursor)
         };
         let target = index.and_then(|index| outline.line_of(index));
         let empty = outline.is_empty();
-        let before = self.scroll;
+        let before = (self.scroll, self.cursor);
         if let Some(line) = target {
             self.set_scroll(line);
-            if self.scroll != before {
+            self.set_cursor(line);
+            if (self.scroll, self.cursor) != before {
                 return;
             }
         }
@@ -991,7 +1208,7 @@ impl AppState {
             self.set_status(StatusMessage::new(NO_HEADINGS));
             return;
         }
-        let selected = outline.index_at_or_before(self.scroll).unwrap_or(0);
+        let selected = outline.index_at_or_before(self.cursor).unwrap_or(0);
         self.toc_return_scroll = self.scroll;
         self.mode = Mode::Toc { selected };
     }
@@ -1045,7 +1262,7 @@ impl AppState {
     /// uses.
     pub fn toggle_fold(&mut self) {
         let outline = self.tree.outline();
-        let Some(index) = outline.index_at_or_before(self.scroll) else {
+        let Some(index) = outline.index_at_or_before(self.cursor) else {
             // `None` here means either there is no heading in the document
             // at all, or there is one but it is below the cursor — a
             // document with headings the reader just has not reached yet.
@@ -1061,7 +1278,7 @@ impl AppState {
         let target = outline.entries[index].block;
         let folding = !self.folds.is_folded(target);
         self.pending_fold_snap =
-            (folding && self.section_line_range(index).contains(&self.scroll)).then_some(target);
+            (folding && self.section_line_range(index).contains(&self.cursor)).then_some(target);
         self.folds.toggle(target);
     }
 
@@ -1332,6 +1549,21 @@ impl AppState {
             // The reserved status row. Nothing there is clickable.
             return false;
         }
+        let page = self.page();
+        // Both axes come back through the page's origin, because the event
+        // arrives in the terminal's coordinates and everything below thinks in
+        // the document's. Skipping this was the whole of the padding bug it is
+        // here to prevent: with a gutter on, every click resolved a few cells
+        // to the left of the glyph the reader aimed at, so the last character
+        // of each link stopped working and the first character of the next
+        // word started opening it.
+        if row < page.origin.y || column < page.origin.x.saturating_add(page.gutter) {
+            // The margin or the gutter. Neither is clickable — a click on a
+            // line number is not a click on the line.
+            return false;
+        }
+        let row = row - page.origin.y;
+        let column = column - page.origin.x - page.gutter;
         let line = self.scroll.saturating_add(usize::from(row));
         let Some(target) = self.link_at(line, column, engine) else {
             return false;
@@ -1342,6 +1574,8 @@ impl AppState {
     }
 
     /// The destination of the link painted at `(line, column)`, if any.
+    /// `column` is page-relative: [`AppState::click`] has already taken the
+    /// padding and the gutter off it.
     fn link_at(&self, line: usize, column: u16, engine: &WidthEngine) -> Option<String> {
         if line >= self.tree.line_count() {
             return None;
@@ -1349,7 +1583,7 @@ impl AppState {
         let Some(Line::Items(items)) = self.tree.lines(line..line + 1).next() else {
             return None;
         };
-        let columns = item_columns(items, engine, self.size.width);
+        let columns = item_columns(items, engine, self.page().content);
         self.visible_links().into_iter().find_map(|link| {
             let hit = link
                 .spans
@@ -1811,6 +2045,12 @@ impl AppState {
         } else if line >= self.scroll.saturating_add(height) {
             self.set_scroll(line + 1 - height);
         }
+        // The reading line goes to the match, not merely near it. `n` is a
+        // motion, and a band left three rows above the match the reader is
+        // now looking at would be pointing at the wrong line — worse than not
+        // pointing at all. Ordered after the scroll so `follow_cursor` has
+        // nothing left to do and cannot undo the minimal-movement rule above.
+        self.set_cursor(line);
     }
 
     /// DW-4.5's status-row half. Silent on an empty query — pressing `n`
@@ -1853,10 +2093,10 @@ impl AppState {
             // path, an externally delivered `kill -INT`; both end in the
             // same terminal restore.
             KeyCode::Char('c') => return Some(true),
-            KeyCode::Char('d') => self.scroll_by(self.half_page() as isize),
-            KeyCode::Char('u') => self.scroll_by(-(self.half_page() as isize)),
-            KeyCode::Char('f') => self.scroll_by(self.page_size() as isize),
-            KeyCode::Char('b') => self.scroll_by(-(self.page_size() as isize)),
+            KeyCode::Char('d') => self.move_page(self.half_page() as isize),
+            KeyCode::Char('u') => self.move_page(-(self.half_page() as isize)),
+            KeyCode::Char('f') => self.move_page(self.page_size() as isize),
+            KeyCode::Char('b') => self.move_page(-(self.page_size() as isize)),
             // Ctrl-g (DW-1.3): file info. Before this phase, lowercase
             // Ctrl-g meant nothing to us and fell through to the unmodified
             // `'g'` binding (jump to top) — an accident of the "strictly
@@ -1882,12 +2122,14 @@ impl AppState {
     fn handle_key(&mut self, code: KeyCode) -> bool {
         match code {
             KeyCode::Char('q') => return true,
-            KeyCode::Up | KeyCode::Char('k') => self.scroll_by(-1),
-            KeyCode::Down | KeyCode::Char('j') => self.scroll_by(1),
-            KeyCode::PageUp => self.scroll_by(-(self.page_size() as isize)),
-            KeyCode::PageDown => self.scroll_by(self.page_size() as isize),
-            KeyCode::Home | KeyCode::Char('g') => self.set_scroll(0),
-            KeyCode::End | KeyCode::Char('G') => self.set_scroll(self.max_scroll()),
+            // Every motion here moves the *reading line*; the viewport follows
+            // it. See [`AppState::cursor`] for why the model changed.
+            KeyCode::Up | KeyCode::Char('k') => self.move_cursor(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.move_cursor(1),
+            KeyCode::PageUp => self.move_page(-(self.page_size() as isize)),
+            KeyCode::PageDown => self.move_page(self.page_size() as isize),
+            KeyCode::Home | KeyCode::Char('g') => self.set_cursor(0),
+            KeyCode::End | KeyCode::Char('G') => self.set_cursor(self.last_line()),
             // Search (Phase 4). All three were unbound before this phase,
             // so nothing pre-existing is displaced.
             KeyCode::Char('/') => self.begin_search(),
@@ -1937,15 +2179,13 @@ impl AppState {
         // re-anchor there.
         self.document_changed = false;
 
-        self.tree = layout_with_folds(
-            ctx.doc,
-            width,
-            ctx.config,
-            ctx.engine,
-            ctx.sizer,
-            &self.folds,
-        );
+        // The reading line as a *fraction of the block it is in*, captured
+        // before the tree is replaced. See `place_cursor` for why the raw
+        // index is not enough.
+        let cursor_offset = self.cursor.saturating_sub(previous_scroll);
+
         self.size = new_size;
+        self.tree = self.layout_fitting_the_gutter(ctx, width);
         // Resync to what layout actually used (already clamped), not the
         // raw `width` argument — the two agree today but this is the
         // authoritative value regardless. A caller-driven toggle
@@ -1979,9 +2219,72 @@ impl AppState {
             .and_then(|id| self.tree.first_line_of(id))
             .unwrap_or(target);
         self.set_scroll(target);
+        self.place_cursor(cursor_offset);
         self.reseat_search(reflowed);
         self.reseat_link_select();
         self.recompute_matches(ctx);
+    }
+
+    /// Lays the document out at `width`, narrowed by the chrome, sizing the
+    /// gutter to the line count the result actually has.
+    ///
+    /// **The gutter can chase its own tail.** Its width comes from the
+    /// document's line count; it narrows the content column; a narrower column
+    /// rewraps the document into *more* lines; more lines can need another
+    /// digit. So this lays out at most twice and keeps the **wider** of the
+    /// two gutters — never the second, which could be the narrower one and
+    /// would clip a number the first pass proved was needed.
+    ///
+    /// It terminates because the second pass is unconditional in the only
+    /// direction that matters: narrowing the content can only add lines, so
+    /// the digit count is monotone across the pair and one extra pass reaches
+    /// a width that fits. A third pass could differ only if a single cell of
+    /// content crossed a power-of-ten boundary in line count, which costs a
+    /// gutter one cell wider than strictly needed — invisible, and a great
+    /// deal cheaper than laying a ten-thousand-line document out until a fixed
+    /// point falls out.
+    fn layout_fitting_the_gutter(&self, ctx: &LayoutContext, width: u16) -> LayoutTree {
+        let lay_out = |width: u16| {
+            layout_with_folds(
+                ctx.doc,
+                width,
+                ctx.config,
+                ctx.engine,
+                ctx.sizer,
+                &self.folds,
+            )
+        };
+        // `width` is a content column the caller already took chrome out of,
+        // using the gutter the *current* tree needs. Seeded from that same
+        // tree, so `budgeted` is the number the caller budgeted for and the
+        // comparison below is against the right thing.
+        let budgeted = painter::gutter_width(self.chrome, self.tree.line_count());
+        let tree = lay_out(width);
+        let needed = painter::gutter_width(self.chrome, tree.line_count());
+        let Some(growth) = needed.checked_sub(budgeted).filter(|n| *n > 0) else {
+            // The common case by a wide margin, and the only one that costs a
+            // single layout: a gutter that did not grow needs no more room. It
+            // may have *shrunk*, which leaves the page a cell wider than it
+            // strictly needs to be — invisible, and not worth a second pass.
+            return tree;
+        };
+        lay_out(width.saturating_sub(growth).max(ctx.config.min_width))
+    }
+
+    /// Puts the reading line back after a relayout, `offset` rows below the
+    /// top of the page — where it was before the tree was replaced.
+    ///
+    /// Anchored to the *viewport* rather than to a block, unlike the scroll
+    /// anchor above, and the asymmetry is deliberate. The scroll anchor answers
+    /// "which text was the reader looking at", which survives a rewrap because
+    /// the text does. The reading line answers "which row was the reader on",
+    /// and after a rewrap that row's content is somewhere else — so the honest
+    /// reconstruction is the reader's position *on the screen*, which is what
+    /// they were actually looking at when the terminal changed shape under
+    /// them. `reseat_cursor` then clamps it onto the page.
+    fn place_cursor(&mut self, offset: usize) {
+        self.cursor = self.scroll.saturating_add(offset).min(self.last_line());
+        self.reseat_cursor();
     }
 
     /// Puts an open search prompt's `origin` back on a line that exists in
@@ -2314,8 +2617,27 @@ impl AppState {
     /// resize storm still costs exactly one re-layout.
     pub fn apply_resize_burst(&mut self, ctx: &LayoutContext, sizes: &[Size]) {
         if let Some(&last) = sizes.last() {
-            self.relayout(ctx, last.width, last);
+            // The terminal's width, less the chrome — the resize is one of the
+            // two places a terminal width becomes a layout width, and the only
+            // one that happens more than once. See `content_width_in`.
+            let width = self.content_width_in(last.width);
+            self.relayout(ctx, width, last);
         }
+    }
+
+    /// Applies `chrome` and re-lays the document out to the width it leaves.
+    ///
+    /// A relayout rather than a repaint, because the gutter and the padding
+    /// are cells the document does not get: turning the gutter on with `#`
+    /// rewraps the page, exactly as `-` does. The scroll anchor is preserved
+    /// through the same path every other chrome mutation uses, so the reader
+    /// keeps their place across the rewrap.
+    pub fn apply_chrome(&mut self, chrome: Chrome, ctx: &LayoutContext) {
+        self.chrome = chrome;
+        let width = self.content_width_in(self.size.width);
+        self.content_width = width;
+        let size = self.size;
+        self.relayout(ctx, width, size);
     }
 }
 
@@ -2656,6 +2978,7 @@ mod tests {
     use width::WidthConfig;
 
     use super::*;
+    use layout::Padding;
 
     fn build(
         source: &str,
@@ -2697,6 +3020,39 @@ mod tests {
         KeyEvent::from(code)
     }
 
+    /// Puts the top of the page on line `top` by pressing `Down`, and leaves
+    /// the reading line there too.
+    ///
+    /// Through the real key path rather than by reaching into `scroll`,
+    /// because a back door into a private field is a setup that cannot catch a
+    /// motion regression. What it hides is arithmetic, not behaviour: under
+    /// the reading-line model `Down` moves the reader and the page only
+    /// follows once the reader reaches its bottom edge, so reaching a given
+    /// *top* takes one press per page row more than it used to. A dozen tests
+    /// here want nothing more than "a reader partway down a document", and
+    /// that count is not what any of them are about.
+    fn scroll_to(state: &mut AppState, top: usize) {
+        // One press per row of the document is the most that can ever be
+        // needed, and a bound is what turns "this fixture is too short" into a
+        // failed assertion rather than a hung test run.
+        let cap = state.tree().line_count() + 1;
+        for _ in 0..cap {
+            if state.scroll() >= top {
+                break;
+            }
+            assert!(
+                !state.handle_key_event(plain(KeyCode::Down)),
+                "Down must not ask to quit"
+            );
+        }
+        assert_eq!(
+            state.scroll(),
+            top,
+            "could not scroll to {top}: the fixture bottoms out at {}",
+            state.max_scroll()
+        );
+    }
+
     /// A document laid out to *exactly* the viewport height: `max_scroll` is
     /// 0, so every downward motion must be a no-op even though there is a
     /// full screen of content.
@@ -2717,25 +3073,39 @@ mod tests {
     fn test_dw_5_1_scroll_navigation_and_quit() {
         let (_doc, _config, _engine, mut state) = build(&non_reflowing_source(50), 40, 10);
         assert_eq!(state.scroll(), 0);
+        assert_eq!(state.cursor(), 0);
 
+        // A line key moves the *reader*. The page does not budge until the
+        // reader reaches its bottom edge — that is the reading-line model,
+        // and it is what makes the band mean something.
         assert!(!state.handle_key_event(plain(KeyCode::Down)));
-        assert_eq!(state.scroll(), 1);
+        assert_eq!(state.cursor(), 1);
+        assert_eq!(state.scroll(), 0, "one line down is not one page scrolled");
         assert!(!state.handle_key_event(plain(KeyCode::Up)));
-        assert_eq!(state.scroll(), 0);
-        // Up at scroll 0 must clamp, not underflow.
+        assert_eq!(state.cursor(), 0);
+        // Up at the top must clamp, not underflow.
         assert!(!state.handle_key_event(plain(KeyCode::Up)));
+        assert_eq!(state.cursor(), 0);
         assert_eq!(state.scroll(), 0);
 
+        // A page key moves the *page*, and carries the reader with it.
         assert!(!state.handle_key_event(plain(KeyCode::PageDown)));
         assert_eq!(state.scroll(), state.page_size());
+        assert_eq!(state.cursor(), state.page_size());
 
         assert!(!state.handle_key_event(plain(KeyCode::Char('G'))));
         assert_eq!(state.scroll(), state.max_scroll());
+        assert_eq!(
+            state.cursor(),
+            state.tree().line_count() - 1,
+            "`G` must reach the last line, not merely the last screen"
+        );
         assert!(!state.handle_key_event(plain(KeyCode::End)));
         assert_eq!(state.scroll(), state.max_scroll());
 
         assert!(!state.handle_key_event(plain(KeyCode::Char('g'))));
         assert_eq!(state.scroll(), 0);
+        assert_eq!(state.cursor(), 0);
         assert!(!state.handle_key_event(plain(KeyCode::Home)));
         assert_eq!(state.scroll(), 0);
 
@@ -2798,9 +3168,7 @@ mod tests {
         };
 
         // Scroll partway into the document first.
-        for _ in 0..100 {
-            state.handle_key_event(plain(KeyCode::Down));
-        }
+        scroll_to(&mut state, 100);
         let topmost_before = topmost_line_text(&state);
 
         // A 50-event resize storm; the content never reflows (every line
@@ -2858,9 +3226,7 @@ mod tests {
         // Scroll to somewhere in the middle and note which source block sits
         // at the top of the viewport (by node identity, not by text — the top
         // line may be a wrapped continuation line, not a paragraph start).
-        for _ in 0..40 {
-            state.handle_key_event(plain(KeyCode::Down));
-        }
+        scroll_to(&mut state, 40);
         let anchor = state
             .tree()
             .block_at(state.scroll())
@@ -2988,9 +3354,7 @@ mod tests {
             "the fixture must be one block"
         );
 
-        for _ in 0..100 {
-            state.handle_key_event(plain(KeyCode::Down));
-        }
+        scroll_to(&mut state, 100);
         let words_before = words_scrolled_past(&state);
         assert!(
             words_before > 1000,
@@ -3043,9 +3407,7 @@ mod tests {
         // to the same block — the case block-granularity anchoring loses.
         assert_eq!(state.tree().block_at(0), state.tree().block_at(200));
 
-        for _ in 0..200 {
-            state.handle_key_event(plain(KeyCode::Down));
-        }
+        scroll_to(&mut state, 200);
         assert_eq!(state.scroll(), 200);
 
         state.apply_resize_burst(
@@ -3086,9 +3448,7 @@ mod tests {
             "clamped up to the min-width floor"
         );
 
-        for _ in 0..60 {
-            state.handle_key_event(plain(KeyCode::Down));
-        }
+        scroll_to(&mut state, 60);
         let before = state.scroll();
         assert_eq!(before, 60);
 
@@ -3119,18 +3479,199 @@ mod tests {
     fn test_ctrl_c_quits_exactly_like_q() {
         let (_doc, _config, _engine, mut state) = build(&non_reflowing_source(50), 40, 10);
         state.handle_key_event(plain(KeyCode::Down));
-        assert_eq!(state.scroll(), 1);
+        assert_eq!(state.cursor(), 1);
 
         assert!(
             state.handle_key_event(ctrl('c')),
             "Ctrl-C must request quit"
         );
         // Quitting is all it does — it must not move the reader on the way out.
-        assert_eq!(state.scroll(), 1);
+        assert_eq!(state.cursor(), 1);
 
         // A bare `c` is not a quit key and never was.
         assert!(!state.handle_key_event(plain(KeyCode::Char('c'))));
-        assert_eq!(state.scroll(), 1);
+        assert_eq!(state.cursor(), 1);
+    }
+
+    // ---- The reading line -------------------------------------------------
+
+    /// The band exists whether or not it is painted, and turning the paint off
+    /// changes no motion.
+    ///
+    /// The rule that keeps the model honest: a key that means different things
+    /// depending on a display setting is worse than either meaning, so
+    /// `current_line = false` hides the band and leaves `j` alone.
+    #[test]
+    fn test_hiding_the_band_does_not_change_a_single_motion() {
+        let mut painted = build(&non_reflowing_source(50), 40, 10).3;
+        let mut hidden = build(&non_reflowing_source(50), 40, 10).3;
+        hidden.set_chrome(Chrome {
+            current_line: false,
+            ..Chrome::default()
+        });
+
+        for key in [
+            KeyCode::Down,
+            KeyCode::Down,
+            KeyCode::PageDown,
+            KeyCode::Up,
+            KeyCode::Char('G'),
+            KeyCode::Char('g'),
+        ] {
+            painted.handle_key_event(plain(key));
+            hidden.handle_key_event(plain(key));
+            assert_eq!(
+                (painted.scroll(), painted.cursor()),
+                (hidden.scroll(), hidden.cursor()),
+                "{key:?} moved differently with the band switched off"
+            );
+        }
+        assert!(painted.page().cursor.is_some(), "the band must be painted");
+        assert!(
+            hidden.page().cursor.is_none(),
+            "the band must not be painted"
+        );
+    }
+
+    /// `scrolloff` keeps rows of context below the reading line, and gives
+    /// them up at the ends of the document.
+    ///
+    /// Without the exception a reader who pressed `G` would land two rows
+    /// short of the last line with no way to reach it.
+    #[test]
+    fn test_scrolloff_keeps_context_but_not_at_the_documents_ends() {
+        let (_doc, _config, _engine, mut state) = build(&non_reflowing_source(50), 40, 10);
+        state.set_chrome(Chrome {
+            scrolloff: 3,
+            ..Chrome::default()
+        });
+
+        // Walking down, the page starts moving three rows early.
+        for _ in 0..7 {
+            state.handle_key_event(plain(KeyCode::Down));
+        }
+        assert_eq!(state.cursor(), 7);
+        assert_eq!(
+            state.scroll(),
+            1,
+            "with three rows of margin the page must lead the reader by one"
+        );
+
+        // But the last line is still reachable.
+        state.handle_key_event(plain(KeyCode::Char('G')));
+        assert_eq!(
+            state.cursor(),
+            state.tree().line_count() - 1,
+            "scrolloff must not fence the reader off the end of the document"
+        );
+        state.handle_key_event(plain(KeyCode::Char('g')));
+        assert_eq!(
+            state.cursor(),
+            0,
+            "nor off the start — there is no context above line 0 to keep"
+        );
+    }
+
+    /// A page key moves the page; a line key moves the reader.
+    ///
+    /// Moving the reading line by a page and letting the viewport chase it
+    /// gives a page key that scrolls by exactly one row — the reading line
+    /// lands on the bottom row, which is already visible, so nothing has to
+    /// move. That is not what anyone pressing `PgDn` is asking for, and it is
+    /// the bug this pins.
+    #[test]
+    fn test_a_page_key_moves_the_page_and_a_line_key_does_not() {
+        let (_doc, _config, _engine, mut state) = build(&non_reflowing_source(50), 40, 10);
+
+        state.handle_key_event(plain(KeyCode::PageDown));
+        assert_eq!(state.scroll(), 10, "a page key moves the page");
+        assert_eq!(state.cursor(), 10, "and carries the reader with it");
+
+        let before = state.scroll();
+        state.handle_key_event(plain(KeyCode::Down));
+        assert_eq!(state.scroll(), before, "a line key does not move the page");
+        assert_eq!(state.cursor(), 11, "it moves the reader");
+    }
+
+    /// Turning the gutter on rewraps the page, because the gutter takes cells
+    /// the document was laid out into.
+    ///
+    /// A repaint would leave the last few characters of every line clipped
+    /// against the page's new right edge.
+    #[test]
+    fn test_turning_the_gutter_on_narrows_the_content_column() {
+        // Narrower than `LayoutConfig`'s 100-cell cap, so the content column is
+        // limited by the *terminal* and the gutter has something to take a bite
+        // out of. On a wide terminal the cap absorbs the gutter and the tree's
+        // width does not move — true, and not what this test is about.
+        let (doc, config, engine, mut state) = build(&numbered_paragraphs(60), 80, 10);
+        let ctx = ctx_for(&doc, &config, &engine);
+        let before = state.tree().width();
+
+        state.apply_chrome(
+            Chrome {
+                line_numbers: true,
+                ..Chrome::default()
+            },
+            &ctx,
+        );
+        assert!(
+            state.tree().width() < before,
+            "the gutter must come out of the content column, not overlap it: \
+             {before} -> {}",
+            state.tree().width()
+        );
+        let page = state.page();
+        assert_eq!(
+            page.gutter + page.content + page.origin.x,
+            state.size().width,
+            "the gutter, the page and the margin must tile the viewport exactly"
+        );
+    }
+
+    /// A click resolves the glyph the reader aimed at, not the one a gutter's
+    /// width to the left of it.
+    ///
+    /// The whole of the padding bug this guards: with a gutter on, every click
+    /// landed a few cells left of the target, so the last character of each
+    /// link stopped working and the first character of the next word started
+    /// opening it.
+    #[test]
+    fn test_a_click_is_resolved_through_the_gutter_and_the_margin() {
+        let source = "[alpha](https://example.com/a) tail\n";
+        let (doc, config, engine, mut state) = build(source, 60, 10);
+        let ctx = ctx_for(&doc, &config, &engine);
+        state.apply_chrome(
+            Chrome {
+                line_numbers: true,
+                padding: Padding {
+                    left: 2,
+                    ..Padding::default()
+                },
+                ..Chrome::default()
+            },
+            &ctx,
+        );
+        let page = state.page();
+        let text_x = page.origin.x + page.gutter;
+
+        // The link's first cell, in the terminal's own coordinates.
+        assert!(
+            state.handle_mouse_event(click_at(text_x, 0), &engine),
+            "a click on the link's first cell must activate it"
+        );
+        assert!(matches!(
+            state.take_action(),
+            Some(PendingAction::OpenLink(url)) if url == "https://example.com/a"
+        ));
+
+        // The same cell counted from column 0 — where the click *used* to be
+        // resolved — is inside the gutter, and a line number is not a link.
+        assert!(
+            !state.handle_mouse_event(click_at(0, 0), &engine),
+            "a click on the gutter must do nothing at all"
+        );
+        assert!(state.take_action().is_none());
     }
 
     /// `j`/`k` are `Down`/`Up`: one line, clamped at 0 and at the tail.
@@ -3138,28 +3679,41 @@ mod tests {
     fn test_vim_j_and_k_move_one_line_and_clamp_at_both_ends() {
         let (_doc, _config, _engine, mut state) = build(&non_reflowing_source(50), 40, 10);
         let tail = state.max_scroll();
+        let last = state.tree().line_count() - 1;
         assert!(tail > 3, "the fixture must be taller than the viewport");
 
         assert!(!state.handle_key_event(plain(KeyCode::Char('j'))));
-        assert_eq!(state.scroll(), 1);
+        assert_eq!(state.cursor(), 1);
         assert!(!state.handle_key_event(plain(KeyCode::Char('j'))));
-        assert_eq!(state.scroll(), 2);
+        assert_eq!(state.cursor(), 2);
         assert!(!state.handle_key_event(plain(KeyCode::Char('k'))));
-        assert_eq!(state.scroll(), 1);
+        assert_eq!(state.cursor(), 1);
+        assert_eq!(state.scroll(), 0, "none of that reached the page's edge");
 
-        // At scroll 0, `k` clamps instead of underflowing.
+        // At the top, `k` clamps instead of underflowing.
         state.handle_key_event(plain(KeyCode::Char('k')));
-        assert_eq!(state.scroll(), 0);
+        assert_eq!(state.cursor(), 0);
         state.handle_key_event(plain(KeyCode::Char('k')));
-        assert_eq!(state.scroll(), 0);
+        assert_eq!(state.cursor(), 0);
 
-        // At the tail, `j` clamps instead of running off the end.
+        // At the end, `j` clamps instead of running off it.
         state.handle_key_event(plain(KeyCode::Char('G')));
+        assert_eq!(state.cursor(), last);
         assert_eq!(state.scroll(), tail);
         state.handle_key_event(plain(KeyCode::Char('j')));
-        assert_eq!(state.scroll(), tail);
+        assert_eq!(state.cursor(), last);
+        assert_eq!(
+            state.scroll(),
+            tail,
+            "clamping must not scroll past the end"
+        );
         state.handle_key_event(plain(KeyCode::Char('k')));
-        assert_eq!(state.scroll(), tail - 1);
+        assert_eq!(state.cursor(), last - 1);
+        assert_eq!(
+            state.scroll(),
+            tail,
+            "the reader left the bottom row, the page did not move"
+        );
     }
 
     /// `Ctrl-d`/`Ctrl-u` move half a viewport — five lines on a ten-row
@@ -3286,7 +3840,11 @@ mod tests {
         let tail = state.max_scroll();
 
         assert!(!state.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL)));
-        assert_eq!(state.scroll(), 1, "Ctrl-Down must still scroll down");
+        assert_eq!(
+            state.cursor(),
+            1,
+            "Ctrl-Down must still move the reader down"
+        );
 
         assert!(!state.handle_key_event(ctrl('G')));
         assert_eq!(state.scroll(), tail, "Ctrl-G must still jump to the end");
@@ -3414,9 +3972,7 @@ mod tests {
             sizer: &NullSizer,
         };
 
-        for _ in 0..30 {
-            state.handle_key_event(plain(KeyCode::Down));
-        }
+        scroll_to(&mut state, 30);
         let anchor = state
             .tree()
             .block_at(state.scroll())
@@ -3451,9 +4007,7 @@ mod tests {
             sizer: &NullSizer,
         };
 
-        for _ in 0..30 {
-            state.handle_key_event(plain(KeyCode::Down));
-        }
+        scroll_to(&mut state, 30);
         let anchor = state
             .tree()
             .block_at(state.scroll())
@@ -3704,19 +4258,19 @@ mod tests {
         let (_doc, _config, _engine, mut state) = build(&heading_source(6), 40, 4);
 
         assert!(!state.handle_key_event(plain(KeyCode::Char(']'))));
-        assert_eq!(state.scroll(), 0, "a lone `]` must not move the reader");
+        assert_eq!(state.cursor(), 0, "a lone `]` must not move the reader");
 
         // `]` then `j` is one line down, not a heading jump.
         assert!(!state.handle_key_event(plain(KeyCode::Char('j'))));
-        assert_eq!(state.scroll(), 1);
+        assert_eq!(state.cursor(), 1);
 
         // A mismatched pair (`]` then `[`) arms the second bracket rather
         // than jumping; the *next* `[` completes it.
         state.handle_key_event(plain(KeyCode::Char(']')));
         state.handle_key_event(plain(KeyCode::Char('[')));
-        assert_eq!(state.scroll(), 1, "`][` is not a motion");
+        assert_eq!(state.cursor(), 1, "`][` is not a motion");
         state.handle_key_event(plain(KeyCode::Char('[')));
-        assert_eq!(state.scroll(), 0, "the following `[` completes `[[`");
+        assert_eq!(state.cursor(), 0, "the following `[` completes `[[`");
     }
 
     #[test]
@@ -3774,9 +4328,7 @@ mod tests {
     #[test]
     fn test_dw_3_2_esc_returns_to_the_scroll_position_the_toc_was_opened_from() {
         let (_doc, _config, _engine, mut state) = build(&heading_source(8), 60, 4);
-        for _ in 0..7 {
-            state.handle_key_event(plain(KeyCode::Down));
-        }
+        scroll_to(&mut state, 7);
         let before = state.scroll();
         assert!(before > 0);
 
@@ -4101,9 +4653,7 @@ mod tests {
     #[test]
     fn test_dw_4_1_backspace_shortens_the_query_and_esc_from_an_empty_query_still_restores() {
         let (_doc, _config, _engine, mut state) = build(&numbered_paragraphs(80), 40, 10);
-        for _ in 0..20 {
-            state.handle_key_event(plain(KeyCode::Down));
-        }
+        scroll_to(&mut state, 20);
         let origin = state.scroll();
         assert_eq!(origin, 20);
 
@@ -4248,9 +4798,7 @@ mod tests {
     #[test]
     fn test_dw_4_5_a_query_with_no_matches_leaves_the_viewport_unmoved_and_says_so() {
         let (_doc, _config, _engine, mut state) = build(&numbered_paragraphs(80), 40, 10);
-        for _ in 0..25 {
-            state.handle_key_event(plain(KeyCode::Down));
-        }
+        scroll_to(&mut state, 25);
         let before = state.scroll();
 
         state.handle_key_event(plain(KeyCode::Char('/')));
@@ -4581,10 +5129,17 @@ mod tests {
             state.chrome_action(plain(KeyCode::Char('T'))),
             Some(ChromeAction::ToggleTheme)
         );
+        // Chrome rather than an ordinary key because the gutter takes cells
+        // the document was laid out into: `#` rewraps the page, so it needs
+        // the `ctx` only the event loop has.
+        assert_eq!(
+            state.chrome_action(plain(KeyCode::Char('#'))),
+            Some(ChromeAction::ToggleLineNumbers)
+        );
 
         // A chord is not the bare key: Ctrl-T must fall through to the chord
         // table rather than toggling the theme.
-        for c in ['+', '-', 'T'] {
+        for c in ['+', '-', 'T', '#'] {
             assert_eq!(
                 state.chrome_action(ctrl(c)),
                 None,
@@ -4739,9 +5294,7 @@ mod tests {
             .map(|i| format!("line {i:02} of the original\n\n"))
             .collect();
         let (_doc, config, engine, mut state) = build(&before, 40, 10);
-        for _ in 0..30 {
-            state.handle_key_event(plain(KeyCode::Down));
-        }
+        scroll_to(&mut state, 30);
         state.handle_key_event(plain(KeyCode::Char('/')));
         let Mode::Search { origin } = state.mode() else {
             panic!("the prompt must be open");
@@ -4783,9 +5336,7 @@ mod tests {
             engine: &engine,
             sizer: &NullSizer,
         };
-        for _ in 0..20 {
-            state.handle_key_event(plain(KeyCode::Down));
-        }
+        scroll_to(&mut state, 20);
         state.handle_key_event(plain(KeyCode::Char('/')));
 
         // What `T` does: same width, same tree.
@@ -4923,9 +5474,7 @@ mod tests {
     #[test]
     fn test_dw_2_2_a_reload_that_grows_a_block_above_the_reader_keeps_their_block() {
         let (_doc, config, engine, mut state) = build(&non_reflowing_source(40), 40, 10);
-        for _ in 0..12 {
-            state.handle_key_event(plain(KeyCode::Down));
-        }
+        scroll_to(&mut state, 12);
         let anchored = topmost_line_text(&state);
         assert_eq!(anchored, "line 6", "test setup: the reader is on line 6");
         let scroll_before = state.scroll();
@@ -4953,9 +5502,7 @@ mod tests {
     #[test]
     fn test_dw_2_2_a_reload_that_appends_below_the_reader_leaves_the_scroll_alone() {
         let (_doc, config, engine, mut state) = build(&non_reflowing_source(40), 40, 10);
-        for _ in 0..12 {
-            state.handle_key_event(plain(KeyCode::Down));
-        }
+        scroll_to(&mut state, 12);
         let anchored = topmost_line_text(&state);
         let scroll_before = state.scroll();
 
@@ -5023,9 +5570,7 @@ mod tests {
     #[test]
     fn test_a_reload_does_not_leave_later_relayouts_permanently_re_anchoring() {
         let (_doc, config, engine, mut state) = build(&non_reflowing_source(40), 40, 10);
-        for _ in 0..12 {
-            state.handle_key_event(plain(KeyCode::Down));
-        }
+        scroll_to(&mut state, 12);
         reload(&mut state, &non_reflowing_source(40), &config, &engine);
         let scroll_after_reload = state.scroll();
 
@@ -5097,9 +5642,7 @@ mod tests {
                         .any(|l| matches!(l, layout::Line::Items(items) if items.iter().any(|i| matches!(i, layout::LineItem::Run(r) if r.text.contains("AFTER-THE-FENCE")))))
                 })
                 .expect("fixture must contain the marker paragraph");
-            for _ in 0..target {
-                state.handle_key_event(plain(KeyCode::Down));
-            }
+            scroll_to(&mut state, target);
             assert_eq!(
                 topmost_line_text(&state).trim(),
                 "AFTER-THE-FENCE",
@@ -5125,9 +5668,7 @@ mod tests {
             non_reflowing_source(40)
         );
         let (_doc, config, engine, mut state) = build(&body, 40, 10);
-        for _ in 0..4 {
-            state.handle_key_event(plain(KeyCode::Down));
-        }
+        scroll_to(&mut state, 4);
         assert_eq!(topmost_line_text(&state).trim(), "MARKER-PARAGRAPH");
 
         let shrunk = body.replacen("first paragraph\n\n", "", 1);
@@ -5173,9 +5714,7 @@ mod tests {
 
                 // Park the reader on the 13th copy of the duplicated block.
                 let copy_line = duplicate_lines(&state, DUPLICATE)[12];
-                for _ in 0..copy_line {
-                    state.handle_key_event(plain(KeyCode::Down));
-                }
+                scroll_to(&mut state, copy_line);
                 assert_eq!(
                     topmost_line_text(&state).trim(),
                     DUPLICATE,
@@ -5236,9 +5775,7 @@ mod tests {
         let body = format!("head\n\nEDIT-ME\n\n{}", non_reflowing_source(60));
         let (_doc, config, engine, mut state) = build(&body, 40, 10);
         // `head` on line 0, a blank separator on line 1, the marker on line 2.
-        for _ in 0..2 {
-            state.handle_key_event(plain(KeyCode::Down));
-        }
+        scroll_to(&mut state, 2);
         assert_eq!(topmost_line_text(&state).trim(), "EDIT-ME");
         let scroll_before = state.scroll();
 
@@ -5716,7 +6253,7 @@ mod tests {
         state.jump_to_block(target);
         state.handle_key_event(plain(KeyCode::Down));
         assert!(
-            state.scroll() > heading_line,
+            state.cursor() > heading_line,
             "test setup: the reader must be inside the section, past its heading line"
         );
 

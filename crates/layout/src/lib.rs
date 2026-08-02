@@ -54,6 +54,128 @@ impl Default for LayoutConfig {
     }
 }
 
+/// Dead cells around the page, in terminal cells.
+///
+/// Padding is *outside* everything: outside the gutter, outside the reading
+/// line's band, outside the clickable content. It is the desk the page sits
+/// on, and nothing is ever painted into it — which is what makes it safe to
+/// hand a hostile theme file, since the worst a large value can do is make the
+/// page narrow (and [`Chrome::fit`] refuses even that).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct Padding {
+    pub left: u16,
+    pub right: u16,
+    pub top: u16,
+    pub bottom: u16,
+}
+
+/// The furniture around the document: padding, the line-number gutter, and
+/// whether the reading line is painted.
+///
+/// This is geometry, and it lives in `crates/layout` rather than in the theme
+/// crate that parses it because it is the vocabulary two crates on opposite
+/// sides of the theme file share — `highlight` reads a `[layout]` table into
+/// one of these, `stele` turns one into a viewport origin and a content width.
+/// Layout itself consumes it only indirectly: chrome narrows the width the
+/// caller passes to [`layout`], which is the whole of its effect on wrapping.
+///
+/// [`Default`] is *today's rendering*, deliberately. A reader with no theme
+/// file gets exactly the frame they got before any of this existed: no
+/// padding, no gutter. The one field that defaults to on is
+/// [`current_line`](Self::current_line), because the reading line exists
+/// whether or not it is painted (every motion moves it) and a cursor you
+/// cannot see is worse than no cursor at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Chrome {
+    pub padding: Padding,
+    /// Whether the gutter shows a number per rendered row.
+    pub line_numbers: bool,
+    /// Cells between the gutter's separator and the first content cell.
+    ///
+    /// Inert when [`line_numbers`](Self::line_numbers) is off: with no numbers
+    /// there is no separator, so there is no gutter for a gap to sit inside
+    /// and the whole thing is zero cells wide. A reader who wants the page
+    /// moved off the terminal's edge without numbering it wants
+    /// [`Padding::left`], which is a different request and has its own key.
+    pub gutter_gap: u16,
+    /// Whether to paint the band under the reading line.
+    pub current_line: bool,
+    /// Rows kept between the reading line and the edge of the viewport before
+    /// it scrolls. `0` lets the reading line sit on the first and last visible
+    /// rows, which is what a pager does.
+    pub scrolloff: u16,
+}
+
+impl Default for Chrome {
+    fn default() -> Self {
+        Chrome {
+            padding: Padding::default(),
+            line_numbers: false,
+            gutter_gap: 1,
+            current_line: true,
+            scrolloff: 0,
+        }
+    }
+}
+
+/// The narrowest content column chrome may leave behind.
+///
+/// Below this a page is not a page, so [`Chrome::fit`] gives up the chrome
+/// rather than the document — a theme that asks for twenty cells of padding in
+/// a forty-cell terminal gets no padding, not a twenty-cell measure. Set to
+/// [`LayoutConfig::default`]'s `min_width`, which is the same judgement made
+/// once already about how narrow is too narrow.
+pub const MIN_CHROME_CONTENT: u16 = 24;
+
+impl Chrome {
+    /// The cells this chrome consumes horizontally at a given gutter width:
+    /// padding on both sides plus the gutter.
+    pub fn horizontal(&self, gutter: u16) -> u16 {
+        self.padding
+            .left
+            .saturating_add(self.padding.right)
+            .saturating_add(gutter)
+    }
+
+    /// The rows this chrome consumes vertically.
+    pub fn vertical(&self) -> u16 {
+        self.padding.top.saturating_add(self.padding.bottom)
+    }
+
+    /// This chrome if the viewport can afford it, and [`Chrome::none`] if it
+    /// cannot.
+    ///
+    /// All or nothing rather than shaved down a cell at a time, and that is
+    /// the useful behaviour rather than the lazy one: chrome that degrades
+    /// gradually produces a sequence of intermediate layouts nobody designed —
+    /// a one-cell left pad, a gutter with no gap — each of which looks like a
+    /// bug on the way to the narrow terminal it was heading for. Dropping the
+    /// lot at a stated threshold gives two states a reader can recognise.
+    pub fn fit(self, width: u16, height: u16, gutter: u16) -> Chrome {
+        let fits_wide = width.saturating_sub(self.horizontal(gutter)) >= MIN_CHROME_CONTENT;
+        // One content row is the floor vertically: padding that consumed the
+        // whole viewport would leave a reader looking at blank cells.
+        let fits_tall = height.saturating_sub(self.vertical()) >= 1;
+        if fits_wide && fits_tall {
+            self
+        } else {
+            Chrome::none()
+        }
+    }
+
+    /// No furniture at all: no padding, no gutter, no band. What a viewport
+    /// too small for chrome falls back to, and what `--no-chrome` asks for.
+    pub fn none() -> Chrome {
+        Chrome {
+            padding: Padding::default(),
+            line_numbers: false,
+            gutter_gap: 0,
+            current_line: false,
+            scrolloff: 0,
+        }
+    }
+}
+
 /// The media seam (P6). Given a node id (an [`ast::InlineKind::Image`] or
 /// [`ast::InlineKind::Math`] node), report its natural size in cells, or
 /// `None` to decline — layout then falls back to the node's textual content
@@ -184,6 +306,21 @@ pub enum Semantic {
     /// The one match the reader is currently on, styled distinctly from the
     /// rest so `n`/`N` traversal is visible.
     SearchCurrent,
+    /// A rendered row's number in the gutter. Layout never emits this — the
+    /// painter composes the gutter, which is chrome rather than document — but
+    /// it lives here for the same reason [`Semantic::SearchMatch`] does: it is
+    /// a style *role*, and the exhaustive tables keyed on this enum are what a
+    /// theme reaches it through.
+    LineNumber,
+    /// The gutter number on the reading line.
+    LineNumberCurrent,
+    /// The rule between the gutter and the content column.
+    GutterBorder,
+    /// The reading line's band. **A background role**: it carries no
+    /// foreground of its own and paints no glyphs, it replaces the background
+    /// of every cell of the page on the row the reader is on. The one role
+    /// here whose colour is a surface rather than ink.
+    CurrentLine,
 }
 
 /// Style identity on a run. Layout emits **only** [`StyleId::Semantic`];

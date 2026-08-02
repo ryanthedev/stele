@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use ast::Document;
 use clap::Parser;
 use crossterm::event::{self, Event, KeyEvent, KeyEventKind};
-use layout::{IntrinsicSizer, LayoutConfig, layout};
+use layout::{Chrome, IntrinsicSizer, LayoutConfig, Padding, layout};
 use width::{WidthConfig, WidthEngine};
 
 use stele::app::{AppState, ChromeAction, LayoutContext, Mode, PendingAction, StatusMessage};
@@ -199,11 +199,33 @@ fn main() -> ExitCode {
         graphics_disabled,
         cell_px: geometry.cell_px,
     };
+    // The theme's furniture, with the two flags layered over it. `--no-chrome`
+    // wins over `--line-numbers` because "none of it" is the more specific
+    // request of the two, and a reader who typed both meant the stronger one.
+    let chrome = {
+        let mut chrome = theme.chrome();
+        if cli.line_numbers {
+            chrome.line_numbers = true;
+        }
+        if cli.no_chrome {
+            chrome = Chrome::none();
+        }
+        chrome
+    };
     let tree = {
         let ctx = session.ctx();
         layout(ctx.doc, size.width, ctx.config, ctx.engine, ctx.sizer)
     };
     let mut state = AppState::new(tree, size, file_info);
+    state.set_chrome(chrome);
+    // The gutter's width is a function of the document's line count, and
+    // nothing has counted the lines until the layout above has run — so
+    // furniture that takes cells costs one extra pass here, at startup, for a
+    // reader who asked for it. `apply_chrome` is the same path `#` uses.
+    if chrome.line_numbers || chrome.padding != Padding::default() {
+        let ctx = session.ctx();
+        state.apply_chrome(chrome, &ctx);
+    }
 
     let mut painter = Painter::new(WidthEngine::new(WidthConfig::default()));
     if graphics_disabled {
@@ -720,10 +742,11 @@ fn paint(state: &mut AppState, painter: &mut Painter, out: &mut dyn Write) -> io
                 search: state.search_overlay(),
                 selected: &selected,
             };
-            painter.frame_with_overlays(
+            painter.frame_page(
                 state.tree(),
                 state.scroll(),
                 state.size(),
+                state.page(),
                 &status,
                 overlays,
                 out,
@@ -796,6 +819,11 @@ fn handle_chrome_key(
         ChromeAction::CollapseAllFolds => {
             state.collapse_all();
             state.relayout_preserving_anchor(&ctx, *ctx.config);
+        }
+        ChromeAction::ToggleLineNumbers => {
+            let mut chrome = state.chrome();
+            chrome.line_numbers = !chrome.line_numbers;
+            state.apply_chrome(chrome, &ctx);
         }
     }
     true

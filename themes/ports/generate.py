@@ -28,7 +28,8 @@ import pathlib
 DARK_BG = (0x1a, 0x1b, 0x26)
 LIGHT_BG = (0xff, 0xff, 0xff)
 AA_TEXT, AA_NONTEXT = 4.5, 3.0
-STRUCTURAL = {"rule", "table_border", "blockquote", "list_marker", "task_marker", "overflow"}
+STRUCTURAL = {"rule", "table_border", "blockquote", "list_marker", "task_marker", "overflow",
+              "line_number", "line_number_current", "gutter_border"}
 
 
 def rgb(h):
@@ -81,6 +82,12 @@ COLORS = {
     "footnote_ref": "aqua", "footnote_label": "gray_light",
     "html": "gray_light", "front_matter": "gray_light", "overflow": "gray_light",
     "search_match": "yellow_bright", "search_current": "orange_bright",
+    # The gutter is chrome, so it follows the house convention like the rest of
+    # [colors] rather than being ported. `line_number_current` is the exception
+    # worth naming: it is the only glyph on the page that says where the reader
+    # is, so it takes the theme's brightest neutral rather than a quiet one.
+    "line_number": "gray", "line_number_current": "fg_bright",
+    "gutter_border": "gray_light",
 }
 
 COLOR_ORDER = ["text", "emphasis", "strong", "strikethrough",
@@ -90,7 +97,9 @@ COLOR_ORDER = ["text", "emphasis", "strong", "strikethrough",
                "alert_note", "alert_tip", "alert_important", "alert_warning",
                "alert_caution", "rule", "table_border", "table_header",
                "footnote_ref", "footnote_label", "html", "front_matter", "overflow",
-               "search_match", "search_current", "code_block_bg"]
+               "search_match", "search_current",
+               "line_number", "line_number_current", "gutter_border",
+               "code_block_bg", "current_line_bg"]
 
 SYNTAX_ORDER = ["plain", "comment", "comment_doc", "punctuation", "operator",
                 "keyword", "keyword_control", "label", "attribute",
@@ -106,6 +115,15 @@ PALETTES = {}
 # it is the one place stele can honestly reproduce the theme's page, because a
 # code block is a surface stele actually paints rather than one the terminal
 # owns.
+# Each project's own CursorLine, which is what `current_line_bg` is for. Read
+# from upstream rather than derived from BACKGROUNDS: every one of these
+# themes defines the band itself (Dracula literally names the colour "Current
+# Line"), and a computed approximation would be a worse port than the value
+# they published.
+CURSOR_LINES = {'gruvbox-dark': '#3c3836', 'gruvbox-light': '#ebdbb2',
+                'nord': '#3b4252', 'dracula': '#44475a',
+                'catppuccin-mocha': '#313244', 'tokyo-night': '#292e42'}
+
 BACKGROUNDS = {'gruvbox-dark': '#282828', 'gruvbox-light': '#fbf1c7', 'nord': '#2e3440', 'dracula': '#282a36', 'catppuccin-mocha': '#1e1e2e', 'tokyo-night': '#1a1b26'}
 
 
@@ -114,7 +132,7 @@ def theme(slug, name, appearance, upstream, source, blurb, ramp_ends, palette, s
     PALETTES[slug] = dict(name=name, appearance=appearance, upstream=upstream,
                           source=source, blurb=blurb, ramp=ramp(*ramp_ends),
                           palette=palette, syntax=syntax, notes=list(notes),
-                          code_bg=BACKGROUNDS[slug])
+                          code_bg=BACKGROUNDS[slug], cursor_line=CURSOR_LINES[slug])
 
 
 # ---------------------------------------------------------------- gruvbox ---
@@ -367,6 +385,7 @@ def render(slug, spec):
     p = spec["palette"]
     colors = {r: p[s] for r, s in COLORS.items()}
     colors["code_block_bg"] = spec["code_bg"]
+    colors["current_line_bg"] = spec["cursor_line"]
     for i, stop in enumerate(spec["ramp"], start=1):
         colors[f"heading{i}"] = stop
     # A syntax value is either a literal hex or a name in this theme's palette.
