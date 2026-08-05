@@ -1,0 +1,70 @@
+# Grid tables
+
+A grid table with a header rule:
+
++---------------+---------------+
+| Fruit         | Colour        |
++===============+===============+
+| apple         | red           |
++---------------+---------------+
+| lime          | green         |
++---------------+---------------+
+
+Headerless — nothing in this one is drawn with `=`:
+
++------+--------+
+| one  | first  |
++------+--------+
+| two  | second |
++------+--------+
+
+Alignment markers ride on the header separator:
+
++-------+-------+-------+
+| left  | mid   | right |
++:======+:=====:+======:+
+| a     | b     | c     |
++-------+-------+-------+
+
+A cell may be written over several lines. The fragments are joined with a
+single space, and inline markup is free to straddle the break:
+
++------------+------------------+
+| one        | see [the stele   |
+| two        | docs](/docs) for |
+| three      | the rest         |
++------------+------------------+
+
+Box art must stay prose. The borders drift, so this is a paragraph:
+
++----------+
+|  parser  |
++----+-----+
+     |
+     v
+   output
+
+So does a diagram whose rule line has gaps in it:
+
++------+      +------+
+| A    | ---> | B    |
++------+      +------+
+
+And so does a rule with no rows under it at all:
+
++--------+
++--------+
+
+Inside a fence the rule is literal:
+
+```text
++---+---+
+| a | b |
++---+---+
+```
+
+Indented four spaces it is code, not a table:
+
+    +---+
+    | a |
+    +---+

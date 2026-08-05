@@ -79,6 +79,47 @@ fn test_dw_2_3_pathological_inputs_stay_fast() {
     );
     assert_fast("whitespace lines", &" \n".repeat(n));
     assert_fast("setext candidates", &"a\n- \n".repeat(n / 2));
+
+    // Grid tables recognize themselves by scanning forward over the whole
+    // candidate table before opening anything, so every rule line that
+    // fails to become a table is a scan that has to be paid for. The
+    // argument that those scans partition the document rather than
+    // stacking up is written out in `parser/grid.rs`; these are the
+    // shapes it turns on, measured rather than reasoned about.
+    //
+    // "rules with no rows" is the one the argument is subtlest for: the
+    // 20,000 rule lines are a single paragraph, and the grid arm refuses
+    // to interrupt a paragraph, so only the first line is ever a
+    // candidate.
+    assert_fast("grid rules with no rows", &"+-+\n".repeat(n));
+    assert_fast("grid rows with no rules", &"| |\n".repeat(n));
+    assert_fast(
+        "grid rules one char short",
+        &"+---+\n| a |\n+--+\n".repeat(n / 3),
+    );
+    assert_fast(
+        "grid ragged column counts",
+        &"+-+-+\n| | |\n+-+\n".repeat(n / 3),
+    );
+    assert_fast(
+        "giant grid table",
+        &format!(
+            "+-----+-----+\n{}",
+            "| aaa | bbb |\n+-----+-----+\n".repeat(n / 2)
+        ),
+    );
+    assert_fast(
+        "grid table of one tall cell",
+        &format!("+-----+\n{}+-----+\n", "| aaa |\n".repeat(n)),
+    );
+    assert_fast(
+        "grid cells holding only bars",
+        &"+-+-+\n| | |\n+-+-+\n".repeat(n / 3),
+    );
+    assert_fast(
+        "grid table unclosed at eof",
+        &format!("+-----+\n{}", "| aaa |\n".repeat(n)),
+    );
 }
 
 #[test]

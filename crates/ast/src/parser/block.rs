@@ -6,11 +6,13 @@
 //! for each line:
 //!     match the continuation prefix of every open block, outermost first
 //!         (blockquote '>', list-item indent, code-fence close, html end,
-//!          paragraph non-blank, footnote indent, table row)
+//!          paragraph non-blank, footnote indent, table row,
+//!          grid-table extent)
 //!     unless the deepest matched leaf consumes text lines outright,
 //!         repeatedly try to open new blocks at the current position
 //!         (blockquote, ATX, fence, html, setext, thematic break,
-//!          footnote definition, list item, indented code, GFM table)
+//!          footnote definition, list item, grid table, indented code,
+//!          GFM table)
 //!         closing unmatched blocks the moment the first new one opens
 //!     add remaining text to the tip:
 //!         lazy paragraph continuation if nothing matched or opened,
@@ -23,7 +25,7 @@
 //! spans survive into the original text.
 
 use super::scan;
-use super::{Leaf, MAX_CONTAINER_DEPTH, ParseOptions, PreBlock, PreKind, PreRow, RefMap};
+use super::{Leaf, MAX_CONTAINER_DEPTH, ParseOptions, PreBlock, PreKind, PreRow, RefMap, grid};
 use crate::ast::{AlertKind, Alignment, ListKind, Span};
 
 const TAB_STOP: usize = 4;
@@ -68,6 +70,15 @@ enum OpenKind {
         html_type: u8,
     },
     Table {
+        alignments: Vec<Alignment>,
+        rows: Vec<PreRow>,
+    },
+    /// A Pandoc grid table, already parsed in full by [`grid::scan`]. The
+    /// block only stays open so the lines it covers are consumed rather
+    /// than re-offered to the other openers; `end` is the byte just past
+    /// its closing rule line.
+    GridTable {
+        end: usize,
         alignments: Vec<Alignment>,
         rows: Vec<PreRow>,
     },
@@ -435,6 +446,11 @@ impl<'s> BlockParser<'s> {
                 },
                 OpenKind::Paragraph => !self.blank,
                 OpenKind::Table { .. } => !self.blank && !self.breaks_table(),
+                // The grid table's extent was fixed when it was opened, so
+                // continuation is pure arithmetic: no line inside it can
+                // start or break anything, because every one of them was
+                // already validated as a rule or a cell row.
+                OpenKind::GridTable { end, .. } => self.line_start < *end,
                 OpenKind::Heading { .. } | OpenKind::ThematicBreak => false,
             };
             if !matched {
@@ -486,7 +502,8 @@ impl<'s> BlockParser<'s> {
                 OpenKind::FencedCode { .. }
                 | OpenKind::IndentedCode
                 | OpenKind::HtmlBlock { .. }
-                | OpenKind::Table { .. } => break,
+                | OpenKind::Table { .. }
+                | OpenKind::GridTable { .. } => break,
                 _ => {}
             }
             let is_paragraph = matches!(self.open[container].kind, OpenKind::Paragraph);
@@ -619,6 +636,51 @@ impl<'s> BlockParser<'s> {
                 }
                 container = self.open_child(container, OpenKind::Item(data), start);
                 opened = true;
+            } else if !indented
+                && !maybe_lazy
+                && !is_paragraph
+                && self.opts.grid_tables
+                && self.peek(fns) == Some(b'+')
+                && let Some(table) = grid::scan(self.src, self.line_start)
+            {
+                // Pandoc grid table. Three guards earn their keep here:
+                //
+                // `!indented` — without it this arm would sit in front of
+                // the indented-code arm below and steal a `+---+` that a
+                // four-space indent had already handed to a code block.
+                //
+                // `!maybe_lazy` and `!is_paragraph` — a rule line directly
+                // under paragraph text stays paragraph text (lazily
+                // continued or not). Pandoc wants a blank line before a
+                // table, and refusing to interrupt keeps prose that merely
+                // happens to contain `+--+` out of the table path.
+                //
+                // `grid::scan` is handed the whole *physical* line, not the
+                // position the container walk reached, because it has to
+                // measure the table's own indent and hold every later line
+                // to it. That is what lets a table sit under three spaces
+                // of indent, or inside a list item whose content prefix is
+                // plain spaces; it is also why a table inside a blockquote
+                // does not parse — `> ` is not an indent the scan can strip.
+                //
+                // The scan has already validated and parsed the whole
+                // table, so there is nothing left to do per line: open the
+                // block, swallow this line, and let `check_open_blocks`
+                // count the rest off against `end`.
+                let start = self.line_start + fns;
+                self.close_down_to(container, &mut opened);
+                self.open_child(
+                    container,
+                    OpenKind::GridTable {
+                        end: table.end,
+                        alignments: table.alignments,
+                        rows: table.rows,
+                    },
+                    start,
+                );
+                opened = true;
+                self.offset = self.line.len();
+                break;
             } else if indented && !maybe_lazy && !self.blank {
                 self.close_down_to(container, &mut opened);
                 self.advance_offset(TAB_STOP, true);
@@ -747,6 +809,12 @@ impl<'s> BlockParser<'s> {
                 if !self.blank {
                     self.add_table_row();
                 }
+                self.update_span_ends(tip);
+            }
+            // Grid-table lines carry no work: the rows were built during
+            // the lookahead that opened the block. All the line does is
+            // extend the span so the table covers its closing rule.
+            OpenKind::GridTable { .. } => {
                 self.update_span_ends(tip);
             }
             _ if self.blank => {
@@ -937,6 +1005,16 @@ impl<'s> BlockParser<'s> {
                 })
             }
             OpenKind::Table { alignments, rows } => Some(PreBlock {
+                span,
+                kind: PreKind::Table { alignments, rows },
+                last_line_blank: false,
+            }),
+            // Grid tables lower into the same PreKind as GFM tables: one
+            // shape reaches layout, HTML and decor, whichever syntax wrote
+            // it.
+            OpenKind::GridTable {
+                alignments, rows, ..
+            } => Some(PreBlock {
                 span,
                 kind: PreKind::Table { alignments, rows },
                 last_line_blank: false,

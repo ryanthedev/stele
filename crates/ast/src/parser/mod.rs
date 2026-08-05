@@ -18,6 +18,7 @@ use std::collections::HashMap;
 
 mod block;
 mod entities;
+mod grid;
 mod inline;
 pub(crate) mod scan;
 mod tables;
@@ -33,6 +34,10 @@ pub(crate) const MAX_CONTAINER_DEPTH: usize = 200;
 pub struct ParseOptions {
     /// GFM tables.
     pub tables: bool,
+    /// Pandoc grid tables (`+---+`/`+===+` rules with `|` cell borders).
+    /// Independent of [`ParseOptions::tables`]: they share an output type
+    /// but not a code path.
+    pub grid_tables: bool,
     /// GFM strikethrough (`~~`).
     pub strikethrough: bool,
     /// GFM task-list items (`- [x]`).
@@ -53,6 +58,7 @@ impl Default for ParseOptions {
     fn default() -> Self {
         ParseOptions {
             tables: true,
+            grid_tables: true,
             strikethrough: true,
             task_lists: true,
             autolinks: true,
@@ -69,6 +75,7 @@ impl ParseOptions {
     pub fn commonmark() -> Self {
         ParseOptions {
             tables: false,
+            grid_tables: false,
             strikethrough: false,
             task_lists: false,
             autolinks: false,
