@@ -80,9 +80,10 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let options = LoadOptions {
-        show_frontmatter: cli.frontmatter,
-    };
+    // Built by `Cli` rather than assembled here, so the flag-to-policy mapping
+    // — including "no `--fetch-remote` means no fetcher exists" — lives
+    // somewhere unit-testable. This file is not (see the module doc).
+    let options = cli.load_options();
 
     // Resolved here, alongside `--watch -` and before the terminal is touched,
     // for the same reason: a `--theme` path that does not load should fail on

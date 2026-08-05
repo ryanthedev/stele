@@ -12,12 +12,22 @@ use layout::Reserved;
 
 use crate::painter::CellRect;
 
+/// The content-addressed on-disk store a fetched remote image lands in.
+pub mod cache;
+/// The network seam: the [`fetch::Fetcher`] trait, its bounds, and the one
+/// real HTTP implementation. Nothing else in this workspace opens a socket.
+pub mod fetch;
+/// `--fetch-remote`: rewriting `![alt](https://…)` to a cache path *before*
+/// the parse, so the existing local-image pipeline draws it unchanged.
+pub mod remote;
 mod residency;
 mod rung;
 mod sink;
 mod sizer;
 mod text_sink;
 
+pub use fetch::{FetchError, FetchLimits, Fetched, Fetcher};
+pub use remote::RemoteImages;
 pub use sink::GfxMediaSink;
 pub use sizer::ImageSizer;
 pub use text_sink::TextMediaSink;

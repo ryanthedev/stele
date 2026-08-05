@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use clap::Parser;
 
-use crate::loader::DocumentSource;
+use crate::loader::{DocumentSource, LoadOptions};
 
 /// Commit + build time this binary was produced from, stamped by `build.rs`.
 /// Shown by `--version` and painted in the viewport corner, so "the fix does
@@ -44,10 +44,10 @@ pub struct Cli {
     #[arg(long)]
     pub max_width: Option<u16>,
 
-    /// Disables image and math rendering: alt text / TeX source is shown
-    /// instead. `main.rs` folds this into `graphics_disabled`, which selects
-    /// `ImageSizer::disabled` and `NoopMediaSink`, so no box is ever reserved
-    /// and the media sink is never invoked.
+    /// Draws no images and no formulae: an image shows its alt text and a
+    /// formula its TeX source, in the flow of the page. Nothing is
+    /// transmitted to the terminal and no space is reserved, so the page is
+    /// exactly as tall as its text.
     #[arg(long)]
     pub no_images: bool,
 
@@ -55,6 +55,17 @@ pub struct Cli {
     /// `main.rs` passes this to `decor::frontmatter::apply` before the parse.
     #[arg(long)]
     pub frontmatter: bool,
+
+    /// Reads the file as written, without rewriting Dive-into-Deep-Learning
+    /// roles, Quarto callouts or CodeCogs equation images into their plain
+    /// markdown equivalents.
+    ///
+    /// Those rewrites delete and reshape source lines, which is a large
+    /// thing to do quietly — so, like `--frontmatter`, they come with a way
+    /// to say no. `--no-rewrite` leaves frontmatter hiding and mermaid
+    /// rendering alone; both predate this flag and neither is changing.
+    #[arg(long)]
+    pub no_rewrite: bool,
 
     /// Uses the theme in this file instead of the built-in colors, and
     /// instead of `~/.config/stele/theme.toml` if one is there.
@@ -73,6 +84,28 @@ pub struct Cli {
     /// `docs/theming.md`.
     #[arg(long)]
     pub line_numbers: bool,
+
+    /// Downloads `![alt](https://…)` images and draws them, instead of
+    /// showing their alt text.
+    ///
+    /// **Off unless you type it, and that is a stance rather than caution.**
+    /// A markdown file whose images are URLs is a file that reports who read
+    /// it, when, and from where, to whoever wrote it — opening a document is
+    /// not consent to be counted. So stele asks for nothing by default and
+    /// makes exactly zero requests until this flag says otherwise.
+    ///
+    /// What it fetches is bounded on every axis (`http`/`https` only, a
+    /// connect and a request timeout, a whole-document budget, a response-size
+    /// ceiling and a redirect cap), cached under `$XDG_CACHE_HOME/stele` so a
+    /// second read costs nothing, and allowed to fail: an image that times
+    /// out, 404s or comes back as something other than a picture goes back to
+    /// being its alt text, and never stops the document opening.
+    ///
+    /// Composes with `--no-rewrite` rather than being cancelled by it — see
+    /// `README.md`.
+    #[cfg(feature = "remote-images")]
+    #[arg(long)]
+    pub fetch_remote: bool,
 
     /// Strips every piece of furniture for this run: no padding, no gutter,
     /// no band under the reading line, whatever the theme says.
@@ -129,6 +162,37 @@ impl Cli {
             return Err(CliError::WatchStdin);
         }
         Ok(DocumentSource::Stdin)
+    }
+
+    /// The source-text policy these flags name.
+    ///
+    /// Lives here rather than in `main.rs` on purpose: `main.rs` is not
+    /// unit-tested (its own module doc says so), and "what does the default
+    /// command line do about the network" is exactly the question that must
+    /// not rest on an untested mapping. With this function the whole chain —
+    /// no flag, `None` policy, no call site, no request — is assertable from
+    /// `Cli::parse_from`.
+    pub fn load_options(&self) -> LoadOptions {
+        LoadOptions {
+            show_frontmatter: self.frontmatter,
+            rewrite_source: !self.no_rewrite,
+            remote: self.remote_policy(),
+        }
+    }
+
+    /// The process-wide fetcher, if `--fetch-remote` was typed.
+    #[cfg(feature = "remote-images")]
+    fn remote_policy(&self) -> Option<&'static crate::media::RemoteImages> {
+        self.fetch_remote.then(crate::media::remote::production)
+    }
+
+    /// Without the `remote-images` feature there is no client compiled in, no
+    /// flag to type, and therefore no policy — the same `None` the default
+    /// command line produces, reached by a route that has no network code
+    /// behind it at all.
+    #[cfg(not(feature = "remote-images"))]
+    fn remote_policy(&self) -> Option<&'static crate::media::RemoteImages> {
+        None
     }
 }
 
@@ -202,8 +266,105 @@ mod tests {
 
     #[test]
     fn test_flags_are_parsed_and_stored() {
-        let cli = Cli::parse_from(["stele", "file.md", "--no-images", "--frontmatter"]);
+        let cli = Cli::parse_from([
+            "stele",
+            "file.md",
+            "--no-images",
+            "--frontmatter",
+            "--no-rewrite",
+        ]);
         assert!(cli.no_images);
         assert!(cli.frontmatter);
+        assert!(cli.no_rewrite);
+        assert!(!Cli::parse_from(["stele", "file.md"]).no_rewrite);
+    }
+
+    /// The privacy default, asserted where it is actually decided.
+    ///
+    /// Not "the flag defaults to false" — that is a fact about clap. This is
+    /// the fact that matters: an ordinary command line produces a policy with
+    /// **no fetcher in it**, so `loader::preprocess` has nothing to call and
+    /// no request can be made however the rest of the pipeline behaves. The
+    /// other flags are checked alongside it so a future edit that reshuffles
+    /// this mapping cannot quietly swap two fields.
+    #[test]
+    fn test_an_ordinary_command_line_names_no_fetcher_at_all() {
+        let options = Cli::parse_from(["stele", "file.md"]).load_options();
+        assert!(
+            options.remote.is_none(),
+            "the default command line installed a fetcher"
+        );
+        assert!(!options.show_frontmatter);
+        assert!(options.rewrite_source);
+
+        // And neither does any other flag: nothing but `--fetch-remote` may
+        // turn the network on, so every one of them is tried here.
+        for args in [
+            vec!["stele", "file.md", "--frontmatter"],
+            vec!["stele", "file.md", "--no-rewrite"],
+            vec!["stele", "file.md", "--no-images"],
+            vec!["stele", "file.md", "--watch"],
+            vec!["stele", "file.md", "--line-numbers"],
+            vec!["stele", "file.md", "--no-chrome"],
+            vec!["stele", "file.md", "--max-width", "60"],
+            vec!["stele", "-"],
+        ] {
+            assert!(
+                Cli::parse_from(args.clone())
+                    .load_options()
+                    .remote
+                    .is_none(),
+                "{args:?} installed a fetcher"
+            );
+        }
+    }
+
+    /// The other half: the flag actually reaches the policy. Without this the
+    /// test above would pass just as well against a `--fetch-remote` that
+    /// parses and does nothing.
+    #[cfg(feature = "remote-images")]
+    #[test]
+    fn test_fetch_remote_is_the_one_flag_that_installs_a_fetcher() {
+        let cli = Cli::parse_from(["stele", "file.md", "--fetch-remote"]);
+        assert!(cli.fetch_remote);
+        assert!(cli.load_options().remote.is_some());
+
+        // It composes with `--no-rewrite` rather than being cancelled by it —
+        // the two answer different questions, and `media::remote`'s module doc
+        // argues why. A reader who typed both gets both.
+        let both =
+            Cli::parse_from(["stele", "file.md", "--fetch-remote", "--no-rewrite"]).load_options();
+        assert!(
+            both.remote.is_some(),
+            "--no-rewrite silently cancelled --fetch-remote"
+        );
+        assert!(!both.rewrite_source);
+    }
+
+    /// `--help` is user-facing text. It may name flags, files and what the
+    /// reader will see; it may not name the types and structs that happen to
+    /// implement any of it — those are ours to rename, and a reader has no
+    /// way to look one up.
+    #[test]
+    fn test_the_help_text_describes_behaviour_and_never_an_internal_name() {
+        let help = <Cli as clap::CommandFactory>::command()
+            .render_long_help()
+            .to_string();
+        for internal in [
+            "graphics_disabled",
+            "ImageSizer",
+            "NoopMediaSink",
+            "MediaSink",
+            "LoadOptions",
+            "Decor",
+        ] {
+            assert!(
+                !help.contains(internal),
+                "--help names the internal {internal}:\n{help}"
+            );
+        }
+        // It still has to say what the flags do.
+        assert!(help.contains("alt text"), "{help}");
+        assert!(help.contains("--no-rewrite"), "{help}");
     }
 }

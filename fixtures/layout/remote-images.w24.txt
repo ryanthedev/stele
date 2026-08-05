@@ -1,0 +1,99 @@
+▌ Remote images         
+────────────────────────
+
+Every image below has a
+destination stele will
+not open on its own.
+With no flag it makes no
+request at all and each
+one renders as its alt
+text, which is what the
+goldens beside this file
+record.
+
+A plain HTTPS image:
+
+a scatter plot of the
+residuals
+
+An SVG, which gfx
+renders as well as it
+renders a raster — the
+format is sniffed from
+the bytes, so a fetched
+vector goes down exactly
+the same path:
+
+the network architecture
+
+Plain HTTP, and one
+carrying a title:
+
+an older diagram
+
+the loss curve
+
+Two on one line, with
+prose between them: the
+first pass then the
+second.
+
+A URL with parentheses
+in it, which a scanner
+that stops at the first
+) gets wrong:
+
+a file with brackets
+
+▌▌ Things that must
+   never be fetched
+────────────────────────
+
+A link to an image is
+not an image. Following
+it is the reader's
+decision, made by
+pressing a key, not a
+consequence of opening
+the page:
+
+the full-size version
+
+An autolink is not one
+either:
+https://example.com/diag
+rams/residuals.png
+
+Schemes other than http
+and https are refused by
+name, on the original
+URL and on every
+redirect hop:
+
+a local file read
+
+bytes smuggled inline
+
+Anything inside a fence
+is quoted, not requested
+— a document about
+remote images would
+otherwise fetch every
+URL it documents:
+
+![this is an example, n…
+
+![indented code is code…
+
+▌▌ Local images are
+   unaffected
+────────────────────────
+
+The pipeline below this
+pass does not know a
+network exists, so a
+relative path behaves
+exactly as it always
+has:
+
+a local diagram

@@ -105,7 +105,7 @@ pub fn document_from_text(text: &str, name: String, options: LoadOptions) -> Loa
         byte_size: text.len() as u64,
         line_count: text.lines().count(),
     };
-    let prepared = crate::decor::frontmatter::apply(text, options.show_frontmatter);
+    let prepared = preprocess(text, options);
     let doc = crate::decor::mermaid::parse(&prepared);
     LoadedDocument {
         doc: Rc::new(doc),
@@ -113,12 +113,117 @@ pub fn document_from_text(text: &str, name: String, options: LoadOptions) -> Loa
     }
 }
 
+/// Every source-text rewrite, in the one order they are allowed to run in.
+///
+/// `frontmatter` first because it can only ever act on the very start of the
+/// file and the passes after it would otherwise have to know that a stripped
+/// block used to be there. Then `codecogs`, whose input is an image link and
+/// whose output is maths — it must run before anything that could edit the
+/// line the link sits on. Then `d2l`, then `quarto`, which is the only pass
+/// that changes a line's *block* structure, so it goes last and reads text
+/// the others have already settled.
+///
+/// **A consequence worth stating.** `mermaid::parse` runs after all of them
+/// and, by its own documented rule (`decor/mermaid.rs:13-15`), only renders
+/// *top-level* mermaid fences. A ` ```mermaid ` fence that began at the top
+/// level and ends up inside a callout that `quarto` turned into a blockquote
+/// is no longer top level, so it renders as a plain code block rather than
+/// as a diagram. That is the same fallback a mermaid fence in a list or a
+/// blockquote already gets, reached by a new route.
+///
+/// **The remote-image pass runs last, and outside the `--no-rewrite` gate.**
+/// Last because it must not fetch anything the passes above would have
+/// deleted — `codecogs` turns a `latex.codecogs.com` image into `$…$` maths,
+/// and running the network before it would have downloaded an equation
+/// picture stele was about to replace with the equation. Outside the gate
+/// because `--no-rewrite` is about what the document *says* and this pass
+/// changes none of it; `media::remote`'s module doc argues that at length,
+/// including the one behaviour it implies (under `--no-rewrite` a CodeCogs
+/// image stays an image and so is fetched).
+///
+/// This is also the only pass here that can block: it is the reason
+/// [`FetchLimits::document_budget`](crate::media::FetchLimits::document_budget)
+/// exists, and it runs before the terminal is entered so a slow host delays
+/// the first frame rather than freezing a live one.
+fn preprocess(text: &str, options: LoadOptions) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+
+    let mut current = crate::decor::frontmatter::apply(text, options.show_frontmatter);
+    if options.rewrite_source {
+        let passes: [for<'a> fn(&'a str) -> Cow<'a, str>; 3] = [
+            crate::decor::codecogs::apply,
+            crate::decor::d2l::apply,
+            crate::decor::quarto::apply,
+        ];
+        for pass in passes {
+            // The `match` (rather than `if let`) is what ends the borrow of
+            // `current` before the reassignment: a pass that changed nothing
+            // hands back a slice of the very string being replaced.
+            let rewritten = match pass(&current) {
+                Cow::Borrowed(_) => None,
+                Cow::Owned(text) => Some(text),
+            };
+            if let Some(text) = rewritten {
+                current = Cow::Owned(text);
+            }
+        }
+    }
+    // `None` — the default, and what every run without `--fetch-remote` gets —
+    // does not reach this pass at all. That is the whole privacy claim: not a
+    // network call that declines, but no call site.
+    if let Some(remote) = options.remote {
+        let rewritten = match remote.rewrite(&current) {
+            Cow::Borrowed(_) => None,
+            Cow::Owned(text) => Some(text),
+        };
+        if let Some(text) = rewritten {
+            current = Cow::Owned(text);
+        }
+    }
+    current
+}
+
 /// Source-text preprocessing policy, fixed for a session by the CLI.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct LoadOptions {
     /// `--frontmatter`: show a leading YAML block as ordinary content
     /// instead of hiding it. Default (`false`) hides it.
     pub show_frontmatter: bool,
+    /// Whether the d2l, Quarto and CodeCogs source rewrites run.
+    /// `--no-rewrite` turns them off; see [`Default`] below for why the
+    /// default is `true` and the field is not named for the flag.
+    pub rewrite_source: bool,
+    /// `--fetch-remote`: how a `![alt](https://…)` image is resolved, and
+    /// whether it is resolved at all. **`None` — the default — never touches
+    /// the network**, and does so by never calling the pass rather than by
+    /// calling a pass that declines.
+    ///
+    /// `&'static` rather than owned or `Rc` so this struct stays `Copy`: it is
+    /// passed by value into `crate::link`'s `Navigator` and back out of the
+    /// `--watch` reload, and there is exactly one of these per process anyway
+    /// (`media::remote::production`).
+    pub remote: Option<&'static crate::media::RemoteImages>,
+}
+
+impl Default for LoadOptions {
+    /// The default *policy*, not the zero value — which is why this is
+    /// written out rather than derived. The rewrites are on by default
+    /// because a d2l or Quarto document is unreadable without them; the
+    /// escape hatch exists for the reader who wants to see the file as it
+    /// was written, exactly as `--frontmatter` exists for the reader who
+    /// wants to see the block stele hides.
+    ///
+    /// Remote fetching is the one policy here that defaults *off*, and it is
+    /// the only one whose default is a stance rather than a convenience: a
+    /// markdown file that makes a network request the moment it is opened is
+    /// a tracking vector, and opening a document is not consent to be counted.
+    fn default() -> Self {
+        LoadOptions {
+            show_frontmatter: false,
+            rewrite_source: true,
+            remote: None,
+        }
+    }
 }
 
 /// One load's product: the parsed document, shared rather than copied, plus
@@ -266,7 +371,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::media::GfxMediaSink;
+    use crate::media::{GfxMediaSink, RemoteImages};
 
     /// A scratch file unique to `tag`, so tests running concurrently in the
     /// same process cannot see each other's writes.
@@ -324,6 +429,7 @@ mod tests {
         let shown = source
             .load_with(LoadOptions {
                 show_frontmatter: true,
+                ..LoadOptions::default()
             })
             .unwrap();
         std::fs::remove_file(&path).ok();
@@ -334,6 +440,103 @@ mod tests {
         // The policy still reaches the parse: hiding the block leaves fewer
         // blocks than showing it does.
         assert!(hidden.doc.blocks().len() < shown.doc.blocks().len());
+    }
+
+    /// The source rewrites reach the parse, and reach it in the documented
+    /// order: `codecogs` turns an image into maths, `d2l` strips the roles
+    /// around it, `quarto` turns the callout it all sits in into an alert.
+    /// A pass running out of turn — `quarto` before `d2l`, say — would quote
+    /// the `:label:` line instead of dropping it, and the alert would come
+    /// out with a line of Sphinx in it.
+    #[test]
+    fn test_the_source_rewrites_reach_the_parse_in_the_documented_order() {
+        let raw = concat!(
+            "::: {.callout-note}\n",
+            ":label:`sec_x`\n",
+            "See :numref:`fig_y`, and ",
+            "![e](http://latex.codecogs.com/svg.latex?x%5E2).\n",
+            ":::\n",
+        );
+        let path = scratch("rewrites", raw);
+        let loaded = DocumentSource::Path(path.clone()).load().unwrap();
+        std::fs::remove_file(&path).ok();
+
+        let blocks = loaded.doc.blocks();
+        assert_eq!(blocks.len(), 1, "{blocks:?}");
+        let ast::BlockKind::Alert { kind, children } = &blocks[0].kind else {
+            panic!("expected an alert, got {:?}", blocks[0].kind);
+        };
+        assert_eq!(*kind, ast::AlertKind::Note);
+        let dumped = format!("{children:?}");
+        assert!(!dumped.contains(":label:"), "{dumped}");
+        assert!(!dumped.contains(":numref:"), "{dumped}");
+        assert!(!dumped.contains("codecogs"), "{dumped}");
+        assert!(dumped.contains("x^2"), "the maths must survive: {dumped}");
+    }
+
+    /// R4's escape hatch. The same document, read as written: every
+    /// construct still there, and — because nothing was rewritten — the same
+    /// number of source lines the reader would see in an editor.
+    #[test]
+    fn test_no_rewrite_shows_the_document_exactly_as_written() {
+        let raw = "::: {.callout-note}\n:label:`sec_x`\nBody.\n:::\n";
+        let path = scratch("no-rewrite", raw);
+        let source = DocumentSource::Path(path.clone());
+        let as_written = source
+            .load_with(LoadOptions {
+                rewrite_source: false,
+                ..LoadOptions::default()
+            })
+            .unwrap();
+        let rewritten = source.load().unwrap();
+        std::fs::remove_file(&path).ok();
+
+        let dumped = format!("{:?}", as_written.doc.blocks());
+        assert!(dumped.contains(":::"), "{dumped}");
+        assert!(dumped.contains(":label:"), "{dumped}");
+        assert!(
+            !matches!(
+                as_written.doc.blocks()[0].kind,
+                ast::BlockKind::Alert { .. }
+            ),
+            "nothing may have been rewritten"
+        );
+        // And the flag really is the only difference.
+        assert!(matches!(
+            rewritten.doc.blocks()[0].kind,
+            ast::BlockKind::Alert { .. }
+        ));
+    }
+
+    /// The documented consequence of running `mermaid::parse` last: a fence
+    /// that *was* top level is not top level any more once `quarto` has
+    /// wrapped it in a blockquote, and `decor/mermaid.rs:13-15` only renders
+    /// top-level fences. It falls back to a plain code block — the same
+    /// fallback a mermaid fence in a list already gets, reached by a new
+    /// route. Pinned so the fallback is a decision rather than a surprise.
+    #[test]
+    fn test_a_mermaid_fence_inside_a_rewritten_callout_falls_back_to_a_code_block() {
+        assert!(
+            mermaid::render("graph TD\n  A-->B\n").is_ok(),
+            "graph TD must render for this test to mean anything"
+        );
+        let raw = "::: {.callout-note}\n```mermaid\ngraph TD\n  A-->B\n```\n:::\n";
+        let path = scratch("mermaid-in-callout", raw);
+        let loaded = DocumentSource::Path(path.clone()).load().unwrap();
+        std::fs::remove_file(&path).ok();
+
+        let ast::BlockKind::Alert { children, .. } = &loaded.doc.blocks()[0].kind else {
+            panic!("expected an alert, got {:?}", loaded.doc.blocks()[0].kind);
+        };
+        let ast::BlockKind::CodeBlock { info, literal, .. } = &children[0].kind else {
+            panic!("expected a code block, got {:?}", children[0].kind);
+        };
+        assert_eq!(
+            info.as_deref(),
+            Some("mermaid"),
+            "the fence keeps its unrendered mermaid tag"
+        );
+        assert_eq!(literal, "graph TD\n  A-->B\n");
     }
 
     /// DW-2.5: the load path parses once, not twice. Asserted on an
@@ -401,6 +604,222 @@ mod tests {
         );
         drop(sink);
         assert_eq!(Rc::strong_count(&loaded.doc), 1);
+    }
+
+    /// A document with several remote images in it, plus prose either side so
+    /// a rewrite that eats a line is visible.
+    const REMOTE_DOC: &str = concat!(
+        "# Diagrams\n",
+        "\n",
+        "![the first](https://example.com/one.png)\n",
+        "\n",
+        "Some prose between them.\n",
+        "\n",
+        "![the second](https://example.com/two.png) inline with ",
+        "![the third](https://example.com/three.png)\n",
+    );
+
+    /// A `RemoteImages` over a counting fake, leaked to `'static` because
+    /// [`LoadOptions`] holds it that way — see the field's doc for why that
+    /// struct must stay `Copy`. A leak in a test is bounded by the test binary.
+    fn leaked_remote(dir: &Path, log: &crate::media::fetch::fake::Log) -> &'static RemoteImages {
+        use crate::media::cache::{Cache, DEFAULT_CACHE_BYTES};
+        use crate::media::fetch::fake::{Fake, png};
+
+        Box::leak(Box::new(RemoteImages::new(
+            Box::new(Fake::serving(log, png(48, 48))),
+            Cache::at(dir, DEFAULT_CACHE_BYTES),
+            crate::media::FetchLimits::default(),
+        )))
+    }
+
+    /// One painted frame of `doc`, byte for byte as the viewer would emit it.
+    fn frame_of(doc: &Document, base_dir: &Path) -> Vec<u8> {
+        use layout::{LayoutConfig, layout};
+        use width::{WidthConfig, WidthEngine};
+
+        use crate::painter::{Painter, Size};
+
+        let engine = WidthEngine::new(WidthConfig::default());
+        let sizer = crate::media::ImageSizer::new(base_dir);
+        let tree = layout(doc, 80, &LayoutConfig::default(), &engine, &sizer);
+        let mut painter = Painter::new(WidthEngine::new(WidthConfig::default()));
+        let mut buf = Vec::new();
+        painter
+            .frame(
+                &tree,
+                0,
+                Size {
+                    width: 80,
+                    height: 24,
+                },
+                &mut buf,
+            )
+            .unwrap();
+        buf
+    }
+
+    /// **The privacy claim, at the level it is claimed.** A document full of
+    /// remote images, loaded under the default policy, with a working fetcher
+    /// sitting right there in the process: zero requests, and a frame that is
+    /// byte-identical to today's alt-text path.
+    ///
+    /// The fake is deliberately *constructed and never installed*. A test that
+    /// simply omitted it would assert nothing — it would pass against a build
+    /// with no fetching code at all — so the fetcher here is real, ready, and
+    /// asked for nothing.
+    ///
+    /// The byte-identity oracle is independent of this file: the comparison
+    /// frame is painted from `Document::parse(REMOTE_DOC)` directly, with the
+    /// whole preprocessing chain bypassed. If any pass had touched the
+    /// document — the remote one included — the two frames would differ.
+    #[test]
+    fn test_the_default_policy_fetches_nothing_and_paints_todays_alt_text_frame() {
+        let dir = std::env::temp_dir().join(format!("stele-loader-off-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = crate::media::fetch::fake::Log::default();
+        let _ready_but_uninstalled = leaked_remote(&dir, &log);
+
+        let path = scratch("remote-off", REMOTE_DOC);
+        let options = LoadOptions::default();
+        assert!(
+            options.remote.is_none(),
+            "the default policy names a fetcher"
+        );
+        let loaded = DocumentSource::Path(path.clone())
+            .load_with(options)
+            .unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(
+            log.calls(),
+            0,
+            "the default policy fetched {:?}",
+            log.urls()
+        );
+        assert_eq!(
+            frame_of(&loaded.doc, &dir),
+            frame_of(&Document::parse(REMOTE_DOC), &dir),
+            "the flag-off frame differs from an untouched parse of the same source"
+        );
+        // And what that frame contains is the alt text, not a path.
+        let painted = String::from_utf8_lossy(&frame_of(&loaded.doc, &dir)).into_owned();
+        for alt in ["the first", "the second", "the third"] {
+            assert!(painted.contains(alt), "{alt} is missing from the frame");
+        }
+        assert!(
+            !painted.contains(dir.to_str().unwrap()),
+            "a cache path reached the screen"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The same document with the policy installed: three requests, three
+    /// destinations inside the cache, and a frame that is no longer the
+    /// alt-text one. Without this the test above would pass equally well
+    /// against a `--fetch-remote` that is wired to nothing.
+    #[test]
+    fn test_the_installed_policy_resolves_every_remote_image_through_the_loader() {
+        let dir = std::env::temp_dir().join(format!("stele-loader-on-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = crate::media::fetch::fake::Log::default();
+        let remote = leaked_remote(&dir, &log);
+
+        let path = scratch("remote-on", REMOTE_DOC);
+        let source = DocumentSource::Path(path.clone());
+        let options = LoadOptions {
+            remote: Some(remote),
+            ..LoadOptions::default()
+        };
+        let loaded = source.load_with(options).unwrap();
+
+        assert_eq!(
+            log.urls(),
+            vec![
+                "https://example.com/one.png".to_string(),
+                "https://example.com/two.png".to_string(),
+                "https://example.com/three.png".to_string(),
+            ]
+        );
+        let dests: Vec<String> = loaded
+            .doc
+            .nodes()
+            .filter_map(|node| match node {
+                ast::NodeRef::Inline(inline) => match &inline.kind {
+                    ast::InlineKind::Image { dest, .. } => Some(dest.clone()),
+                    _ => None,
+                },
+                ast::NodeRef::Block(_) => None,
+            })
+            .collect();
+        assert_eq!(dests.len(), 3, "{dests:?}");
+        for dest in &dests {
+            assert_eq!(
+                Path::new(dest).parent(),
+                Some(dir.as_path()),
+                "{dest} is not in the cache"
+            );
+            assert!(Path::new(dest).is_file(), "{dest} was not written");
+        }
+        assert_ne!(
+            frame_of(&loaded.doc, &dir),
+            frame_of(&Document::parse(REMOTE_DOC), &dir),
+            "the resolved document painted the same frame as the untouched one"
+        );
+
+        // A second load of the same document costs nothing more: the whole
+        // point of the cache, asserted through the loader rather than through
+        // the pass.
+        source.load_with(options).unwrap();
+        assert_eq!(log.calls(), 3, "the reload refetched: {:?}", log.urls());
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `--no-rewrite` does not cancel `--fetch-remote`. The two answer
+    /// different questions — one is about what the document *says*, the other
+    /// about whether its pictures are drawn — and `media::remote`'s module doc
+    /// argues the case. Pinned here because "these flags compose" is the kind
+    /// of decision a later refactor folds into one gate by accident.
+    #[test]
+    fn test_no_rewrite_leaves_remote_fetching_alone() {
+        let dir = std::env::temp_dir().join(format!("stele-loader-both-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = crate::media::fetch::fake::Log::default();
+        let remote = leaked_remote(&dir, &log);
+
+        // A Quarto callout the rewrite would normally consume, with a remote
+        // image inside it: one flag must leave the callout alone and the other
+        // must still resolve the image.
+        let raw = concat!(
+            "::: {.callout-note}\n",
+            "![a diagram](https://example.com/one.png)\n",
+            ":::\n",
+        );
+        let path = scratch("no-rewrite-remote", raw);
+        let loaded = DocumentSource::Path(path.clone())
+            .load_with(LoadOptions {
+                rewrite_source: false,
+                remote: Some(remote),
+                ..LoadOptions::default()
+            })
+            .unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(log.calls(), 1, "--no-rewrite suppressed the fetch");
+        let dumped = format!("{:?}", loaded.doc.blocks());
+        assert!(
+            dumped.contains(":::"),
+            "the callout was rewritten: {dumped}"
+        );
+        assert!(
+            !dumped.contains("https://"),
+            "the image kept its URL: {dumped}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

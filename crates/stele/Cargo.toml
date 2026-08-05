@@ -44,6 +44,56 @@ clap = { version = "4", features = ["derive"] }
 # base64 alphabet contains no ESC, no BEL and no `;`.
 base64 = "0.22"
 
+# The one network dependency, and the only one in the workspace: `--fetch-remote`
+# (`media::fetch::HttpFetcher`). Optional, behind the `remote-images` feature —
+# see `[features]` below for why that feature is on by default and what turning
+# it off actually buys.
+#
+# **Why ureq and not reqwest.** The fetch runs inside `loader::preprocess`,
+# which is synchronous, single-threaded, and happens before the terminal is
+# entered. ureq is a blocking client with no async runtime; reqwest's blocking
+# API is a tokio runtime in a thread with a channel in front of it, and it
+# brings hyper, tokio, http-body, futures-*, mio and the rest — hundreds of
+# crates and a background reactor thread inside a viewer that otherwise has
+# exactly one. Measured cost of this line, `cargo tree -p stele --edges normal`
+# on macOS aarch64: **224 crates before, 241 after — 17 added**. The lockfile
+# gains 25 entries; the other 8 are `windows_*` target shims that never compile
+# off Windows. That is a real cost and it is stated rather than buried: the
+# added set is ureq, ureq-proto, rustls, rustls-pki-types, rustls-webpki,
+# webpki-roots, ring, untrusted, subtle, zeroize, http, httparse,
+# percent-encoding, getrandom, bytes, once_cell and utf8-zero.
+#
+# **Why rustls, on its own merits and not because a lint would catch it.**
+# `default-features = false, features = ["rustls"]` selects rustls with the ring
+# provider and the bundled webpki-roots trust anchors. Three reasons, in order
+# of how much they matter here:
+#   1. No OpenSSL. `native-tls` links libssl/libcrypto from the build host,
+#      which makes a release binary's TLS a property of the machine that built
+#      it — the exact coupling `docs/code-standards.md`'s "release profile is
+#      already maximal" and the CI `linkage` job exist to keep out.
+#   2. No system trust store. webpki-roots ships Mozilla's root set in the
+#      binary, so a fetch behaves identically on a bare CI container and a
+#      developer's laptop. (The trade is real and stated: a corporate MITM root
+#      installed in the OS keychain is *not* trusted, so `--fetch-remote`
+#      through such a proxy fails. That is the right default for a viewer.)
+#   3. Memory safety on bytes from a hostile host. rustls is Rust; ring carries
+#      vendored C and assembly from BoringSSL, statically linked. So this is not
+#      "no C at all" — it is "no *dynamic* C, and no OpenSSL".
+# `default-features = false` also drops ureq's `gzip` feature (and flate2 with
+# it). Deliberate: images are already compressed, so transfer encoding buys
+# nothing here, and a decompressor on the far side of a size cap is a
+# decompression-bomb vector pointed at the byte budget in `FetchLimits`.
+#
+# **CI will not catch a bad choice here — do not assume it does.** The
+# `linkage` job (`.github/workflows/ci.yml:42-66`) filters `ldd` output through
+# an allowlist whose last alternative is `=> */lib`, which matches the
+# *resolved path* of anything under a `/lib` directory. A dynamically linked
+# `libssl.so.3` resolving to `/lib/x86_64-linux-gnu/libssl.so.3` is swallowed
+# by that alternative and the job passes. Verified by reading the regex, not
+# assumed. If someone later swaps this for `native-tls`, nothing automated will
+# object; this comment is the only guard there is.
+ureq = { version = "3", default-features = false, features = ["rustls"], optional = true }
+
 # Signal handling for terminal restore (DW-5.1): SIGTERM/SIGHUP/SIGINT bypass
 # `Drop`, so the guard alone cannot honour "never leak raw mode / the alternate
 # screen". Needs raw `sigaction`/`write`/`tcsetattr`, which crossterm does not
@@ -63,3 +113,22 @@ rustix = { version = "1", features = ["event"] }
 [dev-dependencies]
 # Test-only: building synthetic PNG fixtures for media-module tests.
 image = { version = "0.25", default-features = false, features = ["png"] }
+
+[features]
+default = ["remote-images"]
+
+# Compiles the HTTP client in, and with it the `--fetch-remote` flag. On by
+# default because a flag nobody can reach is not a feature: the shipped binary
+# has to be able to honour `--fetch-remote`, and a reader who never types it
+# makes exactly as many network requests either way (zero — see
+# `media::remote`).
+#
+# Recommended, and the recommendation is "keep it on for the release build, and
+# have it exist anyway": `--no-default-features` gives a stele whose binary
+# contains no TLS stack, no socket code and no flag that would reach one. That
+# is not the same claim as "the default build makes no requests unless asked" —
+# the second is a property of the code and is what the tests assert, while the
+# first is a property anyone can check with `nm`. Distributors packaging for an
+# air-gapped or policy-restricted environment, and anyone who would rather
+# audit an absence than a branch, get the stronger claim without a fork.
+remote-images = ["dep:ureq"]

@@ -5,11 +5,22 @@
 //! blockquote gutters, and so on) — no color, since the full theme engine
 //! arrives in P7.
 
+use std::borrow::Cow;
+
 use highlight::Highlighted;
 use layout::{Run, Semantic, StyleId};
 
 use crate::painter::Style;
 
+/// `latex.codecogs.com` image links back into the `$…$` maths they encode.
+pub mod codecogs;
+/// Dive-into-Deep-Learning's Sphinx roles (`:label:`, `:numref:`, `:cite:`)
+/// and its ` ```{.python .input} ` fences.
+pub mod d2l;
+/// The shared primitive the source-text passes classify lines with: which
+/// lines are inside a fenced code block or a Pandoc grid table, and are
+/// therefore off limits to a rewrite.
+pub mod fences;
 /// `--frontmatter` visibility (parsed in `cli.rs`; this module makes the
 /// flag do something): strips a leading YAML frontmatter block from the
 /// source before parsing, unless the flag says to show it.
@@ -17,10 +28,82 @@ pub mod frontmatter;
 /// Renders ` ```mermaid ` fences to box-drawing grids as a source-text
 /// preprocessor run before `Document::parse`.
 pub mod mermaid;
+/// Quarto/Pandoc `:::` callout divs into GFM alerts, plus `{#id}` heading
+/// attributes, `[text]{.class}` spans and `{{< shortcode >}}` lines.
+pub mod quarto;
 /// P7's implementation: bridges `crates/highlight`'s theme/highlighter
 /// onto this trait. Registrable in one line via [`crate::painter::Painter::register_decor`]:
 /// `painter.register_decor(Box::new(themed::ThemedDecor::detect(bg_reply)))`.
 pub mod themed;
+
+/// The characters that mean something to CommonMark by *how many of them
+/// there are in a row* — the ones a source rewrite can break by butting two
+/// runs together.
+const RUN_DELIMITERS: [char; 2] = ['`', '$'];
+
+/// `replacement`, with a space added on whichever side would otherwise run
+/// one of its edge characters into an identical neighbour.
+///
+/// CommonMark matches a delimiter run against a later run **of the same
+/// length**, so `` `a` `` immediately followed by `` `b` `` is not two code
+/// spans: the closing backtick of the first and the opening backtick of the
+/// second merge into a single two-backtick run, the outer pair closes around
+/// the lot, and the reader gets one code span with literal backticks inside
+/// it. `$…$` maths breaks the same way — `$a$$b$` is one formula reading
+/// `a$$b`.
+///
+/// Every pass here that emits a *delimited* construct has to ask this before
+/// committing to one, and the reason is worth stating plainly: the author did
+/// not write those delimiters, we did. Two constructs the author wrote next
+/// to each other are their business; two we manufactured and jammed together
+/// is a document we corrupted. This phase's standing rule is that a missed
+/// rewrite is recoverable and a corrupted document is not, and emitting
+/// markup the parser reads as neither is worse than either.
+///
+/// A space is the separator rather than declining the rewrite, because both
+/// alternatives are worse in a way the reader can see: declining leaves raw
+/// `:eqref:` or a bare CodeCogs URL in the prose, and dropping the delimiters
+/// leaves one of a matched pair styled and the other not. Two constructs
+/// written flush against each other were never going to read as one word
+/// anyway. **The neighbour may also be the author's own text** — a rewrite
+/// landing directly in front of their code span merges with it just as
+/// readily as with another rewrite, which is why `after` is consulted and not
+/// only what we have already emitted.
+pub(crate) fn spaced_to_not_merge<'a>(
+    before: Option<char>,
+    replacement: &'a str,
+    after: Option<char>,
+) -> Cow<'a, str> {
+    let merges = |left: Option<char>, right: Option<char>| match (left, right) {
+        (Some(left), Some(right)) => left == right && RUN_DELIMITERS.contains(&left),
+        _ => false,
+    };
+    let pad_left = merges(before, replacement.chars().next());
+    let pad_right = merges(replacement.chars().next_back(), after);
+    match (pad_left, pad_right) {
+        (false, false) => Cow::Borrowed(replacement),
+        (true, false) => Cow::Owned(format!(" {replacement}")),
+        (false, true) => Cow::Owned(format!("{replacement} ")),
+        (true, true) => Cow::Owned(format!(" {replacement} ")),
+    }
+}
+
+/// The character immediately in front of an insertion point at `cursor`,
+/// whichever side of the seam it came from.
+///
+/// A rewriting pass keeps two positions: `copied`, how much of the source
+/// line it has committed, and `cursor`, where it is now. When the two differ
+/// there is untouched source between them and the neighbouring character is
+/// the last byte of that gap; when they are equal the insertion point sits
+/// flush against whatever the pass last emitted, which is where a collision
+/// between two replacements happens.
+pub(crate) fn char_before(out: &str, line: &str, copied: usize, cursor: usize) -> Option<char> {
+    if cursor > copied {
+        line[..cursor].chars().next_back()
+    } else {
+        out.chars().next_back()
+    }
+}
 
 /// P7's hook: turns a code-block line into syntax-highlighted runs, and
 /// resolves any [`StyleId`] to concrete SGR attributes.
@@ -161,13 +244,16 @@ fn structural_style(semantic: Semantic) -> Style {
 /// and `dim` is safe to spend on the deepest two because it attenuates the
 /// terminal's own foreground rather than an already-quiet ramp color.
 ///
-/// Kept identical to the monochrome branch of `highlight::theme`'s
-/// `heading_attrs`; that crate's colored branch deliberately differs (it
-/// drops `dim`, since stacking SGR faint on the quietest ramp tier falls
-/// under WCAG AA). Both sides pin their ladder with a test, and the two
-/// tables are separate for the same reason the rest of this function is: the
-/// structural defaults and the themed ones genuinely diverge elsewhere
-/// (`CodeInline`, `ListMarker`).
+/// Deliberately *not* `highlight::theme`'s `heading_attrs`, which stopped
+/// keeping six distinct sets once it could lean on the ramp, the band and the
+/// case transform — none of which exist here. This path has no colour to
+/// pair with, and no wash: the levels this file cannot distinguish, nothing
+/// else on the screen will. It also keeps `dim`, which the themed ladder
+/// dropped because stacking SGR faint on the quietest ramp tier falls under
+/// WCAG AA; against the terminal's own foreground it does not. Both sides pin
+/// their ladder with a test, and the two tables are separate for the same
+/// reason the rest of this function is: the structural defaults and the
+/// themed ones genuinely diverge elsewhere (`CodeInline`, `ListMarker`).
 fn heading_style(level: u8) -> Style {
     let bold = Style {
         bold: true,
@@ -201,9 +287,251 @@ fn heading_style(level: u8) -> Style {
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
+    use std::path::PathBuf;
+
     use layout::AlertTone;
 
     use super::*;
+
+    /// Every `fixtures/*.md`, which is the corpus the parser and the layout
+    /// engine are already pinned against.
+    fn fixture_paths() -> Vec<PathBuf> {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .expect("fixtures/ exists")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "md"))
+            .collect();
+        paths.sort();
+        assert!(paths.len() >= 15, "fixture corpus unexpectedly small");
+        paths
+    }
+
+    /// The source-text passes must be invisible on documents that hold none
+    /// of the syntax they exist for — and "invisible" means the same
+    /// allocation comes back, not merely an equal string. A pass that
+    /// rebuilt every document would pass an equality check and quietly cost
+    /// a copy of the file on every `--watch` reload.
+    ///
+    /// `fixtures/preprocessors.md` is the one document here that *is* meant
+    /// to be rewritten, so it is excluded by name; every other fixture,
+    /// including `preprocessor-lookalikes.md` — which is nothing but
+    /// constructs that resemble the ones these passes take — must come back
+    /// borrowed. Without that second file this assertion would be vacuous:
+    /// before it was added, no fixture in the tree contained `:::`,
+    /// `:label:`, `{{<` or `]{.` at all.
+    #[test]
+    fn test_no_fixture_but_the_preprocessor_one_is_rewritten_by_any_pass() {
+        let mut checked = 0usize;
+        let mut saw_lookalikes = false;
+        for path in fixture_paths() {
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if name == "preprocessors.md" {
+                continue;
+            }
+            saw_lookalikes |= name == "preprocessor-lookalikes.md";
+            let source = std::fs::read_to_string(&path).unwrap();
+            for (pass_name, output) in [
+                ("codecogs", codecogs::apply(&source)),
+                ("d2l", d2l::apply(&source)),
+                ("quarto", quarto::apply(&source)),
+            ] {
+                assert!(
+                    matches!(output, Cow::Borrowed(_)),
+                    "{name} was rewritten by {pass_name}"
+                );
+            }
+            checked += 1;
+        }
+        assert!(
+            saw_lookalikes,
+            "the look-alike fixture must be in the sweep"
+        );
+        assert!(checked >= 15);
+    }
+
+    /// Every delimiter character that survives into a `Text` node of
+    /// `source`, once parsed.
+    ///
+    /// This is the oracle for the whole collision class, and it is the right
+    /// shape for it: a merged run does not announce itself in the text, it
+    /// announces itself by the parser reading a delimiter as prose. If a
+    /// backtick or a dollar we emitted turns up as literal text the reader
+    /// will see, something merged.
+    fn delimiters_left_in_prose(source: &str) -> Vec<String> {
+        let doc = ast::Document::parse(source);
+        doc.nodes()
+            .filter_map(|node| match node {
+                ast::NodeRef::Inline(inline) => match &inline.kind {
+                    ast::InlineKind::Text(text) if text.contains('`') || text.contains('$') => {
+                        Some(text.clone())
+                    }
+                    _ => None,
+                },
+                ast::NodeRef::Block(_) => None,
+            })
+            .collect()
+    }
+
+    /// Two replacements emitted flush against each other merge their
+    /// delimiter runs, and the reader gets literal backticks or dollars in
+    /// their prose instead of the construct we meant. Every pass that emits a
+    /// delimited construct is checked here, in one place, because the bug is
+    /// a property of splicing rather than of any one pass — `d2l` had it
+    /// first and `codecogs` had exactly the same shape waiting.
+    ///
+    /// All inputs are synthetic: nothing in the corpus writes two of these
+    /// flush together. They are pinned anyway, because the failure mode is
+    /// document corruption by a rewriting pass, and this phase's rule is that
+    /// a missed rewrite is recoverable while a corrupted document is not.
+    #[test]
+    fn test_no_pass_lets_two_adjacent_replacements_merge_their_delimiter_runs() {
+        // (pass, source, what the reader must end up with)
+        let cases: [(&str, String, &str); 7] = [
+            (
+                "d2l role beside role",
+                ":eqref:`eq_a`:eqref:`eq_b`\n".to_string(),
+                "`eq_a` `eq_b`\n",
+            ),
+            (
+                "d2l role beside the author's own code span",
+                ":eqref:`eq_a``literal`\n".to_string(),
+                "`eq_a` `literal`\n",
+            ),
+            (
+                "codecogs image beside image",
+                "![a](http://latex.codecogs.com/svg.latex?x)\
+                 ![b](http://latex.codecogs.com/svg.latex?y)\n"
+                    .to_string(),
+                "$x$ $y$\n",
+            ),
+            (
+                "codecogs image beside the author's own maths",
+                "![a](http://latex.codecogs.com/svg.latex?x)$y$\n".to_string(),
+                "$x$ $y$\n",
+            ),
+            (
+                "quarto span beside span",
+                "[`a`]{.mark}[`b`]{.mark}\n".to_string(),
+                "`a` `b`\n",
+            ),
+            (
+                "quarto span beside the author's own code span",
+                "[`a`]{.mark}`b`\n".to_string(),
+                "`a` `b`\n",
+            ),
+            // The middle role is boxed in: a replacement on its left and the
+            // author's own code span on its right, so it needs a separator on
+            // both sides at once.
+            (
+                "d2l role hemmed in on both sides",
+                ":eqref:`eq_a`:eqref:`eq_b``literal`\n".to_string(),
+                "`eq_a` `eq_b` `literal`\n",
+            ),
+        ];
+
+        for (what, source, expected) in cases {
+            let rewritten = match what.split_whitespace().next() {
+                Some("d2l") => d2l::apply(&source).into_owned(),
+                Some("codecogs") => codecogs::apply(&source).into_owned(),
+                _ => quarto::apply(&source).into_owned(),
+            };
+            assert_eq!(rewritten, expected, "{what}");
+            assert_eq!(
+                delimiters_left_in_prose(&rewritten),
+                Vec::<String>::new(),
+                "{what}: a delimiter leaked into the reader's prose ({rewritten:?})"
+            );
+        }
+    }
+
+    /// The separator is only inserted where a run would actually merge. A
+    /// rewrite that padded every replacement would be adding whitespace to
+    /// the author's sentences for no reason, and the corpus is full of these.
+    #[test]
+    fn test_a_replacement_with_room_beside_it_is_not_padded() {
+        assert_eq!(
+            &*d2l::apply("See :numref:`fig_a` and :eqref:`eq_b`.\n"),
+            "See `fig_a` and `eq_b`.\n"
+        );
+        assert_eq!(
+            &*codecogs::apply("where ![a](http://latex.codecogs.com/svg.latex?x) is real\n"),
+            "where $x$ is real\n"
+        );
+        assert_eq!(&*quarto::apply("[a]{.mark} and [b]{.mark}\n"), "a and b\n");
+        // Adjacent, but with nothing that can merge: no padding either.
+        assert_eq!(&*quarto::apply("[a]{.mark}[b]{.mark}\n"), "ab\n");
+        assert_eq!(
+            &*d2l::apply(":citet:`A.1`:citet:`B.2`\n"),
+            "A.1B.2\n",
+            "plain replacements carry no delimiter to merge"
+        );
+    }
+
+    /// The other direction, on the fixture that *is* full of the syntax.
+    /// Asserted on the parsed document rather than on the text, so a rewrite
+    /// that produces plausible-looking markdown the parser reads some other
+    /// way still fails.
+    #[test]
+    fn test_the_preprocessor_fixture_loses_its_machinery_and_gains_its_alerts() {
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/preprocessors.md");
+        let source = std::fs::read_to_string(&path).unwrap();
+
+        // The load path's order, spelled out rather than reached through
+        // `loader::preprocess`, so this test fails if the passes stop
+        // composing even while the loader still calls them.
+        let after_codecogs = codecogs::apply(&source).into_owned();
+        let after_d2l = d2l::apply(&after_codecogs).into_owned();
+        let rewritten = quarto::apply(&after_d2l).into_owned();
+        let doc = ast::Document::parse(&rewritten);
+        let dumped = format!("{:?}", doc.blocks());
+
+        for gone in [
+            ":label:",
+            ":eqlabel:",
+            ":width:",
+            ":numref:",
+            ":eqref:",
+            ":cite:",
+            ":citet:",
+            ":begin_tab:",
+            ":end_tab:",
+            "%%tab",
+            ".input",
+            "latex.codecogs.com",
+            ":::",
+            "{{<",
+            "{#spans-and-shortcodes}",
+            "]{.",
+        ] {
+            assert!(!dumped.contains(gone), "{gone} survived into the AST");
+        }
+
+        // Six callouts in the fixture, in the order it declares them.
+        let alerts: Vec<ast::AlertKind> = doc
+            .blocks()
+            .iter()
+            .filter_map(|block| match &block.kind {
+                ast::BlockKind::Alert { kind, .. } => Some(*kind),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            alerts,
+            vec![
+                ast::AlertKind::Note,
+                ast::AlertKind::Tip,
+                ast::AlertKind::Important,
+                ast::AlertKind::Warning,
+                ast::AlertKind::Caution,
+                ast::AlertKind::Note,
+            ],
+            "callouts read out of the fixture in declaration order"
+        );
+    }
 
     #[test]
     fn test_identity_highlight_returns_unchanged_single_run() {
