@@ -82,14 +82,39 @@ pub fn apply(source: &str) -> Cow<'_, str> {
         let indent = &open_line[..open_line.len() - open_line.trim_start().len()];
         edits[fence.open] = Some(Edit::Replace(format!("{indent}```{language}")));
 
-        // `%%tab all` is a build-tool directive on the block's first line. It
-        // is only ever the *first* line, so a `%%tab` deeper in the block is
-        // real Python (a comment, a string) and is left alone.
-        let body = fence.open + 1;
-        if fence.close.is_some_and(|close| close > body)
-            && strip_eol(lines[body]).trim_start().starts_with("%%tab")
-        {
-            edits[body] = Some(Edit::Drop);
+        // `%%tab all` is a build-tool directive that opens the block, and the
+        // directive position is "before any code" rather than "line one".
+        // Those are the same line in eleven of the corpus's twelve blocks and
+        // not in the twelfth, which puts a blank line between the fence and
+        // the directive:
+        //
+        // ```text
+        // ```{.python .input}
+        //
+        // %%tab pytorch, tensorflow, jax
+        // ```
+        //
+        // An earlier version of this comment asserted the directive "is only
+        // ever the *first* line". The corpus it was written against says
+        // otherwise on line 545 of `01-d2l-linear-regression.md`, and the
+        // result was one marker left on screen among eleven that were
+        // stripped — the kind of inconsistency a reader notices immediately
+        // and cannot explain, which is worse than stripping none of them.
+        //
+        // Blank lines are skipped, and nothing else is: a `%%tab` that
+        // follows a line of real code is a comment or a string literal and
+        // must survive untouched. The leading blanks go with the directive
+        // they were separating, so a block that had one renders like a block
+        // that did not, instead of opening on an empty row.
+        let close = fence.close.unwrap_or(lines.len());
+        let mut body = fence.open + 1;
+        while body < close && strip_eol(lines[body]).trim().is_empty() {
+            body += 1;
+        }
+        if body < close && strip_eol(lines[body]).trim_start().starts_with("%%tab") {
+            for edit in &mut edits[(fence.open + 1)..=body] {
+                *edit = Some(Edit::Drop);
+            }
         }
     }
 
@@ -408,13 +433,44 @@ mod tests {
         }
     }
 
-    /// `%%tab` is a directive only on the block's first line. Anywhere else
-    /// it is a Python comment, a string, or a magic — the reader's, not the
+    /// `%%tab` is a directive only *before any code*. Anywhere after it, it
+    /// is a Python comment, a string, or a magic — the reader's, not the
     /// build tool's.
     #[test]
-    fn test_a_tab_line_that_is_not_the_first_line_of_the_block_survives() {
+    fn test_a_tab_line_that_follows_real_code_survives() {
         let src = "```{.python .input}\nx = 1\n%%tab all\n```\n";
         assert_eq!(&*apply(src), "```python\nx = 1\n%%tab all\n```\n");
+        // Still code-not-directive when a blank line sits between them, which
+        // is the shape the blank-skipping below must not over-reach into.
+        let spaced = "```{.python .input}\nx = 1\n\n%%tab all\n```\n";
+        assert_eq!(&*apply(spaced), "```python\nx = 1\n\n%%tab all\n```\n");
+    }
+
+    /// **The twelfth block.** Eleven of the corpus's `%%tab` directives sit on
+    /// the line after the fence and one does not — `01-d2l-linear-regression`
+    /// separates the two with a blank line. Position in the block is not what
+    /// makes it a directive; having no code in front of it is.
+    ///
+    /// The blank lines go with it. A block that opened on an empty row where
+    /// its neighbours opened on code would be a second, quieter version of
+    /// the same inconsistency.
+    #[test]
+    fn test_a_tab_directive_behind_blank_lines_is_still_a_directive() {
+        let src = "```{.python .input}\n\n%%tab pytorch, tensorflow, jax\nx = 1\n```\n";
+        assert_eq!(&*apply(src), "```python\nx = 1\n```\n");
+
+        // More than one blank, and blanks that are whitespace rather than
+        // empty — the corpus has the first and a hand edit produces the second.
+        let padded = "```{.python .input}\n\n   \n%%tab all\nx = 1\n```\n";
+        assert_eq!(&*apply(padded), "```python\nx = 1\n```\n");
+    }
+
+    /// A block that is nothing but a fence and blank lines has no directive
+    /// to find, and must not have its blanks eaten looking for one.
+    #[test]
+    fn test_a_blank_only_block_keeps_its_blanks() {
+        let src = "```{.python .input}\n\n\n```\n";
+        assert_eq!(&*apply(src), "```python\n\n\n```\n");
     }
 
     /// The `.input` marker is what makes a fence d2l's. Quarto and Pandoc
