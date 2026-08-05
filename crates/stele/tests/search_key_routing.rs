@@ -20,7 +20,7 @@ mod common;
 
 use std::io::Write as _;
 use std::os::unix::process::CommandExt;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
 
 use common::pty::{ENTER_ALT, Pty, read_until};
@@ -52,7 +52,7 @@ impl Session {
             .expect("write fixture");
 
         let pty = Pty::open();
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_stele"));
+        let mut cmd = common::viewer_command();
         cmd.arg(&doc)
             .env("TERM", "xterm-256color")
             .env("TERM_PROGRAM", "ghostty")

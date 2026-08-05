@@ -24,12 +24,10 @@
 //! instead of hanging the run.
 
 use std::io::Write as _;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-fn stele_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_stele")
-}
+mod common;
 
 /// Every path exercised here exits in milliseconds; this is three orders of
 /// magnitude of headroom, so exceeding it means the child is blocked, not slow.
@@ -56,7 +54,7 @@ impl Run {
 /// it — see this module's doc comment. Here the child is killed and the test
 /// reports what it was doing.
 fn run_bounded(args: &[&str], stdin_bytes: Option<&[u8]>) -> Run {
-    let mut child = Command::new(stele_bin())
+    let mut child = common::viewer_command()
         .args(args)
         .stdin(if stdin_bytes.is_some() {
             Stdio::piped()

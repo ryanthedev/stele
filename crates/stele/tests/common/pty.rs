@@ -27,7 +27,7 @@ use std::ffi::{CStr, OsStr};
 use std::io::Write as _;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
 /// The exact bytes `terminal::RESTORE_SEQUENCE` must put on the wire:
@@ -232,7 +232,7 @@ pub fn spawn_viewer_with(
     stdin: ChildStdin<'_>,
     graphics: Graphics,
 ) -> ViewerProcess {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_stele"));
+    let mut cmd = super::viewer_command();
     cmd.args(args)
         .env("TERM", "xterm-256color")
         .env_remove("TMUX");
@@ -472,7 +472,7 @@ pub fn assert_restores_the_terminal(label: &str, exit: Exit) {
         "the pty must start in canonical mode for this test to mean anything"
     );
 
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_stele"));
+    let mut cmd = super::viewer_command();
     cmd.arg(&doc)
         .env("TERM", "xterm-256color")
         // Graphics are only enabled on Ghostty; either way stele enters the

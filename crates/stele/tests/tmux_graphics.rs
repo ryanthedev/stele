@@ -28,7 +28,7 @@
 
 use std::io::Write as _;
 use std::os::unix::process::CommandExt as _;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
 
 mod common;
@@ -177,7 +177,7 @@ fn wire_for(tag: &str, tmux: Option<&str>) -> Vec<u8> {
         .expect("write fixture document");
 
     let pty = Pty::open();
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_stele"));
+    let mut cmd = common::viewer_command();
     cmd.arg(&doc)
         .env("TERM", "xterm-256color")
         .env("TERM_PROGRAM", "ghostty")

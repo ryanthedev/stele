@@ -22,7 +22,7 @@ mod common;
 
 use std::io::Write as _;
 use std::os::unix::process::ExitStatusExt;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
 
 use common::pty::{ENTER_ALT, Pty, RESTORE, contains, read_until};
@@ -42,7 +42,7 @@ fn test_dw_1_6_panic_mid_frame_restores_the_terminal_with_no_stale_frame_bytes_a
         .expect("write fixture");
 
     let pty = Pty::open();
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_stele"));
+    let mut cmd = common::viewer_command();
     cmd.arg(&doc)
         .env("TERM", "xterm-256color")
         // Graphics off (not Ghostty): skips the CSI 16t round trip and its
