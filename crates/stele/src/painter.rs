@@ -2619,16 +2619,29 @@ impl<'a, W: Write + 'a> Iterator for FrameSweep<'a, W> {
         );
     }
 
-    /// **DW-4.7, the committed speed claim.** A code-heavy frame must be at
-    /// least 10x cheaper than it was before this phase, measured against the
-    /// pre-change path itself — `with_cache_capacity(0)` never retains
-    /// anything, so its paint path *is* the old one — in this same harness,
-    /// on this same host, over this same fixture.
+    /// **DW-4.7, the committed speed claim — pinned by the work, not by a
+    /// stopwatch.** A code-heavy frame is at least 10x cheaper than it was
+    /// before this phase. What *makes* it cheaper is not in dispute and is not
+    /// a matter of degree: the old path re-derived every visible code line's
+    /// highlighting on every frame, and the new one derives it once. So that
+    /// is what this asserts — the baseline's highlighter calls grow linearly
+    /// with the frame count, and the cached painter's stop growing after the
+    /// first frame — over the realistic fixture, at a realistic viewport, for
+    /// twenty frames.
     ///
-    /// **The 10x floor is a release-profile claim, and this test says so.**
-    /// This ratio is not a constant of the code — it moves with the build
-    /// profile, because the two costs it divides are not equally sensitive
-    /// to optimization. Measured on this fixture and host, three runs each:
+    /// **Why this replaced a ratio assertion.** It used to divide two
+    /// `Instant::elapsed` measurements and require the quotient to clear a
+    /// floor. That test was a stopwatch, and it graded the host as much as the
+    /// code: on an unoptimized build it measured 3.6–4.6x against a floor of
+    /// 3, a cushion thin enough that a loaded machine — the full 71-binary
+    /// suite in parallel, or a mutation run — could push a correct build under
+    /// it. A test that fails when the machine is busy teaches everyone to
+    /// re-run it, which is the same as having no test. This is `cef8177`'s
+    /// rule applied to the case that prompted it: *pin it with the fact, not a
+    /// stopwatch.*
+    ///
+    /// **The timing claim is still true, and is still written down.** Measured
+    /// on this fixture and host, three runs each:
     ///
     /// | | uncached | cached | ratio |
     /// |---|---|---|---|
@@ -2638,41 +2651,31 @@ impl<'a, W: Write + 'a> Iterator for FrameSweep<'a, W> {
     /// Both arms get slower without `-O`; they just do not get slower at the
     /// same rate. The baseline slows about 5.5x while the cached arm slows
     /// about 15x, and dividing one by the other is what compresses 12x into
-    /// 4x. (An earlier version of this comment claimed the removed cost was
-    /// profile-*independent* — "optimized C whatever profile the crate is
-    /// built in". Its own numbers refute that: a profile-independent parse
-    /// could not have slowed 5.5x. The conclusion below was right for the
-    /// wrong reason, which is worth saying plainly so nobody builds on it.)
+    /// 4x — which is precisely why the ratio was never a constant of the code
+    /// and never belonged in an assertion. (An earlier version of this comment
+    /// claimed the removed cost was profile-*independent*. Its own numbers
+    /// refute that: a profile-independent parse could not have slowed 5.5x.)
     ///
-    /// The optimized number is the one that describes the binary readers
-    /// run, and the 64 µs frame budget the original audit set is unreachable
-    /// in a debug build for reasons that have nothing to do with this cache.
-    /// So the full floor is asserted where it means something, and an
-    /// unoptimized run still asserts a real (weaker) floor rather than
-    /// skipping: a regression that loses the cache outright scores ~1x and
-    /// fails either way, which is what keeps `cargo test` honest. What that
-    /// does *not* cover is a partial regression — something recovering only
-    /// 6x optimized would pass the default suite silently, so the release
-    /// arm needs to be run to gate the headline claim.
+    /// **What is given up, and what is gained.** A count cannot catch a
+    /// regression that keeps the cache but makes each *hit* expensive — a deep
+    /// copy where there was a refcount bump, say. Nothing here would see that,
+    /// and `Rc<[Run]>` is the only thing standing between this cache and that
+    /// bug. What is gained is everything the old test only probabilistically
+    /// had: a regression that loses the cache is caught deterministically, on
+    /// any machine, at any load, in any build profile, instead of being caught
+    /// at 4.4x on an idle laptop and missed at 2.9x on a busy one. Both arms
+    /// are asserted, so a "cache" that never populates and a baseline that
+    /// silently starts caching are equally visible.
     ///
     /// Fixture: real Rust at real line lengths in an 80-column viewport, the
     /// most ordinary terminal there is. See [`realistic_code_fence`] for why
     /// the shape of the code matters to what this measures.
     #[test]
-    fn test_dw_4_7_cached_code_heavy_frames_are_at_least_10x_faster_than_the_uncached_baseline() {
-        use std::time::Instant;
-
-        /// The claim, in an optimized build: the binary readers actually run.
-        const OPTIMIZED_FLOOR: u32 = 10;
-        /// The floor an unoptimized build still has to clear, so the default
-        /// `cargo test` run gates on frame *time* and not just on the call
-        /// count DW-4.6 already pins. Measured at 4.4x; 3 leaves margin for
-        /// a loaded CI host without letting a lost cache through.
-        const UNOPTIMIZED_FLOOR: u32 = 3;
-
+    fn test_dw_4_7_a_cached_code_heavy_frame_re_derives_no_highlighting_at_all() {
         const VISIBLE_LINES: u16 = 40;
         const WIDTH: u16 = 80;
         const FRAMES: usize = 20;
+
         let doc = Document::parse(&realistic_code_fence(usize::from(VISIBLE_LINES)));
         let tree = layout(&doc, WIDTH, &LayoutConfig::default(), &engine(), &NullSizer);
         let size = Size {
@@ -2680,76 +2683,95 @@ impl<'a, W: Write + 'a> Iterator for FrameSweep<'a, W> {
             height: VISIBLE_LINES,
         };
 
+        // `with_cache_capacity(0)` never retains anything, so its paint path
+        // *is* the pre-change one. Both arms count through the same decor, so
+        // the two numbers below are the same unit of work.
+        let baseline_calls = std::rc::Rc::new(Cell::new(0));
+        let mut baseline = Painter::with_cache_capacity(engine(), 0);
+        baseline.register_decor(Box::new(CountingDecor {
+            calls: baseline_calls.clone(),
+            cacheable: true,
+        }));
+
+        let cached_calls = std::rc::Rc::new(Cell::new(0));
+        let mut cached = Painter::new(engine());
+        cached.register_decor(Box::new(CountingDecor {
+            calls: cached_calls.clone(),
+            cacheable: true,
+        }));
+
+        let mut buf = Vec::new();
+        let mut frame = |painter: &mut Painter| {
+            buf.clear();
+            painter.frame(&tree, 0, size, &mut buf).unwrap();
+        };
+
+        frame(&mut baseline);
+        let baseline_per_frame = baseline_calls.get();
+        frame(&mut cached);
+        let cached_cold = cached_calls.get();
+
+        assert!(
+            baseline_per_frame > 0,
+            "the fixture must put code lines on screen for this to measure \
+             anything at all"
+        );
+
+        for _ in 1..FRAMES {
+            frame(&mut baseline);
+            frame(&mut cached);
+        }
+
+        // The old path: every frame pays for every line, every time.
+        assert_eq!(
+            baseline_calls.get(),
+            baseline_per_frame * FRAMES,
+            "the uncached baseline must re-derive all {baseline_per_frame} \
+             lines on each of {FRAMES} frames — if it stopped, it is caching \
+             and is no longer the pre-change path this is measured against"
+        );
+
+        // The new path: the first frame pays, and nothing after it does.
+        assert_eq!(
+            cached_calls.get(),
+            cached_cold,
+            "after the cold frame the cache must answer every line: {FRAMES} \
+             frames cost {} calls where the first alone cost {cached_cold}",
+            cached_calls.get()
+        );
+
+        // Both arms must paint the same thing, through real highlighting. A
+        // "faster" frame that quietly dropped the syntax colours would win any
+        // benchmark and be worthless — the cache may change what a frame
+        // *costs*, never what it *says*.
         let themed = || {
             Box::new(ThemedDecor::new(highlight::Theme::new(
                 highlight::Variant::Dark,
                 highlight::ColorMode::Truecolor,
             ))) as Box<dyn Decor>
         };
+        let mut uncached_painter = Painter::with_cache_capacity(engine(), 0);
+        uncached_painter.register_decor(themed());
+        let mut cached_painter = Painter::new(engine());
+        cached_painter.register_decor(themed());
 
-        let mut baseline = Painter::with_cache_capacity(engine(), 0);
-        baseline.register_decor(themed());
-        let mut cached = Painter::new(engine());
-        cached.register_decor(themed());
-
-        // Warm both: page faults, lumis' own lazy grammar init, and the
-        // cached painter's first (necessarily cold) frame.
-        let mut buf = Vec::new();
-        for painter in [&mut baseline, &mut cached] {
-            buf.clear();
-            painter.frame(&tree, 0, size, &mut buf).unwrap();
-        }
-
-        let start = Instant::now();
-        for _ in 0..FRAMES {
-            buf.clear();
-            baseline.frame(&tree, 0, size, &mut buf).unwrap();
-        }
-        let uncached = start.elapsed();
-
-        let start = Instant::now();
-        for _ in 0..FRAMES {
-            buf.clear();
-            cached.frame(&tree, 0, size, &mut buf).unwrap();
-        }
-        let elapsed = start.elapsed();
-
-        // Both arms must paint the same thing. A "faster" frame that quietly
-        // dropped the syntax highlighting would win this benchmark and be
-        // worthless — the cache may change what a frame *costs*, never what
-        // it *says*.
-        let mut fast_bytes = Vec::new();
-        cached.frame(&tree, 0, size, &mut fast_bytes).unwrap();
         let mut slow_bytes = Vec::new();
-        baseline.frame(&tree, 0, size, &mut slow_bytes).unwrap();
+        uncached_painter
+            .frame(&tree, 0, size, &mut slow_bytes)
+            .unwrap();
+        let mut fast_bytes = Vec::new();
+        // Twice: the second frame is the one served from the cache, and it is
+        // the one whose bytes are in question.
+        cached_painter
+            .frame(&tree, 0, size, &mut fast_bytes)
+            .unwrap();
+        fast_bytes.clear();
+        cached_painter
+            .frame(&tree, 0, size, &mut fast_bytes)
+            .unwrap();
         assert_eq!(
             fast_bytes, slow_bytes,
             "the cache must change the cost of a frame, never its bytes"
-        );
-
-        let floor = if cfg!(debug_assertions) {
-            UNOPTIMIZED_FLOOR
-        } else {
-            OPTIMIZED_FLOOR
-        };
-        let ratio = uncached.as_secs_f64() / elapsed.as_secs_f64();
-        println!(
-            "DW-4.7: {FRAMES} frames x {VISIBLE_LINES} code lines at {WIDTH} cols — \
-             uncached {:?}/frame, cached {:?}/frame, {ratio:.1}x (floor {floor}x, \
-             {} build)",
-            uncached / FRAMES as u32,
-            elapsed / FRAMES as u32,
-            if cfg!(debug_assertions) {
-                "unoptimized"
-            } else {
-                "optimized"
-            }
-        );
-        assert!(
-            elapsed.as_nanos() * u128::from(floor) <= uncached.as_nanos(),
-            "cached code-heavy frames must be at least {floor}x faster than the \
-             pre-change baseline: cached={elapsed:?} uncached={uncached:?} \
-             ({ratio:.1}x) over {FRAMES} frames of {VISIBLE_LINES} code lines"
         );
     }
 
