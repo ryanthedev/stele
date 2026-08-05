@@ -4,13 +4,13 @@
 ▌▌ Section with emphasis
 ────────────────────────
 
-▌▌▌ CLOSING SEQUENCE
+▌▌▌ Closing sequence    
 
-▌▌▌▌ LEVEL FOUR
+▌▌▌▌ Level Four
 
 ▌▌▌▌▌ Level Five
 
-▌▌▌▌▌▌ Level Six
+▌▌▌▌▌▌ Level six
 
 ▌ Setext H1             
 ────────────────────────

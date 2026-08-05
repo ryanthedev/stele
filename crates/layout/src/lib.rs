@@ -220,22 +220,50 @@ pub enum AlertTone {
 /// `heading_text` off the AST and keep the author's own capitalisation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HeadingCase {
-    /// H1, H2 — the author's own casing, untouched.
+    /// H1, H2, H3, H6 — the author's own casing, untouched.
     AsWritten,
-    /// H3, H4 — `SUPPORTED PLATFORMS`.
+    /// `SUPPORTED PLATFORMS`. No level maps here today: shouting a heading
+    /// competed with the band and the marker count rather than adding to
+    /// them. Kept because it is the transform a level would want if the
+    /// ladder ever needs a third tier again, and because `recase` implements
+    /// it either way.
     Upper,
-    /// H5, H6 — `Checksum Mismatches`.
+    /// H4, H5 — `Checksum Mismatches`.
     Title,
 }
 
 /// The case transform for a heading level. Clamps like every other consumer,
 /// so an out-of-range level degrades to the nearest rung.
+///
+/// Case is a *middle* tier here, not a monotonic ramp: the two levels that
+/// get it are the ones where a heading stops being a section and starts being
+/// an entry — H4 and H5, the per-function, per-flag rungs of reference
+/// material, where title case reads as a label. H6 sits below that again and
+/// takes the author's own text, because the deepest rung is a note rather
+/// than a label and should recede rather than be typeset.
 pub fn heading_case(level: u8) -> HeadingCase {
     match level.clamp(1, 6) {
-        1 | 2 => HeadingCase::AsWritten,
-        3 | 4 => HeadingCase::Upper,
-        _ => HeadingCase::Title,
+        4 | 5 => HeadingCase::Title,
+        _ => HeadingCase::AsWritten,
     }
+}
+
+/// Whether a heading level's line is extended to the full measure so its
+/// themed background reads as a band across the page.
+///
+/// Two levels wear one, and they are not adjacent: H1 because it is the
+/// document's title, and H3 because it lost every other loud signal — it is
+/// neither bold nor uppercase, and it is below the depth that earns an ember
+/// rule, so the band is what is left to say "a section starts here". H2 sits
+/// between them unbanded on purpose: it has the rule, and stacking a band on
+/// top would leave nothing for H3 to escalate to.
+///
+/// Lives in `layout` for [`heading_case`]'s reason — the band is spread by
+/// *padding the line*, which is a width decision and has to be settled before
+/// anything is painted. `highlight` gates the background colour on this same
+/// predicate so the two cannot drift.
+pub fn heading_is_washed(level: u8) -> bool {
+    matches!(level.clamp(1, 6), 1 | 3)
 }
 
 /// The style roles layout can distinguish. Theme resolution (role → color/
@@ -251,11 +279,12 @@ pub enum Semantic {
     /// the depth markers and the ember rule's bands — which index the ramp by
     /// position rather than by the heading's own level.
     ///
-    /// It exists because `Heading(1)` is not only a color: it also carries
-    /// the H1 wash background. A decoration that reached for rung 1's color
-    /// through `Heading(1)` dragged the band along with it, which put a
-    /// one-cell chip under the first marker of every H2–H6 and a
-    /// sixth-of-the-measure block under the left end of every H1 rule.
+    /// It exists because `Heading(n)` is not only a color: for the levels
+    /// [`heading_is_washed`] names it also carries that level's band. A
+    /// decoration that reached for rung 1's color through `Heading(1)`
+    /// dragged the band along with it, which put a one-cell chip under the
+    /// first marker of every H2–H6 and a sixth-of-the-measure block under the
+    /// left end of every H1 rule.
     /// Resolving to the same palette slot as `Heading(n)` but to no
     /// background and no attributes keeps the fade and drops the leak, and
     /// costs no new palette slot — so no capture role repaints.

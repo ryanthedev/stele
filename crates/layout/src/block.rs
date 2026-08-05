@@ -36,10 +36,6 @@ const HEADING_RULE: &str = "\u{2500}"; // "─"
 /// rule per heading would stripe the page.
 const HEADING_RULE_MAX_LEVEL: u8 = 2;
 
-/// Deepest heading level whose line is extended to the full measure so a
-/// themed background reads as a band. Only the document's title earns it.
-const HEADING_WASH_MAX_LEVEL: u8 = 1;
-
 struct Seg {
     /// Emitted on the first line after the segment is pushed (the marker).
     first: String,
@@ -124,7 +120,7 @@ impl<'a> Ctx<'a> {
         for _ in 0..pushed {
             self.pop_prefix();
         }
-        if self.lines.len() > line && level <= HEADING_WASH_MAX_LEVEL {
+        if self.lines.len() > line && crate::heading_is_washed(level) {
             self.wash_heading_lines(line, level);
         }
         if self.lines.len() > line && level <= HEADING_RULE_MAX_LEVEL {
@@ -259,7 +255,7 @@ impl<'a> Ctx<'a> {
         self.prefix.pop();
     }
 
-    /// Extend a top-level heading's own line(s) to the full measure with
+    /// Extend a washed heading's own line(s) to the full measure with
     /// blank cells carrying that heading's style, so the theme's background
     /// for the level reads as a band across the page rather than stopping
     /// where the words do.
@@ -356,11 +352,12 @@ impl<'a> Ctx<'a> {
     /// blocks, and `prefix_budget`'s clamp drops the marker rather than
     /// squeezing the text to nothing at a pathological width.
     ///
-    /// Each block is its own segment styled `Heading(1..=level)` — not all
-    /// `Heading(level)`. The theme's ramp has exactly one rung per level, so
-    /// indexing it by *position in the run* makes every marker start on the
-    /// brightest rung and fade toward the page as it lengthens, which is the
-    /// run fade, at the cost of no new palette roles.
+    /// On an unwashed level each block is its own segment styled
+    /// `HeadingRung(1..=level)` — not all `HeadingRung(level)`. The theme's
+    /// ramp has exactly one rung per level, so indexing it by *position in
+    /// the run* makes every marker start on the brightest rung and fade
+    /// toward the page as it lengthens, which is the run fade, at the cost of
+    /// no new palette roles.
     ///
     /// This never reaches `heading_text`, so the outline, the TOC and fold
     /// markers keep the author's text with no blocks in it.
@@ -368,12 +365,21 @@ impl<'a> Ctx<'a> {
         let level = level.clamp(1, 6);
         // A washed heading's markers sit *inside* its band, so they take the
         // full `Heading` style — background included — or the band opens with
-        // a hole where the blocks are. Every other level's markers want the
-        // rung's color alone; `Heading(1)` would hand them H1's background.
-        let washed = level <= HEADING_WASH_MAX_LEVEL;
+        // a hole where the blocks are: `HeadingRung` paints no background, and
+        // the marker glyph is a *half* block, so the page would show through
+        // the right half of every one of them along the band's left edge.
+        //
+        // They take the heading's own level rather than their position in the
+        // run, which costs the fade and is the only way to buy a solid band:
+        // rung n's background is level n's, so an H3 whose markers ran
+        // `Heading(1..=3)` would open with a chip of H1's wash, then a gap
+        // where unwashed H2 paints none, then its own. The fade is the
+        // smaller loss — it reads as a gradient against the *page*, and on a
+        // band there is no page to read it against.
+        let washed = crate::heading_is_washed(level);
         for rung in 1..=level {
             let semantic = if washed {
-                Semantic::Heading(rung)
+                Semantic::Heading(level)
             } else {
                 Semantic::HeadingRung(rung)
             };

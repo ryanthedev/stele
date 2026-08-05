@@ -1133,12 +1133,13 @@ fn test_a_setext_heading_reaches_the_outline() {
     assert_eq!(tree.outline().entries[0].text, "Underlined");
 }
 
-/// The wash is not a line property — it is `Heading(1)`'s *background*, which
-/// `wash_heading_lines` spreads by padding the line with `Heading(level)`
-/// runs. So every other emitter that reaches for rung 1's colour through
-/// `Heading(1)` inherits the band too, and two of them do exactly that: the
-/// depth markers and the ember rule both index the ramp by *position in the
-/// run*, so both start at rung 1 regardless of the heading's own level.
+/// The wash is not a line property — it is a washed level's `Heading`
+/// *background*, which `wash_heading_lines` spreads by padding the line with
+/// `Heading(level)` runs. So every other emitter that reaches for rung 1's
+/// colour through `Heading(1)` inherits the band too, and two of them do
+/// exactly that: the depth markers and the ember rule both index the ramp by
+/// *position in the run*, so both start at rung 1 regardless of the heading's
+/// own level.
 ///
 /// Shipped, that put a one-cell chip of wash under the first marker of every
 /// H2–H6, and a sixth-of-the-measure block under the left end of every H1
@@ -1146,11 +1147,11 @@ fn test_a_setext_heading_reaches_the_outline() {
 /// colour, so this asserts on the style ids instead: a decoration takes
 /// `HeadingRung`, which resolves to the same palette slot with no background.
 ///
-/// H1 is the deliberate exception. Its marker sits *inside* its own band, so
-/// it keeps the full `Heading` style — `HeadingRung` there would open a hole
-/// at the left edge of the wash.
+/// The washed levels are the deliberate exception, checked below: their
+/// markers sit *inside* the band and take the full `Heading` style, because
+/// `HeadingRung` there would open a hole at its left edge.
 #[test]
-fn test_heading_decorations_never_borrow_the_h1_wash() {
+fn test_heading_decorations_never_borrow_a_headings_wash() {
     for level in 2..=6u8 {
         let src = format!("{} Title\n", "#".repeat(usize::from(level)));
         let tree = lay(&Document::parse(&src), 60);
@@ -1184,6 +1185,39 @@ fn test_heading_decorations_never_borrow_the_h1_wash() {
         "the H1 rule's first band carries the wash, painting a block under the \
          rule instead of only under the title: {rule_styles:?}"
     );
+
+    // The other half of the invariant: a washed heading's markers must carry
+    // the band, and must carry *its own* level's — not their position in the
+    // run. An H3 whose markers ran `Heading(1..=3)` would open with a chip of
+    // H1's wash, then a gap where unwashed H2 paints none.
+    for level in (1..=6u8).filter(|l| layout::heading_is_washed(*l)) {
+        let src = format!("{} Title\n", "#".repeat(usize::from(level)));
+        let tree = lay(&Document::parse(&src), 60);
+        let marker_runs: Vec<&Run> = all_runs(&tree)
+            .into_iter()
+            .filter(|run| run.text.contains('\u{258c}'))
+            .collect();
+        // Counted in glyphs, not runs: sharing one style is exactly what
+        // lets the markers of a washed heading merge into a single run.
+        let markers: usize = marker_runs
+            .iter()
+            .map(|run| run.text.matches('\u{258c}').count())
+            .sum();
+        assert_eq!(
+            markers,
+            usize::from(level),
+            "H{level} emitted {markers} markers, expected one per level"
+        );
+        let marker_styles: Vec<StyleId> = marker_runs.iter().map(|run| run.style_id).collect();
+        assert!(
+            marker_styles
+                .iter()
+                .all(|s| *s == StyleId::Semantic(Semantic::Heading(level))),
+            "H{level}'s markers sit inside its band, so every one of them must take \
+             Heading({level}) — anything else opens a hole at the band's left edge: \
+             {marker_styles:?}"
+        );
+    }
 }
 
 /// A space next to a link is not part of the link.

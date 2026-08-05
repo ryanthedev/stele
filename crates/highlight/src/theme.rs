@@ -183,16 +183,19 @@ impl Theme {
             Semantic::LineNumber | Semantic::GutterBorder if fg.is_some() => Style::default(),
             other => semantic_attrs(other),
         };
-        // The H1 wash. Gated on `fg` rather than on the color mode for the
-        // same reason the ladder is: a heading with no color resolved is
+        // The heading wash. Gated on `fg` rather than on the color mode for
+        // the same reason the ladder is: a heading with no color resolved is
         // monochrome in practice, and a background under NO_COLOR would be
         // a color arriving through the back door.
-        // Matched on the *clamped* level, not the literal 1 — every other
-        // heading consumer here clamps, and an out-of-range `Heading(0)` that
-        // resolved to H1's colour but not H1's wash would be a style no level
-        // actually has.
+        //
+        // Which levels wear one is `layout`'s call, not this file's: the band
+        // is spread by padding the line out to the measure, so layout has to
+        // know before this crate ever runs. Asking it keeps the colour and
+        // the padding from drifting into disagreement — a level padded but
+        // not coloured is a wasted run, and coloured but not padded is a band
+        // that stops where the words do.
         let bg = match semantic {
-            Semantic::Heading(level) if fg.is_some() && level.clamp(1, HEADING_LEVELS) == 1 => {
+            Semantic::Heading(level) if fg.is_some() && layout::heading_is_washed(level) => {
                 Some(heading_wash(self.variant))
             }
             // The code slab. Gated on the colour mode rather than on `fg`,
@@ -369,22 +372,29 @@ fn heading_attrs(level: u8, monochrome: bool) -> Style {
         italic: true,
         ..Style::default()
     };
-    // Weight and slope only. The other half of the ladder is *case* — H3/H4
-    // render uppercase and H5/H6 title case — which is a text transform, not
-    // an SGR attribute, so it cannot live in `Style`. See `heading_case`.
+    // Weight and slope only. The rest of the ladder is *case* — H4/H5 render
+    // title case — which is a text transform rather than an SGR attribute so
+    // it cannot live in `Style` (see `heading_case`), and the *band*, which
+    // is a background and lives in the `bg` arm of `resolve_semantic`.
+    //
+    // Weight does not descend monotonically, and that is the point: H3 is
+    // plain and H4 is bold. H3 does not need weight because it wears a band,
+    // and stacking bold on the band would make a sub-subsection shout louder
+    // than the H2 above it. H4 is the first level with neither a band nor a
+    // rule, so weight is the only thing left to lift it off the prose — and
+    // it is the level reference documents repeat most, where an entry that
+    // does not catch the eye is a page you have to read linearly.
     //
     // This no longer maintains a six-way distinct attribute ladder for
     // monochrome. It doesn't need one: every heading is preceded by a run of
     // `level` block markers, and that count survives `ColorMode::NoColor`
-    // untouched (the markers are glyphs; only their color is stripped).
-    // Combined with case, the only pair sharing an attribute set *and* a case
-    // is H1/H2, which the count separates 1-from-2 — the easiest reading in
-    // the set.
+    // untouched (the markers are glyphs; only their color is stripped). The
+    // pairs sharing an attribute set *and* a case are H1/H2/H4 and H3/H5,
+    // and the count separates every one of them.
     let _ = monochrome;
     match level.clamp(1, HEADING_LEVELS) {
-        1 | 2 => bold,
-        3 => bold,
-        4 | 5 => Style::default(),
+        1 | 2 | 4 => bold,
+        3 | 5 => Style::default(),
         _ => italic,
     }
 }
@@ -776,9 +786,10 @@ pub fn background_from_name(name: &str) -> Option<Semantic> {
 /// role has no themeable background.
 ///
 /// Exhaustive over the names rather than over `Semantic`, because the mapping
-/// is deliberately sparse — most roles paint no background at all, and the H1
-/// wash is not themeable (it is derived from the heading ramp, so a theme that
-/// moved it independently could put the title's own colour on top of it).
+/// is deliberately sparse — most roles paint no background at all, and the
+/// heading wash is not themeable (it is derived from the heading ramp, so a
+/// theme that moved it independently could put a heading's own colour on top
+/// of it).
 pub fn background_name(semantic: Semantic) -> Option<&'static str> {
     BACKGROUND_ROLES
         .iter()
@@ -1079,7 +1090,13 @@ fn heading_rung(level: u8) -> usize {
     usize::from(level.clamp(1, HEADING_LEVELS) - 1)
 }
 
-/// The band laid behind the document title's line.
+/// The band laid behind a washed heading's line.
+///
+/// One colour for both washed levels rather than a band per level, and for
+/// the ramp's own reason: the levels are already told apart by the marker
+/// count, the rung and the ember rule, so a second band colour would spend a
+/// palette slot separating what is separated three times over. What differs
+/// between H1's band and H3's is the text lying on it.
 ///
 /// Deliberately close to the page — 1.23:1 against the dark reference and
 /// 1.13:1 against the light one. It is not trying to be legible on its own;
@@ -1087,8 +1104,10 @@ fn heading_rung(level: u8) -> usize {
 /// text sitting on it. Because it is a background rather than a mark, no
 /// contrast floor applies to the band itself — what must clear AA is the
 /// heading text *against* it, which
-/// `test_the_h1_wash_never_costs_the_title_its_contrast` checks directly
-/// rather than assuming the page-background measurement carries over.
+/// `test_the_wash_never_costs_a_heading_its_contrast` checks directly for
+/// every washed level rather than assuming the page-background measurement
+/// carries over. H3 is the binding one: it draws a dimmer rung than H1 on
+/// the same band.
 fn heading_wash(variant: Variant) -> Color {
     let (hue, saturation, _) = match variant {
         Variant::Dark => HEADING_RAMP[0],
@@ -1775,19 +1794,22 @@ mod tests {
             italic: true,
             ..Style::default()
         };
-        // H1 bold · H2 bold · H3 bold (rendered uppercase) · H4 plain
-        // (uppercase) · H5 plain (title case) · H6 italic (title case).
-        // Weight and slope only; `case` below carries the rest, and the
-        // marker count carries what neither does.
-        let ladder = [bold, bold, bold, Style::default(), Style::default(), italic];
+        // H1 bold (banded) · H2 bold · H3 plain (banded) · H4 bold (title
+        // case) · H5 plain (title case) · H6 italic. Weight and slope only;
+        // `case` and `wash` below carry the rest, and the marker count
+        // carries what none of the three does.
+        let ladder = [bold, bold, Style::default(), bold, Style::default(), italic];
         let case = [
             HeadingCase::AsWritten,
             HeadingCase::AsWritten,
-            HeadingCase::Upper,
-            HeadingCase::Upper,
+            HeadingCase::AsWritten,
             HeadingCase::Title,
             HeadingCase::Title,
+            HeadingCase::AsWritten,
         ];
+        // Not a prefix of the ladder and not monotonic: H2 sits unbanded
+        // between the two levels that are.
+        let wash = [true, false, true, false, false, false];
         // Stripping color changes nothing about the attribute ladder — there
         // is no separate monochrome ladder any more, because the markers do
         // not need one.
@@ -1808,11 +1830,15 @@ mod tests {
                     colored[idx],
                     "H{level}'s colored attributes in {variant:?}"
                 );
-                // Exactly one level carries the wash, and it is the title.
+                // The band, asserted against the literal table rather than
+                // against `heading_is_washed` — the point of this test is to
+                // pin the promise, and reading the predicate would only
+                // assert that the predicate equals itself.
                 assert_eq!(
                     got.bg.is_some(),
-                    level == 1,
-                    "H{level} background in {variant:?}: only H1 wears the wash"
+                    wash[idx],
+                    "H{level} background in {variant:?}: H1 and H3 wear the wash, \
+                     nothing else does"
                 );
                 assert_eq!(
                     no_color.resolve(StyleId::Semantic(Semantic::Heading(level))),
@@ -1877,29 +1903,44 @@ mod tests {
         }
     }
 
-    /// The H1 wash sits *behind* the title, so the contrast that matters is
-    /// title-against-band, not title-against-page. Those are different
-    /// numbers, and only one of them is what a reader has to read — a wash
-    /// nudged toward the text's own lightness would pass every other check in
-    /// this file while making the title harder to read than before it existed.
+    /// The wash sits *behind* the heading, so the contrast that matters is
+    /// text-against-band, not text-against-page. Those are different numbers,
+    /// and only one of them is what a reader has to read — a wash nudged
+    /// toward the text's own lightness would pass every other check in this
+    /// file while making the heading harder to read than before it existed.
+    ///
+    /// Run over every washed level, not just the title. One band serves both,
+    /// so the binding level is whichever draws the dimmest rung on it — H3
+    /// today, and the reason a "let's darken the band a little" change is
+    /// riskier than it looks.
     #[test]
-    fn test_the_h1_wash_never_costs_the_title_its_contrast() {
+    fn test_the_wash_never_costs_a_heading_its_contrast() {
+        let washed: Vec<u8> = (1..=HEADING_LEVELS)
+            .filter(|l| layout::heading_is_washed(*l))
+            .collect();
+        assert!(
+            !washed.is_empty(),
+            "no level wears the wash, so this test proves nothing"
+        );
         for variant in [Variant::Dark, Variant::Light] {
             // Both the truecolor values and the 256-color cells they snap to:
             // a terminal in 256-color mode paints the cells, not the ideals.
             for mode in [ColorMode::Truecolor, ColorMode::Downsample256] {
                 let theme = Theme::new(variant, mode);
-                let h1 = theme.resolve(StyleId::Semantic(Semantic::Heading(1)));
-                let (fg, bg) = (
-                    h1.fg.expect("H1 carries a rung color"),
-                    h1.bg.expect("H1 carries the wash"),
-                );
-                let ratio = contrast_ratio(fg, bg);
-                assert!(
-                    ratio >= AA_NORMAL_TEXT,
-                    "H1 title on its own wash is {ratio:.2}:1 in {variant:?}/{mode:?} — \
-                     under AA. The wash has to stay near the page, not drift toward the text."
-                );
+                for &level in &washed {
+                    let heading = theme.resolve(StyleId::Semantic(Semantic::Heading(level)));
+                    let (fg, bg) = (
+                        heading.fg.expect("a washed heading carries a rung color"),
+                        heading.bg.expect("a washed heading carries the wash"),
+                    );
+                    let ratio = contrast_ratio(fg, bg);
+                    assert!(
+                        ratio >= AA_NORMAL_TEXT,
+                        "H{level} on its own wash is {ratio:.2}:1 in {variant:?}/{mode:?} — \
+                         under AA. The wash has to stay near the page, not drift toward \
+                         the text."
+                    );
+                }
             }
         }
     }
