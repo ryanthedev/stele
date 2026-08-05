@@ -22,7 +22,7 @@ use stele::cli::Cli;
 use stele::decor::themed::ThemedDecor;
 use stele::link::{Followed, Navigator, SystemOpener};
 use stele::loader::{DocumentSource, LoadOptions};
-use stele::media::{GfxMediaSink, ImageSizer, NoopMediaSink};
+use stele::media::{GfxMediaSink, ImageSizer, MediaMode, NoopMediaSink, TextMediaSink};
 use stele::painter::{FrameOverlays, Painter, Size};
 use stele::terminal::{
     CellQuery, PanicGuardedWriter, TerminalGuard, install_panic_hook, osc52_copy,
@@ -121,15 +121,26 @@ fn main() -> ExitCode {
     // Relative image paths resolve against the document's own directory.
     let base_dir = source.base_dir();
 
-    // Graphics are off under tmux (which does not pass kitty sequences
-    // through), when the user asks, and on any terminal that isn't Ghostty —
+    // Rasters are off under tmux (which does not pass kitty sequences
+    // through), when the reader asks, and on any terminal that isn't Ghostty —
     // stele targets Ghostty only, and streaming megabytes of base64 APC at a
-    // terminal that cannot decode it is worse than showing alt text. A
-    // disabled sizer reserves no boxes at all, so layout falls through to the
-    // alt-text path and the media sink is never invoked — the structural
-    // guarantee behind DW-6.4.
+    // terminal that cannot decode it is worse than showing alt text.
+    //
+    // The three causes are not one thing, which is why this is a `MediaMode`
+    // and not the single bool it used to be. `--no-images` is a reader stating
+    // a preference and its answer is documented in `--help`: alt text and TeX
+    // source, no boxes reserved at all. `$TMUX` and a non-Ghostty terminal are
+    // the *transport* saying what it can carry, and that says nothing about
+    // whether a formula should be drawn — it only rules out the raster. See
+    // `MediaMode`.
     let is_ghostty = std::env::var("TERM_PROGRAM").is_ok_and(|t| t == "ghostty");
-    let graphics_disabled = cli.no_images || std::env::var_os("TMUX").is_some() || !is_ghostty;
+    let media_mode = if cli.no_images {
+        MediaMode::Suppressed
+    } else if std::env::var_os("TMUX").is_some() || !is_ghostty {
+        MediaMode::TextOnly
+    } else {
+        MediaMode::Full
+    };
 
     let config = LayoutConfig {
         min_width: 24,
@@ -157,10 +168,13 @@ fn main() -> ExitCode {
     // mode (the reply has no newline) and before the alternate-screen switch
     // (so the wait cannot be mistaken for "the first frame is done"). Skipped
     // when graphics are off: nothing would consume the answer.
-    let cell_query = if graphics_disabled {
-        CellQuery::Skip
-    } else {
+    // Asked only when a raster might be produced. `TextOnly` sizes its math
+    // from a grid already measured in cells, so it has nothing to divide by
+    // and no reason to make the terminal answer a question.
+    let cell_query = if media_mode == MediaMode::Full {
         CellQuery::Ask
+    } else {
+        CellQuery::Skip
     };
     let mut guard = match TerminalGuard::enter(cell_query) {
         Ok(guard) => guard,
@@ -178,10 +192,9 @@ fn main() -> ExitCode {
     // to rasterize into — resolution only.
     let geometry = guard.cell_geometry();
 
-    let sizer: Box<dyn IntrinsicSizer> = if graphics_disabled {
-        Box::new(ImageSizer::disabled(&base_dir))
-    } else {
-        Box::new(ImageSizer::new(&base_dir).with_cell_px(geometry.cell_px))
+    let sizer: Box<dyn IntrinsicSizer> = match media_mode {
+        MediaMode::Full => Box::new(ImageSizer::new(&base_dir).with_cell_px(geometry.cell_px)),
+        mode => Box::new(ImageSizer::in_mode(&base_dir, mode)),
     };
 
     let mut session = Session {
@@ -196,7 +209,7 @@ fn main() -> ExitCode {
         last_failure: None,
         last_tick: Instant::now(),
         nav: Navigator::new(Box::new(SystemOpener), options),
-        graphics_disabled,
+        media_mode,
         cell_px: geometry.cell_px,
     };
     // The theme's furniture, with the two flags layered over it. `--no-chrome`
@@ -228,15 +241,18 @@ fn main() -> ExitCode {
     }
 
     let mut painter = Painter::new(WidthEngine::new(WidthConfig::default()));
-    if graphics_disabled {
-        painter.register_media(Box::new(NoopMediaSink));
-    } else {
-        // The sink *shares* the document rather than copying it (DW-2.6): it
-        // resolves image paths and math sources by `NodeId` at paint time,
-        // which is read-only work.
-        painter.register_media(Box::new(
+    // The sinks *share* the document rather than copying it (DW-2.6): they
+    // resolve image paths and math sources by `NodeId` at paint time, which is
+    // read-only work.
+    match media_mode {
+        MediaMode::Full => painter.register_media(Box::new(
             GfxMediaSink::new(Rc::clone(&session.doc), &base_dir).with_cell_px(geometry.cell_px),
-        ));
+        )),
+        MediaMode::TextOnly => painter.register_media(Box::new(TextMediaSink::new(
+            Rc::clone(&session.doc),
+            WidthEngine::new(WidthConfig::default()),
+        ))),
+        MediaMode::Suppressed => painter.register_media(Box::new(NoopMediaSink)),
     }
     // The themed decor provides real syntax highlighting and theme colors.
     // Background is not OSC 11-probed here (that needs a pre-alt-screen query
@@ -330,7 +346,7 @@ struct Session {
     /// media sink at the *new* document's directory: both resolve relative
     /// image paths, and a linked document in another folder would otherwise
     /// look for its images beside the file the reader started from.
-    graphics_disabled: bool,
+    media_mode: MediaMode,
     cell_px: (u32, u32),
 }
 
@@ -484,14 +500,24 @@ impl Session {
     ) {
         painter.reload_media(Rc::clone(&loaded.doc), out);
         let base_dir = source.base_dir();
-        if self.graphics_disabled {
-            self.sizer = Box::new(ImageSizer::disabled(&base_dir));
-            painter.register_media(Box::new(NoopMediaSink));
-        } else {
-            self.sizer = Box::new(ImageSizer::new(&base_dir).with_cell_px(self.cell_px));
-            painter.register_media(Box::new(
-                GfxMediaSink::new(Rc::clone(&loaded.doc), &base_dir).with_cell_px(self.cell_px),
-            ));
+        match self.media_mode {
+            MediaMode::Full => {
+                self.sizer = Box::new(ImageSizer::new(&base_dir).with_cell_px(self.cell_px));
+                painter.register_media(Box::new(
+                    GfxMediaSink::new(Rc::clone(&loaded.doc), &base_dir).with_cell_px(self.cell_px),
+                ));
+            }
+            MediaMode::TextOnly => {
+                self.sizer = Box::new(ImageSizer::in_mode(&base_dir, MediaMode::TextOnly));
+                painter.register_media(Box::new(TextMediaSink::new(
+                    Rc::clone(&loaded.doc),
+                    WidthEngine::new(WidthConfig::default()),
+                )));
+            }
+            MediaMode::Suppressed => {
+                self.sizer = Box::new(ImageSizer::in_mode(&base_dir, MediaMode::Suppressed));
+                painter.register_media(Box::new(NoopMediaSink));
+            }
         }
         self.source = source;
         self.doc = Rc::clone(&loaded.doc);

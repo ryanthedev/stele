@@ -278,13 +278,34 @@ pub fn render(tex: &str, px_height: u32) -> Result<Png, MathError> {
 ///
 /// Returns `None` on any txm parse failure — DW-6.2's third rung (literal
 /// TeX source) is what a caller falls back to next.
+///
+/// Memoized on `tex`, for the same reason [`cached_display_list`] is. This
+/// used to be the rung nothing reached twice: it fired only after RaTeX had
+/// already declined a formula, on a terminal that was rendering rasters for
+/// everything else. It is now the *ordinary* path for every formula on every
+/// terminal that cannot do graphics, called from the sizer on each relayout
+/// and from the sink on each frame — i.e. once per formula per keystroke
+/// while scrolling. A failure is cached too: a `None` from txm is as
+/// deterministic as a grid, and re-deriving it per frame costs a full parse
+/// to learn the same thing.
 pub fn render_text(tex: &str) -> Option<TextGrid> {
     if tex.len() > MAX_TEX_LEN {
         return None;
     }
-    let styled = txm::render(tex).ok()?;
-    let rows = styled.lines().map(strip_ansi_sgr).collect();
-    Some(TextGrid { rows })
+    if let Some(cached) = text_grid_cache().lock().unwrap().get(tex).cloned() {
+        record_text_grid_hit();
+        return cached;
+    }
+    record_text_grid_miss();
+    let grid = txm::render(tex).ok().map(|styled| TextGrid {
+        rows: styled.lines().map(strip_ansi_sgr).collect(),
+    });
+    insert_bounded(
+        &mut text_grid_cache().lock().unwrap(),
+        tex.to_string(),
+        grid.clone(),
+    );
+    grid
 }
 
 /// Strips `ESC [ ... m` SGR sequences (txm's own styling) from one line,
@@ -318,6 +339,8 @@ pub struct CacheStats {
     pub display_list_misses: u64,
     pub png_hits: u64,
     pub png_misses: u64,
+    pub text_grid_hits: u64,
+    pub text_grid_misses: u64,
 }
 
 pub fn cache_stats() -> CacheStats {
@@ -330,6 +353,7 @@ pub fn cache_stats() -> CacheStats {
 pub fn reset_caches_for_test() {
     display_list_cache().lock().unwrap().clear();
     png_cache().lock().unwrap().clear();
+    text_grid_cache().lock().unwrap().clear();
     *stats().lock().unwrap() = Stats::default();
 }
 
@@ -339,6 +363,8 @@ struct Stats {
     display_list_misses: u64,
     png_hits: u64,
     png_misses: u64,
+    text_grid_hits: u64,
+    text_grid_misses: u64,
 }
 
 impl Stats {
@@ -348,6 +374,8 @@ impl Stats {
             display_list_misses: self.display_list_misses,
             png_hits: self.png_hits,
             png_misses: self.png_misses,
+            text_grid_hits: self.text_grid_hits,
+            text_grid_misses: self.text_grid_misses,
         }
     }
 }
@@ -398,6 +426,14 @@ type PngKey = (String, u32);
 
 fn png_cache() -> &'static Mutex<BoundedMap<PngKey, Png>> {
     static CACHE: OnceLock<Mutex<BoundedMap<PngKey, Png>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The txm rung's cache. Values are `Option`, so a formula txm cannot render
+/// is remembered as a failure rather than re-attempted every frame — see
+/// [`render_text`].
+fn text_grid_cache() -> &'static Mutex<BoundedMap<String, Option<TextGrid>>> {
+    static CACHE: OnceLock<Mutex<BoundedMap<String, Option<TextGrid>>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -476,6 +512,12 @@ fn record_display_list_hit() {
 }
 fn record_display_list_miss() {
     stats().lock().unwrap().display_list_misses += 1;
+}
+fn record_text_grid_hit() {
+    stats().lock().unwrap().text_grid_hits += 1;
+}
+fn record_text_grid_miss() {
+    stats().lock().unwrap().text_grid_misses += 1;
 }
 
 /// Cheap, non-rasterizing intrinsic size of `tex` in em units:
@@ -1383,6 +1425,52 @@ mod tests {
         // The PNG cache, keyed by (tex, px_height), correctly treats this
         // as a distinct entry (a genuinely different raster is needed).
         assert_eq!(after_second.png_misses, 2);
+    }
+
+    /// The txm rung is memoized, and a formula txm *rejects* is memoized too.
+    ///
+    /// Both halves matter for the same reason and neither is about speed for
+    /// its own sake. On a terminal that cannot do graphics this rung is not a
+    /// fallback any more, it is the path: the sizer asks on every relayout and
+    /// the sink asks on every frame, so an uncached `render_text` is a full txm
+    /// parse per formula per keystroke while scrolling. Caching only the
+    /// successes would leave the *rejected* formulas — the pathological ones,
+    /// the ones that cost the most to fail — re-parsed forever.
+    #[test]
+    fn test_the_text_grid_rung_is_cached_including_the_formulas_it_rejects() {
+        let _g = test_guard();
+        reset_caches_for_test();
+
+        let good = r"x^2 + 1";
+        let first = render_text(good).expect("txm renders a simple formula");
+        assert_eq!(cache_stats().text_grid_misses, 1);
+        assert_eq!(cache_stats().text_grid_hits, 0);
+
+        let second = render_text(good).expect("the same formula is still renderable");
+        assert_eq!(
+            second, first,
+            "a cached grid must be the grid, not a re-derived look-alike"
+        );
+        assert_eq!(
+            cache_stats().text_grid_misses,
+            1,
+            "the second ask must not re-enter txm"
+        );
+        assert_eq!(cache_stats().text_grid_hits, 1);
+
+        // The rejection half. `\begin{tikzpicture}` is what
+        // `test_dw_6_2_txm_failure_falls_to_literal_rung` uses to reach the
+        // literal rung, so it is a failure this crate already relies on.
+        let bad = r"\begin{tikzpicture}\draw (0,0) -- (1,1);\end{tikzpicture}";
+        assert!(render_text(bad).is_none(), "txm must reject this");
+        assert_eq!(cache_stats().text_grid_misses, 2);
+        assert!(render_text(bad).is_none(), "and keep rejecting it");
+        assert_eq!(
+            cache_stats().text_grid_misses,
+            2,
+            "a remembered failure must not cost a second txm parse"
+        );
+        assert_eq!(cache_stats().text_grid_hits, 2);
     }
 
     #[test]

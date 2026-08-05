@@ -23,6 +23,8 @@ use std::path::{Path, PathBuf};
 use ast::{Document, InlineKind, NodeId, NodeRef};
 use layout::{CellSize, IntrinsicSizer};
 
+use crate::media::MediaMode;
+
 /// Guard rails on the cell geometry this sizer will divide by, applied to
 /// whatever [`ImageSizer::with_cell_px`] is handed. `crate::terminal` already
 /// rejects an implausible answer before it gets here, but `ImageSizer` is
@@ -123,16 +125,18 @@ const MAX_RESERVED_ROWS: u16 = 200;
 
 /// Implements [`IntrinsicSizer`] for both image and math nodes.
 ///
-/// `disabled` is the structural mechanism behind DW-6.4: when `true`,
-/// `size` always returns `None` for every node, so `layout::layout` never
-/// emits a `Reserved` line at all — the document falls back through the
-/// already-tested P4/P5 alt-text path, and `MediaSink::paint` is never
-/// invoked in the first place. The orchestrator sets this from `$TMUX`,
-/// `--no-images`, or a failed capability probe.
+/// [`MediaMode`] is the structural mechanism behind DW-6.4. Under
+/// [`MediaMode::Suppressed`] `size` returns `None` for every node, so
+/// `layout::layout` never emits a `Reserved` line at all — the document falls
+/// back through the already-tested P4/P5 alt-text path, and
+/// `MediaSink::paint` is never invoked in the first place. Under
+/// [`MediaMode::TextOnly`] the same holds for every image and for inline
+/// math; only *display* math reserves a box, sized from the txm grid that
+/// will be painted into it.
 pub struct ImageSizer {
     base_dir: PathBuf,
     limits: gfx::Limits,
-    disabled: bool,
+    mode: MediaMode,
     /// The terminal cell geometry a probed pixel size is divided by to reach
     /// a cell count. Resolved once per session by
     /// [`crate::terminal::query_cell_px`] and handed in via
@@ -154,21 +158,16 @@ impl ImageSizer {
     /// `base_dir` resolves a markdown document's relative image paths
     /// (typically the document file's parent directory).
     pub fn new(base_dir: impl Into<PathBuf>) -> Self {
-        ImageSizer {
-            base_dir: base_dir.into(),
-            limits: gfx::Limits::default(),
-            disabled: false,
-            cell_px: crate::terminal::FALLBACK_CELL_PX,
-        }
+        ImageSizer::in_mode(base_dir, MediaMode::Full)
     }
 
-    /// Builds a sizer that never reserves a box for any node — see the
-    /// struct doc comment's DW-6.4 note.
-    pub fn disabled(base_dir: impl Into<PathBuf>) -> Self {
+    /// Builds a sizer for `mode` — see the struct doc comment's DW-6.4 note
+    /// for what each one reserves.
+    pub fn in_mode(base_dir: impl Into<PathBuf>, mode: MediaMode) -> Self {
         ImageSizer {
             base_dir: base_dir.into(),
             limits: gfx::Limits::default(),
-            disabled: true,
+            mode,
             cell_px: crate::terminal::FALLBACK_CELL_PX,
         }
     }
@@ -211,27 +210,68 @@ impl ImageSizer {
         // RaTeX rung failed to parse: try the txm rung before giving up —
         // this is what makes a txm-rendered formula also get a real
         // Reserved box instead of always bottoming out at literal text.
+        self.size_math_grid(tex)
+    }
+
+    /// The txm rung's own size: the grid measured in display cells.
+    ///
+    /// It asks nothing of `cell_px`, and that is the property that makes it
+    /// the right sizer for [`MediaMode::TextOnly`]. The em path divides a
+    /// pixel width by the terminal's cell width, which means it needs the
+    /// `CSI 16t` answer to be right; a text grid is *already* in cells, so a
+    /// session that never probed the terminal (and `TextOnly` never does —
+    /// there are no rasters to size) still reserves exactly the box the sink
+    /// will fill.
+    fn size_math_grid(&self, tex: &str) -> Option<CellSize> {
         let grid = math::render_text(tex)?;
-        Some(CellSize {
-            cols: grid.cols().max(1),
-            rows: grid.rows_count().max(1),
-        })
+        Some(cap_cells(
+            u64::from(grid.cols().max(1)),
+            u64::from(grid.rows_count().max(1)),
+        ))
     }
 }
 
 impl IntrinsicSizer for ImageSizer {
     fn size(&self, node: NodeId, doc: &Document) -> Option<CellSize> {
-        if self.disabled {
+        if self.mode == MediaMode::Suppressed {
             return None;
         }
         match doc.node(node)? {
             NodeRef::Inline(inline) => match &inline.kind {
-                InlineKind::Image { dest, .. } => self.size_image(dest),
-                InlineKind::Math { tex, .. } => self.size_math(tex),
+                // An image has no second rung: a picture cannot be drawn in
+                // glyphs, so a terminal that cannot carry the raster gets the
+                // alt text through layout's own fallback, exactly as before.
+                InlineKind::Image { dest, .. } => match self.mode {
+                    MediaMode::Full => self.size_image(dest),
+                    MediaMode::TextOnly | MediaMode::Suppressed => None,
+                },
+                InlineKind::Math { tex, display } => match self.mode {
+                    MediaMode::Full => self.size_math(tex),
+                    // Display math only — see [`MediaMode::TextOnly`] for why
+                    // gridding inline math would be a worse read than the TeX
+                    // it replaces. Sized from the grid rather than the em, so
+                    // the box is exactly what the sink will paint into it.
+                    MediaMode::TextOnly if *display => self.size_math_grid(tex),
+                    MediaMode::TextOnly | MediaMode::Suppressed => None,
+                },
                 _ => None,
             },
             NodeRef::Block(_) => None,
         }
+    }
+
+    /// A txm grid is text in cells, not a picture, so it must never be
+    /// aspect-scaled to fit a narrow measure — see
+    /// [`layout::IntrinsicSizer::scalable`]. Every other box this sizer
+    /// produces is a raster and scales as it always did.
+    fn scalable(&self, node: NodeId, doc: &Document) -> bool {
+        if self.mode != MediaMode::TextOnly {
+            return true;
+        }
+        !matches!(
+            doc.node(node),
+            Some(NodeRef::Inline(inline)) if matches!(inline.kind, InlineKind::Math { .. })
+        )
     }
 }
 
@@ -769,11 +809,11 @@ mod tests {
     }
 
     #[test]
-    fn test_dw_6_4_disabled_sizer_yields_no_reserved_boxes_and_full_frame_has_no_kitty_escapes() {
+    fn test_dw_6_4_suppressed_sizer_yields_no_reserved_boxes_and_full_frame_has_no_kitty_escapes() {
         let dir = scratch_dir("dw-6-4-disabled");
         write_png(&dir, "pic.png", 240, 480);
         let doc = Document::parse("![alt text](pic.png)\n\n$x^2$\n");
-        let sizer = ImageSizer::disabled(&dir);
+        let sizer = ImageSizer::in_mode(&dir, MediaMode::Suppressed);
         let engine = WidthEngine::new(WidthConfig::default());
         let tree = layout(&doc, 80, &LayoutConfig::default(), &engine, &sizer);
 
@@ -805,5 +845,125 @@ mod tests {
         assert!(text.contains("alt text"));
         assert!(text.contains("x^2"));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The sibling of the test above, and the whole point of splitting one
+    /// bool into three modes.
+    ///
+    /// `--no-images` is a reader saying what they want and its answer is
+    /// documented — literal TeX. `$TMUX` and a non-Ghostty terminal are the
+    /// *transport* saying what it can carry, which rules out the raster and
+    /// says nothing about the formula. Same document, same absence of kitty
+    /// escapes, different second rung.
+    #[test]
+    fn test_a_text_only_terminal_grids_display_math_while_suppressed_keeps_the_tex() {
+        let dir = scratch_dir("text-only-math");
+        let doc = Document::parse("$$x^2$$\n");
+        let engine = WidthEngine::new(WidthConfig::default());
+
+        let suppressed = ImageSizer::in_mode(&dir, MediaMode::Suppressed);
+        let tree = layout(&doc, 80, &LayoutConfig::default(), &engine, &suppressed);
+        assert!(
+            !has_reserved(&tree),
+            "--no-images must reserve no box at all: the TeX is laid out as text"
+        );
+
+        let text_only = ImageSizer::in_mode(&dir, MediaMode::TextOnly);
+        let tree = layout(&doc, 80, &LayoutConfig::default(), &engine, &text_only);
+        assert!(
+            has_reserved(&tree),
+            "a terminal that cannot raster still has the grid rung for display math"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Inline math stays text under `TextOnly`, and this is a deliberate
+    /// product decision rather than an oversight.
+    ///
+    /// `layout::inline` can only keep a box on the text line when it is one
+    /// row tall. A txm grid is two or three rows the moment a formula has a
+    /// superscript, so gridding `text $x^2$ more text` would flush the line,
+    /// emit a standalone box and flush again — one flowing sentence becomes
+    /// three fragments. The TeX it would have replaced reads better than that.
+    #[test]
+    fn test_text_only_leaves_inline_math_as_flowing_text_rather_than_a_box() {
+        let dir = scratch_dir("text-only-inline");
+        let doc = Document::parse("before $x^2$ after\n");
+        let engine = WidthEngine::new(WidthConfig::default());
+        let sizer = ImageSizer::in_mode(&dir, MediaMode::TextOnly);
+        let tree = layout(&doc, 80, &LayoutConfig::default(), &engine, &sizer);
+        assert!(
+            !has_reserved(&tree),
+            "inline math must not claim rows of its own"
+        );
+        let painted: String = tree
+            .lines(0..tree.line_count())
+            .filter_map(|line| match line {
+                layout::Line::Items(items) => Some(
+                    items
+                        .iter()
+                        .filter_map(|i| match i {
+                            layout::LineItem::Run(run) => Some(run.text.clone()),
+                            layout::LineItem::Box(_) => None,
+                        })
+                        .collect::<String>(),
+                ),
+                layout::Line::Reserved(_) => None,
+            })
+            .collect();
+        assert!(
+            painted.contains("before") && painted.contains("x^2") && painted.contains("after"),
+            "the sentence must survive intact around its formula, got {painted:?}"
+        );
+    }
+
+    /// A grid too wide for the measure keeps every row and loses columns, and
+    /// the alternative is why [`layout::IntrinsicSizer::scalable`] exists.
+    ///
+    /// `emit_box` scales an over-wide box to the content column preserving
+    /// aspect ratio, which is right for a picture and nonsense for text: a
+    /// three-row formula scaled into two rows does not shrink, it simply never
+    /// has its third row requested, and the bottom of the fraction is silently
+    /// gone. A clipped grid reads as truncated; a grid missing its last row
+    /// reads as a different formula.
+    #[test]
+    fn test_a_text_grid_wider_than_the_measure_keeps_every_row_and_clips_instead() {
+        let dir = scratch_dir("text-only-narrow");
+        // A fraction: tall enough that scaling would visibly cost rows.
+        let source = r"$$\frac{a+b+c+d+e+f+m+n+o+p+q}{g+h+i+j+k+l+r+s+t+u+v}$$".to_string() + "\n";
+        let doc = Document::parse(&source);
+        let engine = WidthEngine::new(WidthConfig::default());
+        let sizer = ImageSizer::in_mode(&dir, MediaMode::TextOnly);
+
+        let node = doc
+            .nodes()
+            .find(|n| matches!(n, NodeRef::Inline(i) if matches!(i.kind, InlineKind::Math { .. })))
+            .expect("the document has a math node")
+            .id();
+        let natural = sizer.size(node, &doc).expect("txm renders a fraction");
+
+        // The oracle is the grid's own row count, measured independently of
+        // layout: however narrow the page, the box must still be that tall.
+        let tree = layout(&doc, 24, &LayoutConfig::default(), &engine, &sizer);
+        let rows = tree
+            .lines(0..tree.line_count())
+            .filter(|line| matches!(line, layout::Line::Reserved(_)))
+            .count();
+        assert!(
+            natural.cols > 24,
+            "test setup: the grid must be wider than the measure, got {natural:?}"
+        );
+        assert_eq!(
+            rows,
+            usize::from(natural.rows),
+            "every grid row must survive a narrow measure; scaling dropped {} of them",
+            usize::from(natural.rows).saturating_sub(rows)
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn has_reserved(tree: &layout::LayoutTree) -> bool {
+        tree.lines(0..tree.line_count())
+            .any(|line| matches!(line, layout::Line::Reserved(_)))
     }
 }

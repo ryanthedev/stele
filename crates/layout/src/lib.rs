@@ -184,6 +184,25 @@ impl Chrome {
 /// and the same identity the emitted [`Reserved`] lines carry.
 pub trait IntrinsicSizer {
     fn size(&self, node: NodeId, doc: &Document) -> Option<CellSize>;
+
+    /// Whether a box too wide for the content column may be *scaled* to fit,
+    /// preserving its aspect ratio, or must be clipped to width with its row
+    /// count intact. `true` — scale — is the default and is right for every
+    /// raster.
+    ///
+    /// It is wrong for a box whose contents are *text laid out in cells*: a
+    /// Unicode math grid three rows tall is three rows of glyphs, not a
+    /// picture with an aspect ratio, and scaling it to two rows does not
+    /// shrink it — [`emit_box`](crate::block) simply never asks the sink for
+    /// the third row, so the bottom of the formula is silently missing. A
+    /// clipped-but-complete grid is legible as truncated; a grid with its
+    /// last row dropped reads as a different, wrong formula.
+    ///
+    /// Defaulted so the media seam's other implementors — and every test
+    /// sizer — keep the behaviour they had before this existed.
+    fn scalable(&self, _node: NodeId, _doc: &Document) -> bool {
+        true
+    }
 }
 
 /// The no-media default sizer: declines every node, so every image lays out

@@ -105,6 +105,7 @@ use width::WidthEngine;
 
 use crate::media::MediaSink;
 use crate::media::residency::{RasterCache, Resident};
+use crate::media::rung::{self, text_rung_line};
 use crate::media::sizer::math_baseline_px;
 use crate::painter::{CellRect, sanitize};
 
@@ -507,57 +508,6 @@ impl GfxMediaSink {
         );
     }
 
-    /// Writes one fallback-text row **at `rect`'s own origin**, clipped to
-    /// `rect.width` in **display cells** measured by grapheme cluster — not
-    /// in `char`s.
-    ///
-    /// The leading `CUP` is load-bearing, not decoration. This sink is
-    /// handed a [`CellRect`]; honouring it is the whole contract of the
-    /// seam, and the caller's cursor is not where the box is. `Painter`'s
-    /// `paint_inline_box` blanks the box by *writing* `cols` spaces, which
-    /// leaves the cursor one whole box-width to the right; a fallback row
-    /// written at that cursor lands outside the box and is then either
-    /// overpainted by the following run or erased by the frame's
-    /// `CLEAR_TO_EOL`. Either way the text rungs — image alt text, the txm
-    /// Unicode grid, the literal-TeX source — rendered *nothing at all*,
-    /// which is exactly the degraded path a user hits when a formula won't
-    /// parse or an image won't decode. The graphics rung was never affected:
-    /// [`gfx::Emitter`] positions its placements absolutely.
-    ///
-    /// Positioning here rather than at the call sites also makes the seam
-    /// honour whatever `rect.x` it is handed, so a box indented by a
-    /// blockquote or list gutter needs no second fix on this side.
-    ///
-    /// The cell-measured clip is load-bearing too: CJK alt text and txm's
-    /// own double-width glyphs occupy up to two cells per character, so a
-    /// char-count budget lets the row overflow its reserved box. On the
-    /// bottom viewport row that overflow wraps, which scrolls the alternate
-    /// screen and corrupts the frame. It is [`crate::painter::clip_to_width`]'s
-    /// budget loop, called rather than re-implemented: a second copy of the
-    /// cell-budget arithmetic is the drift risk this guard exists to prevent,
-    /// and the copy that used to live here had already lost the saturating
-    /// width the original returns.
-    fn write_text_row(
-        engine: &WidthEngine,
-        line: Option<&String>,
-        rect: CellRect,
-        out: &mut dyn Write,
-    ) {
-        let text = line.map(String::as_str).unwrap_or("");
-        let (clipped, _) = crate::painter::clip_to_width(text, engine, rect.width.max(1));
-        // Emitted unconditionally, even for an empty row: the frame's
-        // per-line `CLEAR_TO_EOL` fires from wherever this leaves the
-        // cursor, so a row that writes no glyphs still has to leave it at
-        // the box's own origin rather than a box-width past it.
-        let _ = write!(
-            out,
-            "\x1b[{};{}H",
-            rect.y.saturating_add(1),
-            rect.x.saturating_add(1)
-        );
-        let _ = out.write_all(clipped.as_bytes());
-    }
-
     fn resolve_content(
         &mut self,
         reserved: &Reserved,
@@ -566,7 +516,7 @@ impl GfxMediaSink {
     ) -> Resolved {
         let node_id = reserved.node_id;
         let Some(NodeRef::Inline(inline)) = self.doc.node(node_id) else {
-            Self::write_text_row(&self.width_engine, None, rect, out);
+            rung::write_text_row(&self.width_engine, None, rect, out);
             return Resolved::Text(vec![String::new()]);
         };
         match inline.kind.clone() {
@@ -576,7 +526,7 @@ impl GfxMediaSink {
             }
             InlineKind::Math { tex, .. } => self.resolve_math(node_id, tex, reserved, rect, out),
             _ => {
-                Self::write_text_row(&self.width_engine, None, rect, out);
+                rung::write_text_row(&self.width_engine, None, rect, out);
                 Resolved::Text(vec![String::new()])
             }
         }
@@ -719,7 +669,7 @@ impl GfxMediaSink {
     /// The ladder's text rung: paint `text` in the box and remember that
     /// this is what the box resolved to, so its later rows do the same.
     fn degrade_to_text(&self, text: String, rect: CellRect, out: &mut dyn Write) -> Resolved {
-        Self::write_text_row(&self.width_engine, Some(&text), rect, out);
+        rung::write_text_row(&self.width_engine, Some(&text), rect, out);
         Resolved::Text(vec![text])
     }
 
@@ -802,7 +752,7 @@ impl GfxMediaSink {
             // `reserved.row` — not grid line 0 — whenever the box's top has
             // scrolled above the viewport.
             let line = text_rung_line(&lines, reserved, 0);
-            Self::write_text_row(&self.width_engine, line, rect, out);
+            rung::write_text_row(&self.width_engine, line, rect, out);
             return Resolved::Text(lines);
         }
         // Literal rung: the raw TeX source, sanitized.
@@ -825,7 +775,7 @@ impl MediaSink for GfxMediaSink {
         } else if let Some(Resolved::Text(lines)) = self.resolved_this_frame.get(&reserved.node_id)
         {
             let line = text_rung_line(lines, reserved, row_index);
-            Self::write_text_row(&self.width_engine, line, rect, out);
+            rung::write_text_row(&self.width_engine, line, rect, out);
         }
     }
 
@@ -869,45 +819,6 @@ impl MediaSink for GfxMediaSink {
         self.resolved_this_frame.clear();
         self.doc = doc;
     }
-}
-
-/// Which line of a text rung belongs on the box row currently being painted.
-///
-/// `nth_paint` is how many rows of this box this frame has already painted,
-/// so `0` is the box's first *visible* row; `reserved.row` is that row's index
-/// within the whole box, which differs from `nth_paint` by however many of the
-/// box's rows have scrolled above the viewport.
-///
-/// The two rungs need different answers, so this is not one rule:
-///
-/// - A **multi-row** rung — the txm Unicode grid — is a picture drawn in
-///   characters: a superscript raised above its baseline, a fraction bar over
-///   its denominator. Its line *k* means "box row *k*" and nothing else, so it
-///   indexes by [`Reserved::row`], exactly as the raster path crops by it.
-///   Indexing by paint count instead re-anchors the picture on every scroll
-///   step: the exponent of `x^2` slides down onto the baseline and the formula
-///   reads as a different formula.
-/// - A **single-line** rung — image alt text, the literal-TeX source — is not
-///   a picture. It has one line and one chance to be seen, and it is what a
-///   user gets precisely when something has already failed. Indexing it by box
-///   row would make it vanish outright the moment the box is top-truncated,
-///   which is worse than showing it one row low, so it stays anchored to the
-///   box's first visible row.
-///
-/// (This is what `FIXER`'s wave-1 note meant by "fixing it properly means
-/// deciding per-rung behaviour": the blanket rule is wrong in one direction
-/// for each rung.)
-fn text_rung_line<'a>(
-    lines: &'a [String],
-    reserved: &Reserved,
-    nth_paint: u16,
-) -> Option<&'a String> {
-    let index = if lines.len() > 1 {
-        reserved.row
-    } else {
-        nth_paint
-    };
-    lines.get(usize::from(index))
 }
 
 /// The slice of a `rows`-cell-tall box's raster that `visible` rows

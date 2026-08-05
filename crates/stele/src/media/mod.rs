@@ -13,11 +13,60 @@ use layout::Reserved;
 use crate::painter::CellRect;
 
 mod residency;
+mod rung;
 mod sink;
 mod sizer;
+mod text_sink;
 
 pub use sink::GfxMediaSink;
 pub use sizer::ImageSizer;
+pub use text_sink::TextMediaSink;
+
+/// How much of the media ladder this session can actually use.
+///
+/// This replaced a single `graphics_disabled: bool`, and the reason is that
+/// the bool conflated a *request* with a *capability*. Three different
+/// conditions set it — `--no-images`, `$TMUX`, and a `TERM_PROGRAM` that is
+/// not Ghostty — and the first is a reader saying what they want while the
+/// other two are the terminal saying what it can carry. Those deserve
+/// different answers, and with one bool there was nowhere to put the
+/// difference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaMode {
+    /// Ghostty, outside tmux, images wanted: the full ladder.
+    Full,
+    /// The terminal cannot carry a raster — `$TMUX` is set (tmux does not pass
+    /// the kitty APC through) or `TERM_PROGRAM` is not Ghostty.
+    ///
+    /// Images still degrade to alt text, exactly as before, because an image
+    /// has no second rung. Display math does: `math::render_text` draws it as
+    /// a Unicode grid, which is legible where raw TeX source is a wall of
+    /// backslashes. Inline `$…$` math stays TeX source deliberately — a grid
+    /// is two or three rows tall the moment a formula has a superscript, and
+    /// `layout::inline` can only keep a box on the text line if it is one row
+    /// (`inline.rs`'s `size.rows <= 1` arm). Gridding inline math would break
+    /// every sentence containing a formula into three fragments, which is a
+    /// worse read than the TeX it replaced.
+    ///
+    /// **Known cost, stated rather than hidden:** a display formula becomes a
+    /// `Line::Reserved`, and a reserved box carries no text, so `/` cannot
+    /// find a symbol inside one and `y` cannot yank it (see
+    /// `app::append_line_text`, whose offsets must stay byte-identical to what
+    /// is painted — injecting the TeX there would make a match highlight cells
+    /// that paint a grid). This is not a new class of loss: under
+    /// [`MediaMode::Full`] display math has always been a box and has never
+    /// been searchable, so this makes a non-Ghostty terminal behave like
+    /// Ghostty rather than inventing a new gap. Inline math, which is where
+    /// the overwhelming majority of formulas live, stays searchable text.
+    TextOnly,
+    /// The reader asked for no images (`--no-images`): alt text and literal
+    /// TeX source, no boxes reserved at all.
+    ///
+    /// This is the documented contract of the flag — `--help` and the README
+    /// both promise "alt text / TeX source" — so it is the one mode that must
+    /// keep behaving exactly as it did before `MediaMode` existed.
+    Suppressed,
+}
 
 /// P6's hook: paints media into a reserved cell region.
 pub trait MediaSink {

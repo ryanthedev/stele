@@ -450,10 +450,15 @@ impl<'a> Ctx<'a> {
         let cw = self.content_width().max(1);
         let (cols, rows) = if size.cols <= cw {
             (size.cols.max(1), size.rows.max(1))
-        } else {
+        } else if self.sizer.scalable(node_id, self.doc) {
             // Scale to fit, preserving aspect ratio (ceil, at least 1 row).
             let rows = (u32::from(size.rows.max(1)) * u32::from(cw)).div_ceil(u32::from(size.cols));
             (cw, rows.clamp(1, u32::from(u16::MAX)) as u16)
+        } else {
+            // Clip to width, keep every row. See `IntrinsicSizer::scalable`:
+            // the rows of a text grid are not a picture's height, and dropping
+            // one is not a smaller formula, it is a different one.
+            (cw, size.rows.max(1))
         };
         for row in 0..rows {
             let prefix = self.prefix_runs();
