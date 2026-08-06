@@ -4,6 +4,14 @@ on:
   push:
     branches: [main]
   pull_request:
+  # A push event is not a promise that a run gets created. During the Actions
+  # outage of 2026-08-06 two pushes to main queued nothing at all, and the
+  # events do not arrive late — they are simply gone, leaving commits that can
+  # never be shown green. Release cuts from a commit CI has passed, so without
+  # a way to ask for a run by hand the only remedies were a throwaway PR or an
+  # empty commit to move the sha. This is the escape hatch: run CI against any
+  # ref, on demand.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
