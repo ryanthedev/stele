@@ -118,7 +118,7 @@ checksum = "cd898d2dcffeeb51015c511a2849a8637c894b833afc946936d48b1e5c8aa6ec"
 
 [[package]]
 name = "ast"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -706,7 +706,7 @@ dependencies = [
 
 [[package]]
 name = "gfx"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64",
  "image",
@@ -755,7 +755,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "highlight"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ast",
  "layout",
@@ -900,7 +900,7 @@ dependencies = [
 
 [[package]]
 name = "layout"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ast",
  "width",
@@ -1067,7 +1067,7 @@ dependencies = [
 
 [[package]]
 name = "math"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ast",
  "gfx",
@@ -1097,7 +1097,7 @@ dependencies = [
 
 [[package]]
 name = "mermaid"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "mermaid-text",
 ]
@@ -1336,7 +1336,7 @@ dependencies = [
 
 [[package]]
 name = "probe"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64",
  "clap",
@@ -2000,7 +2000,7 @@ dependencies = [
 
 [[package]]
 name = "stele"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ast",
  "base64",
@@ -2813,7 +2813,7 @@ checksum = "a28ac98ddc8b9274cb41bb4d9d4d5c425b6020c50c46f25559911905610b4a88"
 
 [[package]]
 name = "width"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "probe",
  "proptest",
