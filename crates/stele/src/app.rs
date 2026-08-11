@@ -884,7 +884,19 @@ impl AppState {
         old_doc: Option<&Document>,
     ) {
         self.file_info = file_info;
-        self.clear_status();
+        // Cleared for the reason the doc above gives — but only when the row
+        // is the *document's* to speak on. While the explorer is open it is
+        // not: DW-3.10 gives the status row to the listing, and the message
+        // sitting on it is a barricade refusal or a re-list failure that
+        // describes some other file entirely. `stele --watch notes.md`, `_`,
+        // `Enter` on a refused file, and the very next quarter-second tick
+        // that found `notes.md` changed erased the reason the reader had
+        // just asked for. The message that outlives its document is the
+        // hazard here; a message that never described that document was
+        // never in scope.
+        if !matches!(self.mode, Mode::Explore { .. }) {
+            self.clear_status();
+        }
         self.document_changed = true;
         // Captured before clearing: `self.folds.collapsed` is about to be
         // emptied, and this is the only record of which ids to re-key.
@@ -1388,7 +1400,19 @@ impl AppState {
     /// [`Mode::Explore`] — read by `main.rs` before a re-list, so the
     /// directory just being *left* can be looked up by name in the
     /// directory being entered (DW-3.7's noted re-seat-by-name choice).
+    ///
+    /// The `None` half is an invariant, not a hope: every exit from
+    /// [`Mode::Explore`] drops the listing — [`AppState::close_explore`] on
+    /// `Esc`, [`AppState::open_document`] on `Enter` over a document row —
+    /// and [`AppState::install_listing`] is the only thing that installs
+    /// one. The assertion below is what keeps a future third exit honest;
+    /// `open_document` was that third exit until this pass, and this method
+    /// silently answered `Some` in `Mode::Normal` for as long as it was.
     pub fn explore_dir(&self) -> Option<&Path> {
+        debug_assert!(
+            self.explore.is_none() || matches!(self.mode, Mode::Explore { .. }),
+            "a listing outlived Mode::Explore"
+        );
         self.explore.as_ref().map(Listing::dir)
     }
 
@@ -1480,11 +1504,19 @@ impl AppState {
     /// `-` (DW-3.4/DW-3.6): re-lists the parent directory, or does nothing at
     /// the filesystem root, where there is no parent to ascend to — the same
     /// "no such row" no-op `Enter` on a `../` that does not exist would be.
+    ///
+    /// The target is [`crate::explore::Listing::parent`] — the `../` row's
+    /// own recorded path — precisely so that `-` and `Enter` on `../` cannot
+    /// name different directories. This used to call `dir().parent()`
+    /// itself, a second answer to the same question, and both answers were
+    /// wrong for a relative directory: `Path::new(".").parent()` is
+    /// `Some("")`, so `stele .` followed by one `-` queued a read of the
+    /// empty path and left the reader in a listing no key could leave.
     fn ascend_explore(&mut self) {
         let Some(listing) = &self.explore else {
             return;
         };
-        if let Some(parent) = listing.dir().parent() {
+        if let Some(parent) = listing.parent() {
             self.action = Some(PendingAction::ListDirectory(parent.to_path_buf()));
         }
     }
@@ -1964,6 +1996,15 @@ impl AppState {
         self.file_info = file_info;
         self.mode = Mode::Normal;
         self.pending = None;
+        // The listing the reader opened this document *from* is dropped
+        // here, and this is the only place that can drop it: `Enter` on a
+        // document row leaves `Mode::Explore` through this method rather
+        // than through `close_explore`. Left alive it was up to 256 `Entry`
+        // records held for the life of the next document, and — worse than
+        // the memory — it made `explore_dir` answer `Some` in `Mode::Normal`,
+        // falsifying that method's own documented contract for any future
+        // caller that trusted it.
+        self.explore = None;
         self.clear_status();
         self.document_changed = false;
         self.set_scroll(scroll);
@@ -8236,6 +8277,113 @@ mod tests {
                 },
                 "the only row left is index 0 — selected must land there, not stay at 4"
             );
+        }
+
+        /// `-` ascends to the `../` row's **recorded** path, not to whatever
+        /// `dir().parent()` would compute a second time.
+        ///
+        /// The listing here is the shape `stele .` produces: a directory of
+        /// `.` whose parent row points at `..`. `Path::new(".").parent()` is
+        /// `Some("")`, so the old implementation queued a read of the empty
+        /// path and dropped the reader into a listing with no entries, no
+        /// parent row and no working key. This asserts on the exact path
+        /// queued, which is the only assertion that can tell the two apart.
+        #[test]
+        fn test_dash_ascends_to_the_parent_rows_own_path_not_a_recomputed_one() {
+            let (_dir, mut state) = explore_state();
+            let entries = vec![
+                Entry {
+                    name: "..".into(),
+                    path: PathBuf::from(".."),
+                    kind: EntryKind::Parent,
+                },
+                Entry {
+                    name: "notes.md".into(),
+                    path: PathBuf::from("./notes.md"),
+                    kind: EntryKind::Document,
+                },
+            ];
+            let listing = Listing::from_entries(PathBuf::from("."), entries, false);
+            state.install_listing(listing, 1, false);
+            state.handle_key_event(plain(KeyCode::Char('-')));
+            assert_eq!(
+                state.take_action(),
+                Some(PendingAction::ListDirectory(PathBuf::from(".."))),
+                "`-` must follow the ../ row, not `Path::new(\".\").parent()`"
+            );
+        }
+
+        /// `Enter` on a document row leaves `Mode::Explore` through
+        /// `open_document`, which must drop the listing with it — the exit
+        /// that used to leak one.
+        #[test]
+        fn test_opening_a_document_drops_the_listing_behind_it() {
+            let source = numbered_paragraphs(30);
+            let (doc, config, engine, mut state) = build(&source, 80, 5);
+            let dir = PathBuf::from("/fixture/dir");
+            state.install_listing(mixed_listing(&dir), 3, false);
+            assert!(state.explore_dir().is_some(), "test setup: a listing is up");
+
+            let ctx = ctx_for(&doc, &config, &engine);
+            state.open_document(
+                &ctx,
+                FileInfo {
+                    name: "opened.md".to_string(),
+                    byte_size: source.len() as u64,
+                    line_count: source.lines().count(),
+                },
+                0,
+            );
+
+            assert_eq!(state.mode(), Mode::Normal);
+            assert_eq!(
+                state.explore_dir(),
+                None,
+                "`explore_dir` documents itself as `None` outside Mode::Explore, \
+                 and up to 256 `Entry` records were staying resident besides"
+            );
+            assert!(
+                state.explore_rows(10).is_empty(),
+                "and nothing is left for a stale listing to paint"
+            );
+        }
+
+        /// A `--watch` reload must not wipe a message the *explorer* put on
+        /// the status row.
+        ///
+        /// `reload_document` clears the message because a message describes
+        /// the document that produced it, and a reloaded document is a
+        /// different one. An explorer refusal describes a different file
+        /// entirely, and DW-3.10 gives the row to the explorer while it is
+        /// open — so `stele --watch notes.md`, `_`, `Enter` on a refused
+        /// file, and the next quarter-second tick erased the reason.
+        #[test]
+        fn test_a_watch_reload_leaves_an_explorer_message_standing() {
+            let (_doc, config, engine, mut state) = build(&numbered_paragraphs(30), 80, 5);
+            let dir = PathBuf::from("/fixture/dir");
+            state.install_listing(mixed_listing(&dir), 3, false);
+            state.set_status(StatusMessage::new("cannot open: not valid UTF-8"));
+
+            reload(&mut state, &numbered_paragraphs(31), &config, &engine);
+
+            assert_eq!(
+                state.status().message.as_deref(),
+                Some("cannot open: not valid UTF-8"),
+                "the refusal describes the file the reader just tried to open, \
+                 not the document that reloaded underneath the overlay"
+            );
+        }
+
+        /// The other direction, so the fix above cannot be "never clear
+        /// anything": with the explorer closed, a reload still takes the
+        /// message down, and the explorer's own status text comes back once
+        /// the message has aged out.
+        #[test]
+        fn test_a_watch_reload_still_clears_a_document_message_in_normal_mode() {
+            let (_doc, config, engine, mut state) = build(&numbered_paragraphs(30), 80, 5);
+            state.set_status(StatusMessage::new("reload failed: something"));
+            reload(&mut state, &numbered_paragraphs(31), &config, &engine);
+            assert_eq!(state.status().message, None);
         }
     }
 }

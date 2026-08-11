@@ -103,7 +103,10 @@ fuzz_target!(|data: &[u8]| {
     }
 
     let truncated = data[0].is_multiple_of(2);
-    let notice_rows = usize::from(error.is_some() || dropped > 0);
+    // Truncation now speaks on the notice row too (it used to be silent,
+    // on the strength of a "designed consumer" that did not exist), so it
+    // shifts every entry row down by one exactly as the other two do.
+    let notice_rows = usize::from(error.is_some() || dropped > 0 || truncated);
     let listing = Listing::from_parts(PathBuf::from("/fuzz"), entries, truncated, error, dropped);
 
     let rows = listing.rows(height, selected);
@@ -113,19 +116,28 @@ fuzz_target!(|data: &[u8]| {
     );
 
     // Whenever an entry row was painted at all, exactly one carries the
-    // cursor, and it is the row for the (clamped) selected entry.
+    // cursor, and it is the row for the (clamped) selected entry — unless
+    // that entry is `Unopenable`, which paints dim and carries no cursor at
+    // all, because reverse video promises an `Enter` that row would refuse.
     if rows.len() > notice_rows {
         let picked: Vec<&stele::explore::OverlayRow> = rows
             .iter()
             .filter(|row| row.style == RowStyle::Selected)
             .collect();
-        assert_eq!(picked.len(), 1, "exactly one row must carry the cursor");
         let clamped = selected.min(listing.entries().len() - 1);
-        assert_eq!(
-            picked[0].text,
-            expected_row_text(&listing.entries()[clamped]),
-            "the cursor landed on the wrong row"
-        );
+        if listing.entries()[clamped].kind == EntryKind::Unopenable {
+            assert!(
+                picked.is_empty(),
+                "an unselectable selection must carry no cursor"
+            );
+        } else {
+            assert_eq!(picked.len(), 1, "exactly one row must carry the cursor");
+            assert_eq!(
+                picked[0].text,
+                expected_row_text(&listing.entries()[clamped]),
+                "the cursor landed on the wrong row"
+            );
+        }
     }
     if notice_rows == 1 && !rows.is_empty() {
         assert_eq!(

@@ -197,6 +197,14 @@ pub enum Start {
     /// unchanged.
     Document(DocumentSource),
     /// Browse this directory instead of loading anything.
+    ///
+    /// **Absolute and lexically normalized**, whatever was typed:
+    /// [`crate::explore::absolute_dir`] runs on the way out of
+    /// [`Cli::start`], so `stele .`, `stele docs` and `stele ./docs/` all
+    /// arrive here as a path whose parent directory is a real directory
+    /// rather than the empty path `Path::parent` answers for a
+    /// single-component relative path. No `canonicalize`: a symlinked
+    /// directory keeps the name the reader typed.
     Explore(PathBuf),
 }
 
@@ -285,9 +293,11 @@ impl Cli {
     /// explicit positional), so the rule cannot drift between them.
     fn explore_or_watch_conflict(&self, dir: PathBuf) -> Result<Start, CliError> {
         if self.watch {
+            // The refusal names what the reader typed, not the normalized
+            // form: `stele --watch .` should complain about `.`.
             return Err(CliError::WatchDirectory(dir));
         }
-        Ok(Start::Explore(dir))
+        Ok(Start::Explore(crate::explore::absolute_dir(&dir)))
     }
 
     /// The source-text policy these flags name.

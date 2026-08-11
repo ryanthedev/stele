@@ -632,10 +632,181 @@ fn test_dw_3_10_the_status_row_shows_the_listed_directory() {
 /// **DW-3.12.** Bare `stele` (no document argument) opens the explorer at
 /// the current directory through the real binary; `q` exits and restores
 /// the terminal via the extended harness.
+///
+/// **The frame assertions are the half this test was missing.** It used to
+/// be the `assert_restores_the_terminal_in` call alone, which checks
+/// alt-screen entry, raw mode and restore — every one of them mode-agnostic.
+/// A review deleted the rooted `install_listing` call in a throwaway
+/// worktree, so bare `stele` opened no explorer at all, and this test still
+/// passed: it was named after a behavior it never looked at. So the frame
+/// is read first, and the listing and the status row are asserted on
+/// directly; the restore harness follows as the second, separate claim it
+/// always was.
 #[test]
 fn test_dw_3_12_bare_stele_opens_the_explorer_at_cwd_and_q_restores_the_terminal() {
     let dir = fixture("dw-3-12");
+
+    let pty = Pty::open();
+    let mut child = spawn_viewer_in_dir(&pty, &[], ChildStdin::Tty, Graphics::Off, &dir);
+    let frame = read_one_frame(pty.master_fd(), DEADLINE);
+    let body = screen(&frame);
+    for name in ["../", "alpha.md", "index.md", "sub/", "zeta.md"] {
+        assert!(
+            body.contains(name),
+            "bare stele must paint the cwd's listing, missing {name}:\n{body}"
+        );
+    }
+    assert_eq!(
+        reversed_text(&frame),
+        vec!["alpha.md".to_string()],
+        "and seat the cursor on the first real entry, not on `../`"
+    );
+    // A fragment, not the whole path: `getcwd` resolves `/var` to
+    // `/private/var` on macOS, and the result plus the scratch tag runs past
+    // 80 columns, where `clip_to_width` cuts it.
+    assert!(
+        status(&frame).contains("stele-test-explorer"),
+        "the status row must name the listed directory, got {:?}",
+        status(&frame)
+    );
+    quit_and_reap(&pty, &mut child);
+
     assert_restores_the_terminal_in("q (bare stele)", Exit::Key(b"q"), &[], Some(&dir));
+}
+
+// ---------------------------------------------- relative arguments (F1, pty)
+//
+// `stele .` shipped a dead end: `Path::new(".").parent()` is `Some("")`, so
+// the `../` row pointed at the empty path and one press of `-` — or one
+// `Enter` on `../` — landed the reader in `cannot read directory: No such
+// file or directory` with no key that could leave it. Every other pty
+// fixture here passes an absolute path, which is why nothing caught it.
+// These three drive the three relative doors: a relative directory
+// argument, `.`, and `_` from a relatively-named document.
+
+/// `stele sub` — a single-component relative directory — ascends with `-`.
+#[test]
+fn test_a_relative_directory_argument_ascends_with_dash() {
+    let dir = fixture("relative-dir-arg");
+    let pty = Pty::open();
+    let mut child = spawn_viewer_in_dir(
+        &pty,
+        &[std::ffi::OsStr::new("sub")],
+        ChildStdin::Tty,
+        Graphics::Off,
+        &dir,
+    );
+    let opened = screen(&read_one_frame(pty.master_fd(), DEADLINE));
+    assert!(
+        opened.contains("inner.md"),
+        "`stele sub` must list `sub`:\n{opened}"
+    );
+
+    let up = screen(&press(&pty, b"-"));
+    assert!(
+        !up.contains("cannot read directory"),
+        "`-` from a relative directory must ascend, not fail:\n{up}"
+    );
+    for name in ["alpha.md", "index.md", "sub/", "zeta.md"] {
+        assert!(
+            up.contains(name),
+            "`-` must land in the parent directory, missing {name}:\n{up}"
+        );
+    }
+    quit_and_reap(&pty, &mut child);
+}
+
+/// `stele .` ascends with `Enter` on the `../` row — the other key that
+/// reaches the same target, and the one that reads it off the row rather
+/// than recomputing it.
+#[test]
+fn test_a_dot_argument_ascends_with_enter_on_the_parent_row() {
+    let dir = fixture("relative-dot-arg");
+    let pty = Pty::open();
+    let mut child = spawn_viewer_in_dir(
+        &pty,
+        &[std::ffi::OsStr::new(".")],
+        ChildStdin::Tty,
+        Graphics::Off,
+        &dir.join("sub"),
+    );
+    let opened = read_one_frame(pty.master_fd(), DEADLINE);
+    assert!(
+        screen(&opened).contains("inner.md"),
+        "`stele .` must list the current directory:\n{}",
+        screen(&opened)
+    );
+
+    // `k` from the only real entry lands on `../`; `Enter` there ascends.
+    let on_parent = press(&pty, b"k");
+    assert_eq!(reversed_text(&on_parent), vec!["../".to_string()]);
+    let up = screen(&press(&pty, b"\r"));
+    assert!(
+        !up.contains("cannot read directory"),
+        "`Enter` on `../` from `.` must ascend, not fail:\n{up}"
+    );
+    for name in ["alpha.md", "index.md", "sub/", "zeta.md"] {
+        assert!(
+            up.contains(name),
+            "`Enter` on `../` must land in the parent, missing {name}:\n{up}"
+        );
+    }
+    quit_and_reap(&pty, &mut child);
+}
+
+/// `stele inner.md` — a document named with no directory at all, so
+/// `base_dir()` answers `"."` — opens an explorer with a working `../`.
+#[test]
+fn test_underscore_from_a_relatively_named_document_ascends() {
+    let dir = fixture("relative-doc-arg");
+    let pty = Pty::open();
+    let mut child = spawn_viewer_in_dir(
+        &pty,
+        &[std::ffi::OsStr::new("inner.md")],
+        ChildStdin::Tty,
+        Graphics::Off,
+        &dir.join("sub"),
+    );
+    read_until(pty.master_fd(), b"inner-document-marker", DEADLINE);
+
+    let explorer = press(&pty, b"_");
+    assert_eq!(
+        reversed_text(&explorer),
+        vec!["inner.md".to_string()],
+        "`_` seats on the open document's own row"
+    );
+    // `base_dir()` answers `"."` for a document named with no directory, and
+    // `main.rs` normalizes it on the way in. The status row is where that
+    // shows: a bare `.` here would mean the explorer is running on a path
+    // whose own name it cannot report.
+    assert!(
+        status(&explorer).starts_with('/'),
+        "the listed directory must be named absolutely, got {:?}",
+        status(&explorer)
+    );
+
+    let up = press(&pty, b"-");
+    let body = screen(&up);
+    assert!(
+        !body.contains("cannot read directory"),
+        "`-` after `_` from a bare filename must ascend, not fail:\n{body}"
+    );
+    for name in ["alpha.md", "index.md", "sub/", "zeta.md"] {
+        assert!(
+            body.contains(name),
+            "`-` must land in the parent, missing {name}:\n{body}"
+        );
+    }
+    // And the retrace works: the directory just left takes the cursor, so
+    // `Enter` goes straight back down. That lookup is by the leaving
+    // directory's `file_name`, and `Path::new(".").file_name()` is `None` —
+    // so an unnormalized `"."` loses the reader's place silently.
+    assert_eq!(
+        reversed_text(&up),
+        vec!["sub/".to_string()],
+        "`-` must seat the cursor on the directory just left"
+    );
+    quit_and_reap(&pty, &mut child);
 }
 
 /// **DW-3.13, pty half.** `stele <dir>` opens the explorer and the rendered
@@ -742,4 +913,51 @@ fn test_dw_3_16_an_unreadable_cwd_shows_a_named_notice_instead_of_a_blank_explor
 
     quit_and_reap(&pty, &mut child);
     let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+}
+
+/// **DW-3.16, and the evidence behind this pass's decision to keep the
+/// behavior the item's literal wording does not describe.**
+///
+/// The item says an unreadable cwd should "exit with a named error rather
+/// than an empty explorer or a panic". What the binary does instead is open
+/// the explorer, name the error on a notice row, and leave the `../` row
+/// working. The two failure modes DW-3.16 actually names — an *empty*
+/// explorer and a panic — are both avoided; refusing to start is a third
+/// thing, and a worse one, because a reader whose cwd is unreadable would be
+/// left with no way to reach a directory that is. This test is the proof
+/// that the alternative is real: the reader ascends out under their own
+/// power. The plan's wording is corrected to match rather than the code.
+#[test]
+fn test_dw_3_16_an_unreadable_cwd_can_still_be_escaped_upward() {
+    let dir = fixture("dw-3-16-escape");
+    let locked = dir.join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    // Execute-only: `chdir` into it succeeds, `read_dir` does not.
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o100)).unwrap();
+
+    let pty = Pty::open();
+    let mut child = spawn_viewer_in_dir(&pty, &[], ChildStdin::Tty, Graphics::Off, &locked);
+    let frame = read_one_frame(pty.master_fd(), DEADLINE);
+    assert!(
+        frame.to_lowercase().contains("cannot read directory"),
+        "the notice names the error:\n{}",
+        screen(&frame)
+    );
+    assert_eq!(
+        reversed_text(&frame),
+        vec!["../".to_string()],
+        "with nothing else selectable, the cursor seats on the way out"
+    );
+
+    let up = screen(&press(&pty, b"-"));
+    for name in ["alpha.md", "index.md", "locked/", "zeta.md"] {
+        assert!(
+            up.contains(name),
+            "`-` must escape an unreadable cwd into its readable parent, \
+             missing {name}:\n{up}"
+        );
+    }
+
+    quit_and_reap(&pty, &mut child);
+    let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700));
 }

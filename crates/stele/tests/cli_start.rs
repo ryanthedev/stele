@@ -160,3 +160,90 @@ fn test_an_existing_non_directory_special_file_is_still_document() {
         Start::Document(DocumentSource::Path(path))
     );
 }
+
+// ------------------------------------------- relative directory arguments (F1)
+//
+// The untested form of the whole feature, and the one that shipped broken.
+// Every test above builds an absolute path from `std::env::temp_dir()`, and
+// `Path::parent` is only wrong about relative paths: it answers `Some("")`,
+// not `None`, for a single component. A `Start::Explore(".")` therefore
+// reached the explorer verbatim and produced a `../` row aimed at the empty
+// path — one press of `-` and the reader was in a listing with no entries,
+// no parent, and no key that could leave it.
+//
+// `src` is used as the sample relative directory: these tests run with the
+// package root as their working directory, and a crate that has no `src` has
+// no tests either.
+
+/// `stele .` browses the current directory, named absolutely.
+#[test]
+fn test_a_dot_argument_resolves_to_the_absolute_current_directory() {
+    let cwd = std::env::current_dir().unwrap();
+    assert_eq!(
+        Cli::parse_from(["stele", "."]).start().unwrap(),
+        Start::Explore(cwd)
+    );
+}
+
+/// `stele src`, `stele ./src` and `stele ./src/` are the same directory, and
+/// all three name it absolutely.
+#[test]
+fn test_relative_directory_arguments_resolve_against_the_current_directory() {
+    let expected = Start::Explore(std::env::current_dir().unwrap().join("src"));
+    for arg in ["src", "./src", "./src/", "./src/../src"] {
+        assert_eq!(
+            Cli::parse_from(["stele", arg]).start().unwrap(),
+            expected,
+            "`stele {arg}` must resolve to the same absolute directory"
+        );
+    }
+}
+
+/// `stele ..` resolves upward rather than to the empty path, and `..`
+/// components inside a longer argument cancel.
+#[test]
+fn test_dotdot_arguments_resolve_upward() {
+    let cwd = std::env::current_dir().unwrap();
+    let parent = cwd.parent().expect("the package root has a parent");
+    assert_eq!(
+        Cli::parse_from(["stele", ".."]).start().unwrap(),
+        Start::Explore(parent.to_path_buf())
+    );
+    assert_eq!(
+        Cli::parse_from(["stele", "src/.."]).start().unwrap(),
+        Start::Explore(cwd)
+    );
+}
+
+/// Resolution is lexical: a symlinked directory keeps the name that was
+/// typed rather than being canonicalized to its target, so the reader
+/// ascends back the way they came in.
+#[cfg(unix)]
+#[test]
+fn test_a_directory_argument_is_not_canonicalized_to_its_target() {
+    let dir = scratch_dir("no-canonicalize");
+    let target = dir.join("real");
+    std::fs::create_dir(&target).unwrap();
+    let link = dir.join("link");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    assert_eq!(
+        Cli::parse_from(["stele", link.to_str().unwrap()])
+            .start()
+            .unwrap(),
+        Start::Explore(link),
+        "the link's own path, not `.../real`"
+    );
+}
+
+/// The `--watch <dir>` refusal still names what the reader typed. Normalizing
+/// the path is the explorer's business; an error message about an argument is
+/// not the place to hand back a form they did not write.
+#[test]
+fn test_watch_with_a_relative_directory_names_what_was_typed() {
+    let err = Cli::parse_from(["stele", ".", "--watch"])
+        .start()
+        .unwrap_err();
+    assert_eq!(err, CliError::WatchDirectory(PathBuf::from(".")));
+    assert!(err.to_string().contains("(.)"), "message was: {err}");
+}

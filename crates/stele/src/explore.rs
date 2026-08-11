@@ -26,10 +26,10 @@
 //! something the barricade then refuses. It must never refuse something the
 //! command line accepts.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// The most directory entries [`Listing::read`] will consider.
 ///
@@ -49,7 +49,68 @@ use std::path::{Path, PathBuf};
 /// and 20 000 at 32.35 ms against the real function: 9.99× for 10×, which is
 /// no bound whatsoever, and precisely the hazard this constant exists to
 /// close.
+///
+/// **What it does not bound: wall-clock time — and no value of it could.**
+/// An earlier version of this comment claimed the cap closed the hazard
+/// outright. It closes the *count*. [`Listing::read`] runs synchronously on
+/// the event-loop thread (`main.rs`'s `perform_action`) inside raw mode,
+/// where `ISIG` is off and `Ctrl-C` is therefore a keystroke rather than a
+/// signal — see `link.rs`'s barricade notes, which record the same fact.
+/// One `fs::metadata` against a hung NFS or SMB mount, or against an autofs
+/// mount point that triggers a mount when it is `stat`ed, blocks for the
+/// server or mount timeout; 512 bounded calls are 512 unbounded waits, and
+/// `Enter` on a `../` row that ascends into a stale mount reaches it. A
+/// FIFO cannot do this to `fs::metadata` — that is what the barricade's
+/// `open(2)` guards are for — but a dead server can, through a door those
+/// guards do not cover.
+///
+/// **Deliberately not fixed, and this is the reasoning rather than a
+/// silence.** The only real fix is to stop reading the directory on the
+/// thread that reads keys: hand the path to a worker, paint a cancellable
+/// "reading…" frame, and install the listing if and when it arrives — a
+/// feature with its own state machine, cancellation semantics and tests,
+/// not a hardening tweak, and one that would have to be threaded through
+/// [`Listing::read`]'s totality contract. It is also not a hazard this
+/// module introduces: the same event loop already blocks the same way on
+/// `Navigator::open_path` reading a document off that mount, and on
+/// `--watch`'s quarter-second `stat` of the watched file. Closing this one
+/// door while those two stand open would buy a reader nothing. When it is
+/// fixed it should be fixed for all three at once.
 const MAX_LISTING_ENTRIES: usize = 256;
+
+/// The directory path the explorer works in: `dir` made absolute against the
+/// current directory, with every `.` dropped and every `..` cancelled.
+///
+/// **The barricade every path crossing into the explorer passes through**,
+/// and it exists because of [`Path::parent`]: for a single-component
+/// relative path that answers `Some("")`, not `None`.
+/// `Path::new(".").parent()` and `Path::new("docs").parent()` are both the
+/// empty path, which no `read_dir` can open. A `stele .` whose start
+/// directory reached [`Listing::read`] verbatim therefore built a `../` row
+/// aimed at `""`, and one press of `-` landed the reader in a listing with
+/// no entries, no parent and no key that could leave it.
+/// `loader.rs`'s `DocumentSource::base_dir` has always guarded that same
+/// trap for image paths; this is the explorer's half of the same guard.
+///
+/// Lexical, and deliberately **not** [`fs::canonicalize`]: no `stat`, no
+/// symlink resolution. A directory reached through a symlink keeps the name
+/// the reader typed and ascends back the way they came rather than jumping
+/// to the link's target's parent, a directory that cannot be read still
+/// normalizes (its unreadability is [`Listing::read`]'s to report, not this
+/// function's), and nothing here can block on a dead mount. Cancelling
+/// `x/..` without consulting the filesystem is what `cd ..` does in a shell
+/// and what a `../` row means to a reader.
+///
+/// Falls back to the lexically-normalized `dir` when the current directory
+/// cannot be read at all — a process whose cwd was deleted out from under
+/// it. That leaves a relative `dir` relative, which [`Listing::read`] still
+/// handles correctly; a degraded answer, not a broken one.
+pub fn absolute_dir(dir: &Path) -> PathBuf {
+    match std::env::current_dir() {
+        Ok(cwd) => lexical(&cwd.join(dir)),
+        Err(_) => lexical(dir),
+    }
+}
 
 /// A directory read into classified, ordered rows.
 ///
@@ -85,8 +146,9 @@ pub struct Entry {
 /// matched, per `docs/code-standards.md`'s "no wildcard arms" rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryKind {
-    /// The `../` row. Present unless `dir` has no parent (the filesystem
-    /// root).
+    /// The `../` row. Present unless `dir` is its own parent — the
+    /// filesystem root, and nothing else (see [`absolute_dir`] for why a
+    /// relative `dir` is not the second case it once was).
     Parent,
     /// A directory, or a symlink resolving to one.
     Directory,
@@ -124,7 +186,8 @@ pub enum RowStyle {
     /// The row under the cursor — reverse video, the one attribute legible
     /// against either theme (the overlay has no theme roles of its own).
     Selected,
-    /// An [`EntryKind::Unopenable`] row not currently selected.
+    /// An [`EntryKind::Unopenable`] row — selected or not. Dim wins over
+    /// the cursor; [`Listing::rows`] says why.
     Dimmed,
 }
 
@@ -144,6 +207,11 @@ impl Listing {
     /// Following the symlink is bounded for the reason [`classify`] gives: a
     /// cycle returns `ELOOP`, it does not hang.
     ///
+    /// Bounded in syscall *count*. Not in wall-clock time, and this call
+    /// runs on the thread that reads keys — [`MAX_LISTING_ENTRIES`] records
+    /// what that exposes, why the cap cannot close it, and what a real fix
+    /// would have to look like.
+    ///
     /// **A partial read is reported, never hidden.** An entry whose
     /// `read_dir` step or `symlink_metadata` fails is left out — there is no
     /// honest row to paint for a name whose type is unknown — but it is
@@ -158,10 +226,13 @@ impl Listing {
     /// reported the same way.
     pub fn read(dir: &Path) -> Listing {
         let mut entries = Vec::new();
-        if let Some(parent) = dir.parent() {
+        // [`parent_dir`], never `dir.parent()` — see that function for the
+        // two paths `Path::parent` is wrong about, one of which (`.`) is
+        // what `stele .` hands this function.
+        if let Some(parent) = parent_dir(dir) {
             entries.push(Entry {
                 name: OsString::from(".."),
-                path: parent.to_path_buf(),
+                path: parent,
                 kind: EntryKind::Parent,
             });
         }
@@ -258,6 +329,21 @@ impl Listing {
         &self.entries
     }
 
+    /// Where `-` ascends to: the `../` row's own recorded target, or `None`
+    /// at the filesystem root.
+    ///
+    /// Read off the row rather than recomputed from [`Listing::dir`], so the
+    /// key and the row cannot disagree about where "up" is. They did:
+    /// `AppState::ascend_explore` asked `dir().parent()` itself, which meant
+    /// the two answers were only ever equal by coincidence and were both
+    /// wrong for a relative directory — see [`parent_dir`].
+    pub fn parent(&self) -> Option<&Path> {
+        self.entries
+            .first()
+            .filter(|entry| entry.kind == EntryKind::Parent)
+            .map(|entry| entry.path.as_path())
+    }
+
     /// `true` if [`Listing::read`] stopped at [`MAX_LISTING_ENTRIES`] rather
     /// than exhausting the directory.
     pub fn truncated(&self) -> bool {
@@ -294,10 +380,17 @@ impl Listing {
     /// still shows the way back up.
     ///
     /// `selected` is **clamped**, not validated: an index past the end lands
-    /// on the last row rather than painting no cursor at all, and an index
-    /// naming an `Unopenable` row is still highlighted — painting honors the
-    /// caller's selection, and only the `*_selectable` movement methods
-    /// enforce "never lands on `Unopenable`".
+    /// on the last row rather than painting no cursor at all.
+    ///
+    /// The one selection this does not honor is an [`EntryKind::Unopenable`]
+    /// row, which paints [`RowStyle::Dimmed`] even when it is the selected
+    /// index. Reverse video is a promise that `Enter` opens this row, and
+    /// `Enter` refuses that one — so the promise must not be made. Nothing
+    /// *seats* the cursor there any more either
+    /// ([`Listing::seat`] checks the kind, the three movement methods always
+    /// did), which leaves exactly one listing where the difference shows: one
+    /// with no selectable row at all, where the honest frame has no cursor
+    /// in it because there is nowhere for a cursor to be.
     pub fn rows(&self, height: u16, selected: usize) -> Vec<OverlayRow> {
         let height = usize::from(height);
         if height == 0 {
@@ -354,10 +447,14 @@ impl Listing {
         out.extend(self.entries[first..first + window].iter().enumerate().map(
             |(offset, entry)| {
                 let index = first + offset;
-                let style = if index == selected {
-                    RowStyle::Selected
-                } else if entry.kind == EntryKind::Unopenable {
+                // Dim beats the cursor, deliberately — see this method's
+                // doc. The two arms used to be the other way round, which
+                // let a listing with nothing selectable paint reverse video
+                // on a row `Enter` would refuse.
+                let style = if entry.kind == EntryKind::Unopenable {
                     RowStyle::Dimmed
+                } else if index == selected {
+                    RowStyle::Selected
                 } else {
                     RowStyle::Ordinary
                 };
@@ -378,21 +475,105 @@ impl Listing {
     /// both. That is what keeps the notice offset in [`Listing::rows`] a
     /// zero-or-one, and it is stated here rather than left to be inferred.
     ///
-    /// Truncation deliberately gets no row. It is an expected, bounded
-    /// consequence of this module's own cap with a designed consumer
-    /// already — [`Listing::truncated`], read by the status row and by
-    /// Phase 4's "a truncated listing can infer no deletions" rule. A
-    /// dropped entry had no channel at all, which is exactly why an
-    /// unsearchable directory could paint as empty.
+    /// **Truncation says so here, and the claim that it did not need to was
+    /// false.** This comment used to argue that truncation could stay silent
+    /// because [`Listing::truncated`] had "a designed consumer already —
+    /// the status row". It had none: `explore_status_text` returns the
+    /// directory path and nothing else, and nothing else in the crate read
+    /// the flag. So a directory over [`MAX_LISTING_ENTRIES`] painted a
+    /// listing that looked complete and was not — and worse than a missing
+    /// tail, because the survivors are the first `MAX_LISTING_ENTRIES` in
+    /// `readdir` order and only *then* sorted, so the missing names are
+    /// scattered arbitrarily through the alphabet with nothing to mark the
+    /// gaps. That is precisely the module doc's "must never refuse
+    /// something the command line accepts", failing quietly.
+    ///
+    /// The cap itself stays. Paging is a feature, not a fix; a bigger cap
+    /// moves the same cliff without removing it and buys more of the
+    /// wall-clock exposure [`MAX_LISTING_ENTRIES`] documents; and reading
+    /// every name before sorting so the omission is a clean alphabetical
+    /// tail would make the `readdir` walk itself unbounded, which is the
+    /// same trade in a different currency. What was actually wrong was the
+    /// silence, so the silence is what changed.
+    ///
+    /// Still at most one row, which is what keeps the notice offset in
+    /// [`Listing::rows`] a zero-or-one: an error returns before any entry is
+    /// considered, so [`Listing::read`] never produces both, and truncation
+    /// and dropped entries — which *can* co-occur — share one line.
     fn notice(&self) -> Option<String> {
         if let Some(error) = &self.error {
             return Some(format!("cannot read directory: {error}"));
         }
-        match self.dropped {
-            0 => None,
-            1 => Some("1 entry could not be read".to_string()),
-            dropped => Some(format!("{dropped} entries could not be read")),
+        let mut parts = Vec::new();
+        if self.truncated {
+            // "some names are missing", not "the rest are below": the
+            // omitted entries are scattered through the sort order, and a
+            // reader who is told the tail was cut would trust the alphabet.
+            parts.push(format!(
+                "listing capped at {MAX_LISTING_ENTRIES} entries: some names are missing"
+            ));
         }
+        match self.dropped {
+            0 => {}
+            1 => parts.push("1 entry could not be read".to_string()),
+            dropped => parts.push(format!("{dropped} entries could not be read")),
+        }
+        (!parts.is_empty()).then(|| parts.join("; "))
+    }
+
+    /// Where the cursor lands in a freshly-read listing: the row named by
+    /// `seed`, or [`Listing::default_selection`] when there is no seed, no
+    /// row by that name, or a row by that name that cannot be selected.
+    ///
+    /// One method for three callers with three different ideas of `seed` —
+    /// the open document's own name (`_`), the directory just left
+    /// (`Enter`/`-`), or none at all (the initial rooted launch) — so the
+    /// fallback rule cannot drift between them.
+    ///
+    /// **The kind check on the matched row is not decoration.** A name can
+    /// change type between two listings — the directory just left, replaced
+    /// by a FIFO of the same name — and seating on it would put the cursor
+    /// exactly where the three movement methods refuse to go and where
+    /// `Enter` refuses to act.
+    pub fn seat(&self, seed: Option<&OsStr>) -> usize {
+        seed.and_then(|name| {
+            self.entries
+                .iter()
+                .position(|entry| entry.name == name && entry.kind != EntryKind::Unopenable)
+        })
+        .unwrap_or_else(|| self.default_selection())
+    }
+
+    /// Where a fresh listing lands with no seed to reseat by: the first
+    /// selectable row that **is not** the `../` row, when one exists.
+    ///
+    /// [`Listing::first_selectable`] documents, correctly, that `../` itself
+    /// counts as selectable — DW-2.3 pins exactly that, as the landing spot
+    /// for a directory with nothing else in it. But `../` is always entry
+    /// `0` when it exists, so a caller that used `first_selectable` as its
+    /// *only* answer would land every fresh listing with real content on
+    /// `../` instead of on the first real entry — including the very first
+    /// frame a rooted `stele <dir>` paints. This tries "the first real
+    /// entry" before falling back to `first_selectable`'s own answer
+    /// (`../`, or `None`), so DW-2.3's fallback still holds for the
+    /// directory it was written for: one with nothing selectable past the
+    /// parent row.
+    ///
+    /// `0` when nothing at all is selectable — a parentless directory whose
+    /// every child is a FIFO, socket, device or broken symlink. There is no
+    /// honest cursor position in such a listing, and row `0` is therefore
+    /// painted [`RowStyle::Dimmed`] rather than [`RowStyle::Selected`] (see
+    /// [`Listing::rows`]) so the frame does not promise an `Enter` that
+    /// would do nothing.
+    fn default_selection(&self) -> usize {
+        let starts_with_parent = matches!(
+            self.entries.first(),
+            Some(entry) if entry.kind == EntryKind::Parent
+        );
+        let skip_parent = starts_with_parent
+            .then(|| self.next_selectable(0))
+            .flatten();
+        skip_parent.or_else(|| self.first_selectable()).unwrap_or(0)
     }
 
     /// The first selectable index, or `None` if nothing in this listing is
@@ -426,6 +607,59 @@ impl Listing {
             .find(|(_, entry)| entry.kind != EntryKind::Unopenable)
             .map(|(index, _)| index)
     }
+}
+
+/// The directory a listing of `dir` ascends to, or `None` when `dir` is its
+/// own parent — the filesystem root, where there is nowhere above to go.
+///
+/// [`Path::parent`] is not this function, for the reason [`absolute_dir`]
+/// gives and for a second one it does not: `parent` is also wrong for any
+/// path whose last component is `..`. `Path::new("../..").parent()` is
+/// `".."`, a step *down*, so `-` from `../..` would bounce between two
+/// directories forever instead of ascending. Appending `..` and normalizing
+/// gives `../../..`, which is what ascending means.
+fn parent_dir(dir: &Path) -> Option<PathBuf> {
+    let here = lexical(dir);
+    let up = lexical(&here.join(".."));
+    (up != here).then_some(up)
+}
+
+/// `path` with every `.` dropped and every `..` cancelled against the
+/// component before it, touching no filesystem.
+///
+/// Two rules carry the weight, and together they are why [`parent_dir`]
+/// always terminates. A leading `..` survives, because there is no
+/// component in front of it to cancel — so ascending from a relative path
+/// grows a `../` prefix forever and never cycles. And `/..` is `/`, because
+/// the root is its own parent — so ascending from an absolute path stops
+/// there. An empty result is `.`: "no components" names the current
+/// directory, not the empty path that started all this.
+fn lexical(path: &Path) -> PathBuf {
+    let mut stack: Vec<Component> = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => match stack.last() {
+                // Cancels the name in front of it.
+                Some(Component::Normal(_)) => {
+                    stack.pop();
+                }
+                // The root's parent is the root. A bare Windows prefix
+                // (`C:..`, drive-relative) has no name to cancel and so
+                // falls to the arm below, which keeps the `..`.
+                Some(Component::RootDir) => {}
+                _ => stack.push(component),
+            },
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                stack.push(component);
+            }
+        }
+    }
+    let out: PathBuf = stack.iter().collect();
+    if out.as_os_str().is_empty() {
+        return PathBuf::from(".");
+    }
+    out
 }
 
 /// One `read_dir` item turned into an [`Entry`], or `None` when it cannot be

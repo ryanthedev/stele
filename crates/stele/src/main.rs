@@ -20,7 +20,7 @@ use width::{WidthConfig, WidthEngine};
 use stele::app::{AppState, ChromeAction, LayoutContext, Mode, PendingAction, StatusMessage};
 use stele::cli::{Cli, Start};
 use stele::decor::themed::ThemedDecor;
-use stele::explore::Listing;
+use stele::explore::{self, Listing};
 use stele::link::{Followed, Navigator, SystemOpener};
 use stele::loader::{DocumentSource, LoadOptions};
 use stele::media::{GfxMediaSink, ImageSizer, MediaMode, NoopMediaSink, TextMediaSink};
@@ -640,7 +640,13 @@ fn perform_action(
         // included — so the cwd fallback DW-3.1 asks for costs no special
         // case.
         PendingAction::OpenExplorer => {
-            let dir = session.source.base_dir();
+            // `absolute_dir` is not decoration on top of `base_dir`: for a
+            // document named without a directory (`stele notes.md`, or a
+            // stdin stream) `base_dir` answers `"."`, and `"."` is one of
+            // the two paths `Path::parent` gets wrong — see that function.
+            // This is the explorer's second entry point; `Cli::start` is the
+            // first, and both normalize so nothing downstream has to.
+            let dir = explore::absolute_dir(&session.source.base_dir());
             let seed = match &session.source {
                 DocumentSource::Path(path) => path.file_name(),
                 DocumentSource::Stdin | DocumentSource::Scratch => None,
@@ -691,52 +697,23 @@ fn perform_action(
     }
 }
 
-/// Reads `dir` and picks up where the reader's attention already was: the
-/// row named by `seed` (an entry name carried over from wherever they came
-/// from), or [`default_selection`] if `seed` is `None` or no longer exists
-/// in the fresh listing.
+/// Reads `dir` and picks up where the reader's attention already was — the
+/// I/O half of that, with the seating rule itself in
+/// [`explore::Listing::seat`], where a test can reach it over a listing no
+/// real filesystem needs to produce.
 ///
-/// One function for three different callers with three different ideas of
-/// `seed` — the open document's own name (`_`), the directory just left
-/// (`Enter`/`-`), or none at all (the initial rooted launch) — so the
-/// fallback rule cannot drift between them.
+/// **This read is synchronous, and it is on the thread that reads keys.**
+/// A directory on a hung network mount blocks the event loop here, for the
+/// mount timeout, with no frame painted and `Ctrl-C` unavailable (raw mode
+/// makes it a keystroke). `MAX_LISTING_ENTRIES` in `explore.rs` records that
+/// exposure in full, why its own cap does not close it, and why the fix —
+/// moving the read to a cancellable worker — is deliberately not in this
+/// pass. The two other reads on this thread, `open_path` and `--watch`'s
+/// `stat`, have exactly the same property.
 fn read_listing_seated(dir: &std::path::Path, seed: Option<&std::ffi::OsStr>) -> (Listing, usize) {
     let listing = Listing::read(dir);
-    let selected = seed
-        .and_then(|name| {
-            listing
-                .entries()
-                .iter()
-                .position(|entry| entry.name == name)
-        })
-        .unwrap_or_else(|| default_selection(&listing));
+    let selected = listing.seat(seed);
     (listing, selected)
-}
-
-/// Where a fresh listing lands with no seed to reseat by: the first
-/// selectable row that **is not** the `../` row, when one exists.
-///
-/// [`explore::Listing::first_selectable`] documents, correctly, that `../`
-/// itself counts as selectable — Phase 2's DW-2.3 pins exactly that, as the
-/// landing spot for a directory with nothing else in it. But `../` is
-/// always entry `0` when it exists, so a caller that used
-/// `first_selectable` as its *only* answer would land every fresh listing
-/// with real content on `../` instead of the first real entry — including
-/// the very first frame a rooted `stele <dir>` paints. This tries "the first
-/// real entry" before falling back to `first_selectable`'s own answer
-/// (`../`, or `None`), so DW-2.3's fallback still holds for the directory it
-/// was written for — one with nothing selectable past the parent row.
-fn default_selection(listing: &Listing) -> usize {
-    let starts_with_parent = matches!(
-        listing.entries().first(),
-        Some(entry) if entry.kind == stele::explore::EntryKind::Parent
-    );
-    let skip_parent = starts_with_parent
-        .then(|| listing.next_selectable(0))
-        .flatten();
-    skip_parent
-        .or_else(|| listing.first_selectable())
-        .unwrap_or(0)
 }
 
 /// The interactive session: initial paint, then the scroll/resize/paint event

@@ -13,7 +13,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use stele::explore::{Entry, EntryKind, Listing, OverlayRow, RowStyle};
+use stele::explore::{self, Entry, EntryKind, Listing, OverlayRow, RowStyle};
 use stele::{Painter, Size};
 use width::{WidthConfig, WidthEngine};
 
@@ -420,6 +420,11 @@ fn test_reading_the_real_filesystem_root_has_no_parent_row() {
         "the root has no parent to list: {:?}",
         listing.entries()
     );
+    assert_eq!(
+        listing.parent(),
+        None,
+        "and `-` there is therefore a no-op, not a step to `/..`"
+    );
 }
 
 // -------------------------------------------------------------------- DW-2.4
@@ -644,11 +649,18 @@ fn test_rows_marks_exactly_the_selected_index_dims_only_unopenable_rows_and_leav
         assert_eq!(row.style, *want, "row {i} ({:?}): wrong style", row.text);
     }
 
-    // Selecting an `Unopenable` row itself must still highlight it as
-    // `Selected`, not `Dimmed` — painting honors the caller's selection even
-    // when it points at a row the movement methods would never choose.
+    // Selecting an `Unopenable` row paints it `Dimmed` anyway, and **no**
+    // row carries the cursor. Reverse video is the frame's promise that
+    // `Enter` opens this row; `Enter` refuses this one, so the promise must
+    // not be painted. The inverted case — dim losing to the cursor — is
+    // what let a listing with nothing selectable at all offer a row it
+    // could not open.
     let rows = listing.rows(6, 1);
-    assert_eq!(rows[1].style, RowStyle::Selected);
+    assert_eq!(rows[1].style, RowStyle::Dimmed);
+    assert!(
+        rows.iter().all(|row| row.style != RowStyle::Selected),
+        "an unselectable selection must leave no cursor at all: {rows:?}"
+    );
 }
 
 // -------------------------------------------------------------------- DW-2.7
@@ -1139,25 +1151,41 @@ fn test_dw_2_10_arbitrary_listings_never_panic_and_never_select_an_unselectable_
         // is the assertion an off-by-one between the notice-row space and
         // the entry space actually trips — previously that was checked only
         // against one hand-built 30-entry listing with no notice row.
-        let notice_rows = usize::from(listing.error().is_some() || listing.dropped() > 0);
+        //
+        // With one exception, added with the fix that made dim beat the
+        // cursor: when the clamped selection names an `Unopenable` row there
+        // is *no* cursor, because no row may promise an `Enter` that would
+        // be refused. The invariant is still exact in both directions, which
+        // is the point — "at most one" alone would pass for a frame that
+        // lost the cursor entirely.
+        let notice_rows =
+            usize::from(listing.error().is_some() || listing.dropped() > 0 || listing.truncated());
         if rows.len() > notice_rows {
             let picked: Vec<&OverlayRow> = rows
                 .iter()
                 .filter(|row| row.style == RowStyle::Selected)
                 .collect();
-            assert_eq!(
-                picked.len(),
-                1,
-                "exactly one row must carry the cursor ({}): {rows:?}",
-                assertion_context()
-            );
             let clamped = selected.min(listing.entries().len() - 1);
-            assert_eq!(
-                picked[0].text,
-                expected_row_text(&listing.entries()[clamped]),
-                "the cursor landed on the wrong row ({}), selected {selected}",
-                assertion_context()
-            );
+            if listing.entries()[clamped].kind == EntryKind::Unopenable {
+                assert!(
+                    picked.is_empty(),
+                    "an unselectable selection must carry no cursor ({}): {rows:?}",
+                    assertion_context()
+                );
+            } else {
+                assert_eq!(
+                    picked.len(),
+                    1,
+                    "exactly one row must carry the cursor ({}): {rows:?}",
+                    assertion_context()
+                );
+                assert_eq!(
+                    picked[0].text,
+                    expected_row_text(&listing.entries()[clamped]),
+                    "the cursor landed on the wrong row ({}), selected {selected}",
+                    assertion_context()
+                );
+            }
         }
         if notice_rows == 1 && !rows.is_empty() {
             assert_eq!(
@@ -1189,4 +1217,287 @@ fn test_dw_2_10_arbitrary_listings_never_panic_and_never_select_an_unselectable_
             );
         }
     }
+}
+
+// ------------------------------------------------- relative directories (F1)
+//
+// The gap that let `stele .` ship a dead end: every fixture above builds an
+// absolute path out of `std::env::temp_dir()`, and `Path::parent` is only
+// wrong about relative ones. `Path::new(".").parent()` and
+// `Path::new("docs").parent()` are both `Some("")` — not `None` — so the
+// `../` row was aimed at a path no `read_dir` can open, and one press of `-`
+// left the reader in a listing with no entries, no parent, and no key that
+// could leave it. These tests use relative paths on purpose.
+
+/// The `../` row of a listing read from `.` ascends to `..`, and `..` is a
+/// directory that actually reads.
+#[test]
+fn test_a_listing_of_dot_ascends_to_a_directory_that_reads() {
+    let listing = Listing::read(Path::new("."));
+    let parent = listing.entries().first().expect("`.` must have a ../ row");
+    assert_eq!(parent.kind, EntryKind::Parent);
+    assert_eq!(
+        parent.path,
+        Path::new(".."),
+        "the ../ row of `.` must point at `..`, not at the empty path"
+    );
+    assert_eq!(listing.parent(), Some(Path::new("..")));
+    assert!(
+        Listing::read(&parent.path).error().is_none(),
+        "the directory the ../ row names must be readable — the whole defect \
+         was that it was not"
+    );
+}
+
+/// A single-component relative directory ascends to the current directory.
+///
+/// Deliberately a name that does not exist: the parent row is built before
+/// `read_dir` is attempted, so this pins the path arithmetic alone and needs
+/// no fixture and no assumption about the working directory's contents.
+#[test]
+fn test_a_single_component_relative_directory_ascends_to_the_current_directory() {
+    let listing = Listing::read(Path::new("stele-no-such-directory-anywhere"));
+    assert!(
+        listing.error().is_some(),
+        "the fixture must genuinely not exist for this test to mean anything"
+    );
+    assert_eq!(
+        listing.parent(),
+        Some(Path::new(".")),
+        "a name with no directory part sits in the current directory, and \
+         that is what `..` must reach"
+    );
+}
+
+/// Ascending out of a relative path that already starts with `..` grows the
+/// prefix instead of bouncing.
+///
+/// `Path::new("../..").parent()` is `".."` — a step *down*. Two presses of
+/// `-` would have oscillated between two directories forever rather than
+/// reaching the root.
+#[test]
+fn test_ascending_from_a_dotdot_path_grows_the_prefix_rather_than_bouncing() {
+    assert_eq!(
+        Listing::read(Path::new("..")).parent(),
+        Some(Path::new("../.."))
+    );
+    assert_eq!(
+        Listing::read(Path::new("../..")).parent(),
+        Some(Path::new("../../.."))
+    );
+}
+
+/// `Listing::parent` is the `../` row's own path, not a second computation
+/// of it — the property that keeps `-` and `Enter` on `../` from disagreeing.
+#[test]
+fn test_parent_is_exactly_the_parent_rows_recorded_path() {
+    let dir = scratch_dir("parent-row-agrees");
+    write(&dir, "a.md", "a");
+    let listing = Listing::read(&dir);
+    let row = listing.entries().first().expect("../ row");
+    assert_eq!(row.kind, EntryKind::Parent);
+    assert_eq!(listing.parent(), Some(row.path.as_path()));
+    assert_eq!(listing.parent(), Some(dir.parent().expect("temp parent")));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `absolute_dir`, the barricade every path entering the explorer crosses:
+/// absolute against the current directory, `.` dropped, `..` cancelled, and
+/// no symlink resolution.
+#[test]
+fn test_absolute_dir_normalizes_without_touching_the_filesystem() {
+    let cwd = std::env::current_dir().expect("cwd");
+    assert_eq!(explore::absolute_dir(Path::new(".")), cwd);
+    assert_eq!(explore::absolute_dir(Path::new("docs")), cwd.join("docs"));
+    assert_eq!(
+        explore::absolute_dir(Path::new("./docs/")),
+        cwd.join("docs")
+    );
+    assert_eq!(
+        explore::absolute_dir(Path::new("./docs/../notes")),
+        cwd.join("notes")
+    );
+    assert_eq!(
+        explore::absolute_dir(Path::new("/usr/bin/../lib")),
+        PathBuf::from("/usr/lib")
+    );
+    assert_eq!(explore::absolute_dir(Path::new("/")), PathBuf::from("/"));
+    assert_eq!(
+        explore::absolute_dir(Path::new("/..")),
+        PathBuf::from("/"),
+        "the root is its own parent"
+    );
+    // A path that does not exist normalizes anyway: no `stat`, so nothing
+    // here can fail or block on a dead mount.
+    assert_eq!(
+        explore::absolute_dir(Path::new("/no/such/place/../here")),
+        PathBuf::from("/no/such/here")
+    );
+}
+
+/// An absolute directory is already normal, so the barricade is a no-op on
+/// it — the invariant that lets `Listing::read`'s children and parent rows
+/// stay normalized without re-normalizing at every hop.
+#[test]
+fn test_absolute_dir_leaves_an_already_normal_path_alone() {
+    let dir = scratch_dir("already-normal");
+    assert_eq!(explore::absolute_dir(&dir), dir);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ------------------------------------------------------ truncation notice (F2)
+
+/// A directory past the cap says so on the notice row.
+///
+/// It used to say nothing at all, on the strength of a comment claiming
+/// `truncated()` had "a designed consumer already — the status row". It had
+/// none: nothing outside this module read the flag. A reader in a directory
+/// of 300 files saw 256 of them, sorted, looking complete.
+#[test]
+fn test_a_truncated_listing_says_so_on_the_notice_row() {
+    let dir = scratch_dir("truncation-notice");
+    for i in 0..300 {
+        write(&dir, &format!("f{i:04}.md"), "x");
+    }
+    let listing = Listing::read(&dir);
+    assert!(listing.truncated(), "300 entries must exceed the cap");
+
+    let rows = listing.rows(30, 0);
+    assert_eq!(
+        rows[0].style,
+        RowStyle::Ordinary,
+        "the notice leads, unstyled: {rows:?}"
+    );
+    assert!(
+        rows[0].text.contains("capped") && rows[0].text.contains("missing"),
+        "the notice must say both that the listing is capped and that names \
+         are missing, got {:?}",
+        rows[0].text
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The other direction: a listing with nothing to report leads with an
+/// entry, not with a notice. Without this, the test above would pass on an
+/// implementation that put a notice on every listing.
+#[test]
+fn test_an_untruncated_listing_has_no_notice_row() {
+    let dir = scratch_dir("no-notice");
+    write(&dir, "only.md", "x");
+    let listing = Listing::read(&dir);
+    assert!(!listing.truncated());
+    let rows = listing.rows(30, 0);
+    assert_eq!(
+        rows[0].text, "../",
+        "an unremarkable listing starts at its first entry: {rows:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Truncation and unreadable entries can co-occur, and they share the one
+/// notice row that [`Listing::rows`]'s windowing arithmetic is built around.
+#[test]
+fn test_truncation_and_dropped_entries_share_a_single_notice_row() {
+    let listing = Listing::from_parts(
+        PathBuf::from("/parts"),
+        vec![entry("a.md", EntryKind::Document)],
+        true,
+        None,
+        3,
+    );
+    let rows = listing.rows(10, 0);
+    assert_eq!(
+        rows.len(),
+        2,
+        "one notice row plus one entry row, never two notices: {rows:?}"
+    );
+    assert!(rows[0].text.contains("capped"), "{:?}", rows[0].text);
+    assert!(
+        rows[0].text.contains("3 entries could not be read"),
+        "{:?}",
+        rows[0].text
+    );
+    assert_eq!(rows[1].text, "a.md");
+}
+
+/// An unreadable directory still wins the row outright: `read` returns
+/// before any entry is considered, so the error is the only thing there is
+/// to say.
+#[test]
+fn test_a_read_error_still_owns_the_notice_row_alone() {
+    let listing = Listing::from_parts(
+        PathBuf::from("/parts"),
+        Vec::new(),
+        true,
+        Some(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+        9,
+    );
+    let rows = listing.rows(10, 0);
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].text.starts_with("cannot read directory: "));
+    assert!(!rows[0].text.contains("capped"));
+}
+
+// --------------------------------------------------------------- seating (F4)
+
+/// A seed is honored only while the row it names is still selectable. A name
+/// that turned into a FIFO between two listings must not take the cursor
+/// somewhere `Enter` refuses to act and `j`/`k` refuse to go.
+#[test]
+fn test_seat_ignores_a_seed_whose_row_became_unselectable() {
+    let entries = vec![
+        entry("..", EntryKind::Parent),
+        entry("gone", EntryKind::Unopenable),
+        entry("real.md", EntryKind::Document),
+    ];
+    let listing = Listing::from_entries(PathBuf::from("/seat"), entries, false);
+
+    assert_eq!(
+        listing.seat(Some(std::ffi::OsStr::new("gone"))),
+        2,
+        "the seed names an unopenable row, so the default seat wins"
+    );
+    assert_eq!(
+        listing.seat(Some(std::ffi::OsStr::new("real.md"))),
+        2,
+        "a selectable seed is still honored"
+    );
+    assert_eq!(
+        listing.seat(None),
+        2,
+        "with no seed, the first real entry, not the ../ row"
+    );
+}
+
+/// With nothing but the parent row selectable, the seat falls back to it —
+/// DW-2.3's case, preserved by the move of this rule out of `main.rs`.
+#[test]
+fn test_seat_falls_back_to_the_parent_row_when_nothing_else_is_selectable() {
+    let entries = vec![
+        entry("..", EntryKind::Parent),
+        entry("bad", EntryKind::Unopenable),
+    ];
+    let listing = Listing::from_entries(PathBuf::from("/seat"), entries, false);
+    assert_eq!(listing.seat(None), 0);
+    assert_eq!(listing.seat(Some(std::ffi::OsStr::new("bad"))), 0);
+}
+
+/// A listing with nothing selectable at all seats at `0` and paints no
+/// cursor: there is no row to promise an `Enter` for.
+#[test]
+fn test_a_listing_with_nothing_selectable_seats_at_zero_and_paints_no_cursor() {
+    let entries = vec![
+        entry("dev-a", EntryKind::Unopenable),
+        entry("dev-b", EntryKind::Unopenable),
+    ];
+    let listing = Listing::from_entries(PathBuf::from("/dev-only"), entries, false);
+    assert_eq!(listing.first_selectable(), None);
+    let seated = listing.seat(None);
+    assert_eq!(seated, 0);
+    let rows = listing.rows(10, seated);
+    assert!(
+        rows.iter().all(|row| row.style == RowStyle::Dimmed),
+        "every row is unopenable, so every row is dim and none is the \
+         cursor: {rows:?}"
+    );
 }
