@@ -438,6 +438,20 @@ impl Session {
         // keystroke rather than a signal, so a `File::open` that blocks on a
         // FIFO leaves a viewer with no way out at all. A watched file
         // replaced by one is all it takes.
+        //
+        // **Known gap, deliberately not closed here.** `install_document`
+        // reassigns `self.source`, so after a link hop `--watch` is watching
+        // the *linked* document — and `load_with` below applies
+        // `MAX_DOCUMENT_BYTES` and no NUL sniff whatever the provenance. A
+        // link-reached document that grows past `MAX_LINK_FILE_BYTES`, or
+        // that gains a NUL, is therefore rendered by a reload after
+        // `Navigator::follow` would refuse it. Both were reproduced against
+        // the real code. Closing it means reloading at
+        // `nav`'s recorded ceiling — `link::reread_document` already takes
+        // one — which changes shipped `--watch` behavior and its error
+        // strings, so it is a decision for its own change rather than a
+        // silent widening of this one. It costs no hang: the type check
+        // above still runs first.
         if let Err(err) = stele::link::refuse_unless_regular_file(&self.source) {
             return self.report_reload_failure(state, &err.to_string());
         }

@@ -31,6 +31,22 @@ fn write(dir: &Path, name: &str, contents: &str) -> PathBuf {
     path
 }
 
+/// Creates a genuinely unopenable entry: a symlink whose target does not
+/// exist, so the following `fs::metadata` errors and the entry classifies
+/// `Unopenable`.
+///
+/// The fixtures below used to reach for a `.bin` file, which the extension
+/// rule made unopenable. Extension is no longer openability — every regular
+/// file is a `Document` — so a fixture that needs an unselectable row has to
+/// build something the barricade would really refuse before reading a byte.
+/// A broken symlink is the cheapest of those and needs no `mkfifo` and no
+/// socket.
+#[cfg(unix)]
+fn unopenable(dir: &Path, name: &str) {
+    std::os::unix::fs::symlink(dir.join("does-not-exist-anywhere"), dir.join(name))
+        .expect("create broken symlink");
+}
+
 fn entry(name: &str, kind: EntryKind) -> Entry {
     Entry {
         name: OsString::from(name),
@@ -42,8 +58,18 @@ fn entry(name: &str, kind: EntryKind) -> Entry {
 // -------------------------------------------------------------------- DW-2.1
 
 /// A directory holding one of every kind: a subdirectory, a markdown file,
-/// a non-markdown regular file, and a socket — against a real directory, as
-/// the DW item requires, not a mock.
+/// a non-markdown regular file, an extensionless regular file, and a socket
+/// — against a real directory, as the DW item requires, not a mock.
+///
+/// `notes.txt` and `LICENSE` are `Document`, not `Unopenable`, and that is
+/// the correction a batch review forced. Extension is not openability:
+/// `stele notes.txt` opens it, `[x](notes.txt)` opens it (pinned at
+/// `link.rs:1822`), and an extensionless file opens too (`link.rs:1858`).
+/// Classifying them `Unopenable` did not merely dim them — `Unopenable` rows
+/// are unselectable, so the cursor could never reach them, making the
+/// explorer strictly more restrictive than the command line, which this
+/// plan's own constraint forbids. Only the socket is genuinely refused
+/// before a byte is read.
 #[test]
 #[cfg(unix)]
 fn test_dw_2_1_a_mixed_directory_classifies_every_entry_into_exactly_one_kind() {
@@ -53,6 +79,7 @@ fn test_dw_2_1_a_mixed_directory_classifies_every_entry_into_exactly_one_kind() 
     std::fs::create_dir(dir.join("sub")).expect("create subdirectory");
     write(&dir, "readme.md", "# hi\n");
     write(&dir, "notes.txt", "plain text\n");
+    write(&dir, "LICENSE", "no extension at all\n");
     let sock_path = dir.join("sock");
     let _listener = UnixListener::bind(&sock_path).expect("bind unix socket");
 
@@ -60,6 +87,11 @@ fn test_dw_2_1_a_mixed_directory_classifies_every_entry_into_exactly_one_kind() 
     assert!(
         listing.error().is_none(),
         "a readable directory has no error"
+    );
+    assert_eq!(
+        listing.dropped(),
+        0,
+        "every entry classified, so nothing was dropped"
     );
 
     let kind_of = |name: &str| {
@@ -72,8 +104,21 @@ fn test_dw_2_1_a_mixed_directory_classifies_every_entry_into_exactly_one_kind() 
     };
     assert_eq!(kind_of("sub"), EntryKind::Directory);
     assert_eq!(kind_of("readme.md"), EntryKind::Document);
-    assert_eq!(kind_of("notes.txt"), EntryKind::Unopenable);
-    assert_eq!(kind_of("sock"), EntryKind::Unopenable);
+    assert_eq!(
+        kind_of("notes.txt"),
+        EntryKind::Document,
+        "a non-markdown regular file is openable: `stele notes.txt` opens it"
+    );
+    assert_eq!(
+        kind_of("LICENSE"),
+        EntryKind::Document,
+        "an extensionless regular file is openable too"
+    );
+    assert_eq!(
+        kind_of("sock"),
+        EntryKind::Unopenable,
+        "a socket is refused by the barricade before any read, so it is genuinely unopenable"
+    );
     assert_eq!(
         listing.entries()[0].kind,
         EntryKind::Parent,
@@ -81,14 +126,104 @@ fn test_dw_2_1_a_mixed_directory_classifies_every_entry_into_exactly_one_kind() 
     );
     assert_eq!(
         listing.entries().len(),
-        5,
-        "parent + 4 real entries, no more and no fewer: {:?}",
+        6,
+        "parent + 5 real entries, no more and no fewer: {:?}",
         listing.entries()
     );
     assert!(
         !listing.truncated(),
-        "four entries is nowhere near the cap; `truncated()` must answer false"
+        "five entries is nowhere near the cap; `truncated()` must answer false"
     );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The other half of the same correction: a symlink is classified by what it
+/// **resolves to**, not by being a symlink.
+///
+/// Every symlink used to come back `Unopenable` — and therefore
+/// unselectable — while `stele link.md`, `[x](link.md)` and
+/// `Navigator::open_path(link.md)` all open one whose target is a real
+/// document (`canonicalize` resolves the link before the type check). A
+/// review demonstrated the three surfaces disagreeing on one fixture. On
+/// macOS the same rule made `/tmp` and `/var` — both symlinks — impossible
+/// to enter from a listing of `/`.
+///
+/// Only a symlink whose *target* the barricade would refuse before reading a
+/// byte stays `Unopenable`: one pointing at a socket, and one that will not
+/// resolve at all.
+#[test]
+#[cfg(unix)]
+fn test_a_symlink_is_classified_by_its_target_not_by_being_a_symlink() {
+    use std::os::unix::net::UnixListener;
+
+    let dir = scratch_dir("symlink-targets");
+    write(&dir, "real.md", "# real\n");
+    write(&dir, "real.txt", "plain\n");
+    std::fs::create_dir(dir.join("real-dir")).expect("create subdirectory");
+    let sock_path = dir.join("real-sock");
+    let _listener = UnixListener::bind(&sock_path).expect("bind unix socket");
+
+    std::os::unix::fs::symlink(dir.join("real.md"), dir.join("to-doc.md")).expect("link to doc");
+    std::os::unix::fs::symlink(dir.join("real.txt"), dir.join("to-text")).expect("link to text");
+    std::os::unix::fs::symlink(dir.join("real-dir"), dir.join("to-dir")).expect("link to dir");
+    std::os::unix::fs::symlink(&sock_path, dir.join("to-sock")).expect("link to socket");
+    std::os::unix::fs::symlink(dir.join("to-doc.md"), dir.join("to-link.md"))
+        .expect("link to a link");
+
+    let listing = Listing::read(&dir);
+    let kind_of = |name: &str| {
+        listing
+            .entries()
+            .iter()
+            .find(|e| e.name == name)
+            .unwrap_or_else(|| panic!("{name} must be listed: {:?}", listing.entries()))
+            .kind
+    };
+
+    assert_eq!(
+        kind_of("to-doc.md"),
+        EntryKind::Document,
+        "a symlink to a markdown file is a document — all three doors open it"
+    );
+    assert_eq!(
+        kind_of("to-text"),
+        EntryKind::Document,
+        "a symlink to a plain regular file is a document too"
+    );
+    assert_eq!(
+        kind_of("to-dir"),
+        EntryKind::Directory,
+        "a symlink to a directory is enterable — this is what made /tmp unreachable"
+    );
+    assert_eq!(
+        kind_of("to-link.md"),
+        EntryKind::Document,
+        "a chain of symlinks resolves the whole way"
+    );
+    assert_eq!(
+        kind_of("to-sock"),
+        EntryKind::Unopenable,
+        "a symlink to a socket is refused before any read, so it stays unopenable"
+    );
+
+    // The three that must be selectable actually are, through the API the
+    // cursor uses — classification alone would not prove reachability.
+    let index_of = |name: &str| {
+        listing
+            .entries()
+            .iter()
+            .position(|e| e.name == name)
+            .expect("listed")
+    };
+    for name in ["to-doc.md", "to-text", "to-dir", "to-link.md"] {
+        let index = index_of(name);
+        let reachable = (0..listing.entries().len())
+            .filter_map(|from| listing.next_selectable(from))
+            .any(|found| found == index)
+            || listing.first_selectable() == Some(index);
+        assert!(reachable, "{name} must be reachable by cursor movement");
+    }
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -150,15 +285,16 @@ fn test_an_empty_directory_lists_only_the_parent_row() {
 /// sort: `0-`/`1-` lead, `3-`/`4-` run together in the middle, `6-` trails).
 /// Movement in both directions must skip every one and never land on one.
 #[test]
+#[cfg(unix)]
 fn test_dw_2_2_selection_movement_skips_every_unopenable_row_in_both_directions() {
     let dir = scratch_dir("skip-unopenable");
-    write(&dir, "0-bad.bin", "x");
-    write(&dir, "1-bad.bin", "x");
+    unopenable(&dir, "0-bad.bin");
+    unopenable(&dir, "1-bad.bin");
     write(&dir, "2-doc.md", "# 2\n");
-    write(&dir, "3-bad.bin", "x");
-    write(&dir, "4-bad.bin", "x");
+    unopenable(&dir, "3-bad.bin");
+    unopenable(&dir, "4-bad.bin");
     write(&dir, "5-doc.md", "# 5\n");
-    write(&dir, "6-bad.bin", "x");
+    unopenable(&dir, "6-bad.bin");
 
     let listing = Listing::read(&dir);
     let names: Vec<String> = listing
@@ -221,10 +357,11 @@ fn test_dw_2_2_selection_movement_skips_every_unopenable_row_in_both_directions(
 /// A directory with only unopenable children still has its parent row, and
 /// the parent row is where selection lands.
 #[test]
+#[cfg(unix)]
 fn test_dw_2_3_a_directory_with_nothing_selectable_leaves_the_parent_row_selected() {
     let dir = scratch_dir("nothing-selectable");
-    write(&dir, "a.bin", "x");
-    write(&dir, "b.bin", "x");
+    unopenable(&dir, "a.bin");
+    unopenable(&dir, "b.bin");
 
     let listing = Listing::read(&dir);
     assert_eq!(listing.entries()[0].kind, EntryKind::Parent);
@@ -429,6 +566,50 @@ fn test_a_one_row_viewport_shows_only_the_selection_and_a_zero_row_viewport_show
     assert!(rows[0].text.contains("doc-3.md"));
 }
 
+/// `first` was clamped to the listing's length and `selected` was not, so a
+/// selection past the end matched no row and the frame painted **no cursor
+/// at all** — silently, since nothing asserted a cursor was present. That is
+/// the resize-and-shrink shape Phase 3 has to survive. Clamping to the last
+/// row is the honest answer.
+///
+/// Checked with and without a notice row in front, because the notice is the
+/// only thing that offsets the two coordinate spaces and is exactly where an
+/// off-by-one would hide.
+#[test]
+fn test_a_selection_past_the_end_still_paints_a_cursor_on_the_last_row() {
+    let entries: Vec<Entry> = (0..4)
+        .map(|i| entry(&format!("doc-{i}.md"), EntryKind::Document))
+        .collect();
+
+    for (label, listing) in [
+        (
+            "no notice row",
+            Listing::from_entries(PathBuf::from("/four"), entries.clone(), false),
+        ),
+        (
+            "a notice row in front",
+            Listing::from_parts(PathBuf::from("/four"), entries.clone(), false, None, 2),
+        ),
+    ] {
+        for selected in [4usize, 99, usize::MAX] {
+            let rows = listing.rows(10, selected);
+            let picked: Vec<&OverlayRow> = rows
+                .iter()
+                .filter(|r| r.style == RowStyle::Selected)
+                .collect();
+            assert_eq!(
+                picked.len(),
+                1,
+                "{label}, selected {selected}: exactly one row must carry the cursor: {rows:?}"
+            );
+            assert_eq!(
+                picked[0].text, "doc-3.md",
+                "{label}, selected {selected}: the cursor belongs on the last row"
+            );
+        }
+    }
+}
+
 /// Past the DW floor, and the direct counterpart to DW-2.9's painter-level
 /// byte test: `Listing::rows` itself — not a hand-built `OverlayRow` list —
 /// must classify every row correctly. The exact index carrying `Selected`
@@ -490,6 +671,7 @@ fn test_dw_2_7_a_broken_symlink_a_symlink_loop_and_a_non_utf8_name_list_without_
     let non_utf8_name = OsString::from_vec(vec![b'x', 0xff, b'.', b'm', b'd']);
     let wrote_non_utf8 = std::fs::write(dir.join(&non_utf8_name), "# bytes\n").is_ok();
 
+    let started = Instant::now();
     let listing = Listing::read(&dir);
     assert!(listing.error().is_none());
 
@@ -504,18 +686,34 @@ fn test_dw_2_7_a_broken_symlink_a_symlink_loop_and_a_non_utf8_name_list_without_
     assert_eq!(
         kind_of(std::ffi::OsStr::new("broken.md")),
         Some(EntryKind::Unopenable),
-        "a broken symlink must not be Document"
+        "a broken symlink must not be Document: the following stat errors, and nothing can open it"
     );
     assert_eq!(
         kind_of(std::ffi::OsStr::new("loop.md")),
         Some(EntryKind::Unopenable),
-        "a symlink loop must not be Document, and reading it must not hang"
+        "a symlink loop must not be Document — the follow returns ELOOP in bounded time, so this \
+         is an errored stat rather than a hang"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "following the loop must return in bounded time (ELOOP), not hang: {:?}",
+        started.elapsed()
     );
     if wrote_non_utf8 {
+        // DW-2.7's own text says "none is classified `Document`", written
+        // when a non-markdown extension meant unopenable. The plan's
+        // corrected Phase 2 approach notes supersede that for this case: a
+        // non-UTF8 *filename* names a perfectly ordinary regular file, and
+        // Phase 1 pins that the command line opens one
+        // (`link.rs`'s test_a_filename_that_is_not_utf8_opens_because_the_
+        // command_line_opens_it). Refusing it here would be exactly the
+        // more-restrictive-than-the-command-line direction the plan forbids.
+        // What DW-2.7 actually guards — listing it without panicking — is
+        // what the assertion below still proves.
         assert_eq!(
             kind_of(&non_utf8_name),
-            Some(EntryKind::Unopenable),
-            "a non-UTF8-named file with a non-markdown-looking extension test still classifies without panicking"
+            Some(EntryKind::Document),
+            "a non-UTF8 name is still a regular file, and the command line opens one"
         );
     } else {
         eprintln!(
@@ -559,6 +757,203 @@ fn test_dw_2_8_a_directory_past_the_cap_truncates_and_stays_within_a_bounded_tim
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A directory with read permission but no search permission: `readdir`
+/// yields every name, and `lstat` on every child returns `EACCES`. Builds
+/// `count` files and hands back the locked directory, or `None` when the
+/// fixture does not bite (running as root, or a filesystem that ignores the
+/// mode) — the root-skip idiom from `link.rs:1217-1221`, so the tests below
+/// state a reason rather than passing vacuously.
+#[cfg(unix)]
+fn unsearchable_dir(tag: &str, count: usize) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = scratch_dir(tag);
+    for i in 0..count {
+        write(&dir, &format!("f{i:05}.md"), "x");
+    }
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o600)).expect("chmod 600");
+
+    let stat_succeeds = std::fs::read_dir(&dir)
+        .ok()
+        .and_then(|mut read_dir| read_dir.next())
+        .and_then(|entry| entry.ok())
+        .is_some_and(|entry| std::fs::symlink_metadata(entry.path()).is_ok());
+    if stat_succeeds {
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        let _ = std::fs::remove_dir_all(&dir);
+        eprintln!(
+            "skipping: chmod 600 on a directory does not deny this process `lstat` on its \
+             children (running as root, or a filesystem that ignores the mode), so the \
+             stat-failure branch this test exists for is unreachable here"
+        );
+        return None;
+    }
+    Some(dir)
+}
+
+#[cfg(unix)]
+fn unlock_and_remove(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// DW-2.8, in the failure branch its original test never reached: the cap
+/// must bound `stat` **attempts**, not successes.
+///
+/// The cap used to be checked against the count of successfully classified
+/// entries, so a directory where every child `stat` fails never reached it —
+/// the loop ran once per name `readdir` yielded, unbounded. A review measured
+/// the real `Listing::read` against exactly this fixture at 3.24 ms for 2 000
+/// entries and 32.35 ms for 20 000: 9.99× for 10×, i.e. no bound at all.
+///
+/// Asserted by counting the attempts rather than by timing them, which is
+/// both the stronger of the two options the DW item offers and immune to a
+/// slow machine: `dropped() + listed children` **is** the number of entries
+/// the loop considered, and it must not grow with the directory. Two
+/// directories differing 4× in size must report the identical count.
+#[test]
+#[cfg(unix)]
+fn test_dw_2_8_the_cap_bounds_stat_attempts_when_every_entry_fails_its_stat() {
+    const SMALL: usize = 300;
+    const LARGE: usize = 1200;
+
+    let Some(small_dir) = unsearchable_dir("unsearchable-small", SMALL) else {
+        return;
+    };
+    let Some(large_dir) = unsearchable_dir("unsearchable-large", LARGE) else {
+        unlock_and_remove(&small_dir);
+        return;
+    };
+
+    // `entries()` here is the parent row plus whatever classified; nothing
+    // classifies in this directory, so `considered` is `dropped()` alone —
+    // but computing it this way keeps the assertion honest if that changes.
+    let considered = |listing: &Listing| {
+        listing.dropped()
+            + listing
+                .entries()
+                .iter()
+                .filter(|e| e.kind != EntryKind::Parent)
+                .count()
+    };
+
+    let small = Listing::read(&small_dir);
+    let large = Listing::read(&large_dir);
+
+    assert!(
+        considered(&small) < SMALL,
+        "the loop must stop at the cap, not walk all {SMALL} names: considered {}",
+        considered(&small)
+    );
+    assert_eq!(
+        considered(&large),
+        considered(&small),
+        "4x the entries must cost the same number of stat attempts — that is what 'bounded' \
+         means. Considered {} for {LARGE} entries against {} for {SMALL}.",
+        considered(&large),
+        considered(&small)
+    );
+    assert!(
+        small.truncated() && large.truncated(),
+        "stopping at the cap is truncation and must be reported as such: small {}, large {}",
+        small.truncated(),
+        large.truncated()
+    );
+
+    unlock_and_remove(&small_dir);
+    unlock_and_remove(&large_dir);
+}
+
+/// The same permission state, five files, and the defect it used to cause:
+/// the listing claimed the directory was **empty**.
+///
+/// `read_dir` succeeded, so `error()` was `None`; the cap never fired, so
+/// `truncated()` was `false`; every child was silently dropped, so there
+/// were no entries. A directory of 200 000 files painted as an empty one
+/// with nothing on screen to say otherwise. The docstring justified the
+/// silent drop as a read-then-stat vanishing race — but `EACCES` here is
+/// that directory's permanent state, not a race, so the stated reason never
+/// covered the case that actually reached the code.
+#[test]
+#[cfg(unix)]
+fn test_a_directory_whose_entries_cannot_be_stat_ed_does_not_render_as_empty() {
+    let Some(dir) = unsearchable_dir("unsearchable-notice", 5) else {
+        return;
+    };
+
+    let listing = Listing::read(&dir);
+
+    assert!(
+        listing.error().is_none(),
+        "read_dir itself succeeded, so this is not the unreadable-directory case"
+    );
+    assert!(
+        !listing.truncated(),
+        "five entries is nowhere near the cap, so truncation is not the signal either"
+    );
+    assert_eq!(
+        listing.dropped(),
+        5,
+        "every child failed its stat and every one must be counted: {:?}",
+        listing.entries()
+    );
+    assert!(
+        listing
+            .entries()
+            .iter()
+            .all(|e| e.kind == EntryKind::Parent),
+        "nothing could be classified, so only the parent row survives: {:?}",
+        listing.entries()
+    );
+
+    let rows = listing.rows(10, 0);
+    assert!(
+        rows[0].text.contains("5 entries could not be read"),
+        "the listing must say so on screen rather than looking empty: {rows:?}"
+    );
+    assert!(
+        rows.len() >= 2 && rows[1].text == "../",
+        "the notice must not displace the way back up: {rows:?}"
+    );
+
+    unlock_and_remove(&dir);
+}
+
+/// The notice row is singular for one dropped entry — a small thing, but the
+/// row is the only place a reader learns the listing is incomplete, and
+/// "1 entries could not be read" reads as a bug in the tool.
+#[test]
+fn test_a_single_dropped_entry_is_named_in_the_singular() {
+    let listing = Listing::from_parts(PathBuf::from("/partial"), Vec::new(), false, None, 1);
+    assert_eq!(listing.dropped(), 1);
+    assert_eq!(listing.rows(4, 0)[0].text, "1 entry could not be read");
+
+    let listing = Listing::from_parts(PathBuf::from("/partial"), Vec::new(), false, None, 2);
+    assert_eq!(listing.rows(4, 0)[0].text, "2 entries could not be read");
+}
+
+/// An unreadable directory and a partial read are different facts and must
+/// not be conflated: `error()` names the first, `dropped()` the second, and
+/// the error wins the single notice row when a caller builds both.
+#[test]
+fn test_the_error_row_takes_precedence_over_the_dropped_row() {
+    let listing = Listing::from_parts(
+        PathBuf::from("/both"),
+        vec![entry("..", EntryKind::Parent)],
+        false,
+        Some(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+        3,
+    );
+    let rows = listing.rows(5, 0);
+    assert!(
+        rows[0].text.contains("cannot read directory"),
+        "the directory-level failure is the one worth the row: {rows:?}"
+    );
+    assert_eq!(rows.len(), 2, "exactly one notice row, never two: {rows:?}");
 }
 
 // -------------------------------------------------------------------- DW-2.9
@@ -634,11 +1029,28 @@ impl Xorshift64 {
     }
 }
 
+/// The text `Listing::rows` must paint for `entry`, mirrored here so the
+/// randomized suite can prove the *right* row carries the cursor rather than
+/// merely that some row does. `row_text` is private, and duplicating three
+/// lines is what makes an off-by-one between the row space and the entry
+/// space detectable at all.
+fn expected_row_text(entry: &Entry) -> String {
+    match entry.kind {
+        EntryKind::Parent => "../".to_string(),
+        EntryKind::Directory => format!("{}/", entry.name.to_string_lossy()),
+        EntryKind::Document | EntryKind::Unopenable => entry.name.to_string_lossy().into_owned(),
+    }
+}
+
 /// Builds one arbitrary `Listing` from `rng`, including entries whose names
-/// carry non-UTF8 bytes, entries with no name at all, and an occasional
-/// out-of-range `selected`/`height` — the same shape DW-2.10's fuzz target
-/// explores, driven here through the stable toolchain so the invariant
-/// cannot silently rot between anyone running `cargo fuzz` by hand.
+/// carry non-UTF8 bytes, an occasional out-of-range `selected`/`height`, and
+/// — added after a review — the two notice states, since both generators
+/// used to hardcode "no error, nothing dropped" and so never randomized the
+/// branch holding the windowing math's only subtraction.
+///
+/// Every name is prefixed with its own index, which costs nothing (the bytes
+/// after it are still arbitrary, non-UTF8 included) and buys uniqueness, so
+/// the selected row's text identifies exactly one entry.
 #[cfg(unix)]
 fn arbitrary_listing(rng: &mut Xorshift64) -> (Listing, u16, usize) {
     use std::os::unix::ffi::OsStringExt as _;
@@ -653,7 +1065,8 @@ fn arbitrary_listing(rng: &mut Xorshift64) -> (Listing, u16, usize) {
                 _ => EntryKind::Unopenable,
             };
             let name_len = rng.next_usize(12);
-            let name_bytes: Vec<u8> = (0..name_len).map(|_| (rng.next() % 256) as u8).collect();
+            let mut name_bytes = format!("{i}-").into_bytes();
+            name_bytes.extend((0..name_len).map(|_| (rng.next() % 256) as u8));
             let name = OsString::from_vec(name_bytes);
             Entry {
                 path: PathBuf::from(format!("entry-{i}")),
@@ -662,10 +1075,20 @@ fn arbitrary_listing(rng: &mut Xorshift64) -> (Listing, u16, usize) {
             }
         })
         .collect();
-    let listing = Listing::from_entries(
+    let (error, dropped) = match rng.next() % 4 {
+        0 => (
+            Some(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            0,
+        ),
+        1 => (None, 1 + rng.next_usize(500)),
+        _ => (None, 0),
+    };
+    let listing = Listing::from_parts(
         PathBuf::from("/fuzz"),
         entries,
         rng.next().is_multiple_of(2),
+        error,
+        dropped,
     );
     // Skew toward small heights/selections (the common case) but reach
     // pathological values (0, near-`usize::MAX`) often enough to matter.
@@ -709,6 +1132,41 @@ fn test_dw_2_10_arbitrary_listings_never_panic_and_never_select_an_unselectable_
             assertion_context(),
             rows.len()
         );
+
+        // The invariant neither randomized suite used to check: whenever an
+        // entry row was painted at all, exactly one of them carries the
+        // cursor, and it is the row for the (clamped) selected entry. This
+        // is the assertion an off-by-one between the notice-row space and
+        // the entry space actually trips — previously that was checked only
+        // against one hand-built 30-entry listing with no notice row.
+        let notice_rows = usize::from(listing.error().is_some() || listing.dropped() > 0);
+        if rows.len() > notice_rows {
+            let picked: Vec<&OverlayRow> = rows
+                .iter()
+                .filter(|row| row.style == RowStyle::Selected)
+                .collect();
+            assert_eq!(
+                picked.len(),
+                1,
+                "exactly one row must carry the cursor ({}): {rows:?}",
+                assertion_context()
+            );
+            let clamped = selected.min(listing.entries().len() - 1);
+            assert_eq!(
+                picked[0].text,
+                expected_row_text(&listing.entries()[clamped]),
+                "the cursor landed on the wrong row ({}), selected {selected}",
+                assertion_context()
+            );
+        }
+        if notice_rows == 1 && !rows.is_empty() {
+            assert_eq!(
+                rows[0].style,
+                RowStyle::Ordinary,
+                "the notice row leads and is never styled as an entry ({})",
+                assertion_context()
+            );
+        }
 
         for index in [
             listing.first_selectable(),

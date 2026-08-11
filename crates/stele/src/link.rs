@@ -453,8 +453,15 @@ fn is_binary(bytes: &[u8]) -> bool {
     bytes.iter().take(BINARY_SNIFF_BYTES).any(|&byte| byte == 0)
 }
 
-/// Re-reads a document this session **already has open** — the one
-/// `Backspace` returns to, and the one a `--watch` tick reloads.
+/// Re-reads a document this session **already has open**: the one
+/// `Backspace` returns to.
+///
+/// Not, despite what this line used to say, the one a `--watch` tick
+/// reloads. `Session::poll_reload` calls
+/// [`crate::loader::DocumentSource::load_with`] instead, guarded only by
+/// [`refuse_unless_regular_file`] — so it applies the command-line ceiling
+/// and skips the NUL sniff whatever the document's provenance. See
+/// [`Navigator`]'s `current_limit` for what that does and does not break.
 ///
 /// **This function exists because two entry points had diverged, which is the
 /// shape of the defect it fixes.** `Navigator::follow` put every target
@@ -701,9 +708,28 @@ pub struct Navigator {
     /// `open_path` (document ceiling), and `back` (whatever the popped entry
     /// recorded). **The invariant a caller could break is that the document on
     /// screen is the one this `Navigator` last returned** — the same
-    /// assumption `follow`'s `current` argument already makes. A `--watch`
-    /// reload re-reads the same source at the same provenance and so cannot
-    /// disturb it.
+    /// assumption `follow`'s `current` argument already makes.
+    ///
+    /// A `--watch` reload never writes this field — it goes around this type
+    /// entirely, through [`crate::loader::DocumentSource::load_with`] — but
+    /// the earlier claim here, that it "re-reads the same source at the same
+    /// provenance", was false: `load_with` admits at
+    /// [`crate::loader::MAX_DOCUMENT_BYTES`] whatever the source's
+    /// provenance, so after a link hop the bytes on screen may have arrived
+    /// under a ceiling this field does not name. That mismatch is survivable
+    /// here only because it runs one way — this field is then the *stricter*
+    /// of the two — and because `back` judges the file on disk rather than
+    /// the bytes on screen, so its answer does not depend on this field being
+    /// in step with what was rendered. It is **not** survivable as a policy:
+    /// reloading a link-provenance document at the command-line ceiling is a
+    /// hole in [`MAX_LINK_FILE_BYTES`] and in the NUL sniff, in `poll_reload`
+    /// rather than in this field. See that function.
+    ///
+    /// One thing this field is *not* the cause of: a `Backspace` that reports
+    /// `TooLarge` after the file grew past its recorded ceiling. That is the
+    /// recorded ceiling being a promise about a file that can change on disk,
+    /// and it happens identically with `--watch` off — verified by running
+    /// both.
     current_limit: u64,
 }
 

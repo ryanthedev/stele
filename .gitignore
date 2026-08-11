@@ -10,3 +10,9 @@
 # disk, deliberately not published: they are a working record, not part of the
 # project. Present in history up to d72d7c4.
 .code-foundations/
+
+# cargo-mutants writes its whole working tree here — mutated source copies,
+# per-mutant logs, build output. Ignored rather than cleaned up by hand,
+# because every sweep recreates it and one forgotten `git add .` would commit
+# hundreds of megabytes of scratch.
+mutants.out/

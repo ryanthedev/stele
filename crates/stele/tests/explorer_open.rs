@@ -273,6 +273,112 @@ fn test_dw_1_5_a_large_document_opened_by_path_at_depth_survives_the_back_round_
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The same round trip at the **exact** ceiling, which is the edge the `>`
+/// comparisons in `resolve_regular_file` and `read_text_target` actually turn
+/// on.
+///
+/// The test above proves the round trip somewhere between the two ceilings;
+/// this one proves it at the boundary itself, where an off-by-one in either
+/// direction is invisible to every other fixture in this file. A document of
+/// exactly [`MAX_DOCUMENT_BYTES`] must be **admitted** on the way in — the
+/// gates read `len() > limit`, not `>=` — and must come back the same size
+/// after being pushed and popped, which it can only do if `DocumentStack::push`
+/// recorded the document ceiling rather than the link one.
+///
+/// The fixture is a real 64 MiB of text rather than a sparse hole, and that is
+/// not incidental: `read_text_target` reads every byte and `String::from_utf8`
+/// decodes them, so a hole would be refused by the NUL sniff and the size gate
+/// would go untested. This is the honest cost of the code path — the file is
+/// read and decoded twice, once by `open_path` and once by the reload inside
+/// `back()`.
+///
+/// Only the admitted side is asserted here. One byte *past* the ceiling is
+/// already refused-by-`open_path` under test in
+/// `link::tests::test_dw_1_3_open_path_admits_under_the_command_line_ceiling_not_the_link_one`,
+/// where a sparse fixture is legitimate because that refusal happens on the
+/// `stat` size before a byte is read.
+#[test]
+fn test_dw_1_5_a_document_exactly_at_the_document_ceiling_survives_the_back_round_trip() {
+    let dir = scratch_dir("exact-ceiling-round-trip");
+    let root = write(&dir, "root.md", "# Root\n");
+    write(&dir, "second.md", "# Second\n");
+    let third = write(&dir, "third.md", "# Third\n");
+
+    // Sized against the constant, never a byte count: raising the ceiling
+    // must move this fixture with it rather than make the test vacuous.
+    //
+    // Long lines rather than short ones. The line length is irrelevant to
+    // every gate under test — the same 64 MiB is written, read, decoded and
+    // parsed either way — but it is not irrelevant to the clock: 4 KiB lines
+    // cost the debug-build parser about 2.5s per load where 27-byte lines
+    // cost about 17s and empty ones about 200s.
+    let line = "lorem ipsum dolor sit amet ".repeat(151) + "\n";
+    let mut body = String::with_capacity(MAX_DOCUMENT_BYTES as usize);
+    while body.len() as u64 + line.len() as u64 <= MAX_DOCUMENT_BYTES {
+        body.push_str(&line);
+    }
+    while (body.len() as u64) < MAX_DOCUMENT_BYTES {
+        // ASCII filler, so the tail lands on the ceiling exactly whatever
+        // length the line above happens to be.
+        body.push('.');
+    }
+    assert_eq!(
+        body.len() as u64,
+        MAX_DOCUMENT_BYTES,
+        "the fixture must sit on the ceiling, not near it"
+    );
+    assert!(
+        !body.as_bytes().contains(&0),
+        "a NUL anywhere would make the binary sniff, not the size gate, the thing under test"
+    );
+
+    let exact = dir.join("exact.md");
+    std::fs::write(&exact, &body).expect("write a fixture exactly at the ceiling");
+    drop(body);
+    assert_eq!(
+        std::fs::metadata(&exact).expect("stat the fixture").len(),
+        MAX_DOCUMENT_BYTES,
+        "the fixture on disk must be exactly at the ceiling"
+    );
+
+    let mut nav = navigator();
+    // root -> second by link, so the path-open below happens at depth 1 —
+    // the depth at which the ceiling used to be derived wrongly.
+    nav.follow("second.md", &DocumentSource::Path(root), 5)
+        .expect("root -> second");
+    let second = DocumentSource::Path(dir.join("second.md"));
+
+    match nav
+        .open_path(&exact, &second, 7)
+        .expect("a document exactly at the ceiling is admitted, because the gate is `>` not `>=`")
+    {
+        Followed::Opened { source, loaded } => {
+            assert!(source.display_name().ends_with("exact.md"));
+            assert_eq!(loaded.info.byte_size, MAX_DOCUMENT_BYTES);
+        }
+        Followed::Handed => panic!("open_path must never hand a path to an opener"),
+    }
+    assert_eq!(nav.depth(), 2);
+
+    // Move off it, which is what pushes it — and what records the ceiling it
+    // has to come back under.
+    nav.open_path(&third, &DocumentSource::Path(exact), 11)
+        .expect("exact -> third");
+    assert_eq!(nav.depth(), 3);
+
+    let (source, loaded, scroll) = nav
+        .back()
+        .expect("a document admitted at the ceiling must still be reachable on the way back");
+    assert!(source.display_name().ends_with("exact.md"));
+    assert_eq!(scroll, 11, "the scroll offset must survive the round trip");
+    assert_eq!(
+        loaded.info.byte_size, MAX_DOCUMENT_BYTES,
+        "the reload must have run under the document ceiling, not the link one"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The mirror case, so the fix is a fix and not a blanket loosening: a
 /// document reached by a **link** keeps the tighter link ceiling on the way
 /// back even after an `open_path` hop has used the wider one.
