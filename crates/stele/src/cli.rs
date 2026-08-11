@@ -1,6 +1,7 @@
-//! CLI surface: `stele <file.md>` and its flags. Parsing and the one
-//! cross-flag rule clap cannot express ([`Cli::source`]) — every other flag is
-//! acted on by `main.rs`, which is where the flag doc comments below point.
+//! CLI surface: `stele <file.md>` and its flags. Parsing and the two
+//! cross-flag/cross-filesystem rules clap cannot express ([`Cli::source`],
+//! [`Cli::start`]) — every other flag is acted on by `main.rs`, which is
+//! where the flag doc comments below point.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -33,10 +34,12 @@ pub const LONG_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("ST
     about = "A terminal markdown viewer for Ghostty"
 )]
 pub struct Cli {
-    /// The markdown file to open, or `-` to read the document from stdin.
+    /// The markdown file to open, `-` to read the document from stdin, a
+    /// directory to browse, or omitted to browse the current directory.
     /// With `-`, keys are read from `/dev/tty` instead (see
-    /// [`Cli::source`]).
-    pub file: PathBuf,
+    /// [`Cli::source`]). See [`Cli::start`] for how a bare directory is told
+    /// apart from a file.
+    pub file: Option<PathBuf>,
 
     /// Reloads the document whenever the file changes on disk, preserving
     /// the scroll anchor. Polled on the event loop's own timeout — no
@@ -125,14 +128,25 @@ pub struct Cli {
 }
 
 /// A combination of flags that parse individually but cannot mean anything
-/// together. Separate from [`crate::loader::LoadError`] on purpose: this one
-/// is decided before a single byte is read, and before the terminal is
-/// touched at all.
-#[derive(Debug, PartialEq, Eq)]
+/// together, or a filesystem fact [`Cli::start`] needs settled before the
+/// terminal is touched at all. Separate from [`crate::loader::LoadError`] on
+/// purpose: every variant here is decided before a single document byte is
+/// read.
+#[derive(Debug)]
 pub enum CliError {
     /// `--watch -`. Every word of the message names one half of the
     /// conflict, so the reader is not left to infer which flag to drop.
     WatchStdin,
+    /// `--watch <directory>`. The same shape as [`CliError::WatchStdin`] —
+    /// `--watch` polls a file's mtime, and a directory has no single file to
+    /// poll — named the same way, so both the flag and what it was combined
+    /// with are in the message.
+    WatchDirectory(PathBuf),
+    /// The current directory could not be determined at all (e.g. it was
+    /// deleted out from under the process) — reached only by a bare `stele`
+    /// with no positional argument, since every other path names its own
+    /// directory instead of asking the OS for one.
+    Cwd(std::io::Error),
 }
 
 impl fmt::Display for CliError {
@@ -143,31 +157,137 @@ impl fmt::Display for CliError {
                 "--watch cannot be combined with `-`: stdin is a stream read \
                  once to end, not a file whose changes can be watched"
             ),
+            CliError::WatchDirectory(path) => write!(
+                f,
+                "--watch cannot be combined with a directory ({}): there is \
+                 no single file to poll for changes",
+                path.display()
+            ),
+            CliError::Cwd(err) => {
+                write!(f, "could not determine the current directory: {err}")
+            }
+        }
+    }
+}
+
+impl PartialEq for CliError {
+    /// Structural equality except for [`CliError::Cwd`]'s `io::Error`, which
+    /// does not implement it. Every existing test compares the other two
+    /// variants; a `Cwd` test compares the rendered message instead (see
+    /// `test_dw_3_16_...`).
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (CliError::WatchStdin, CliError::WatchStdin) => true,
+            (CliError::WatchDirectory(a), CliError::WatchDirectory(b)) => a == b,
+            (CliError::Cwd(_), CliError::Cwd(_)) => true,
+            _ => false,
         }
     }
 }
 
 impl std::error::Error for CliError {}
 
+/// What `stele`'s arguments resolved to (Phase 3): a document to load, or a
+/// directory to browse. The split point between "read a file" and "walk a
+/// filesystem" — everything downstream of [`Cli::start`] acts on one or the
+/// other, never on `Cli` itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Start {
+    /// Load and render this document — `main.rs`'s pre-Phase-3 path,
+    /// unchanged.
+    Document(DocumentSource),
+    /// Browse this directory instead of loading anything.
+    Explore(PathBuf),
+}
+
 /// The conventional argument for "read the document from standard input".
 const STDIN_ARG: &str = "-";
 
 impl Cli {
-    /// Which [`DocumentSource`] these arguments name, or why they name none.
+    /// Which [`DocumentSource`] `self.file` names, or why it names none.
     ///
     /// This is where the `-` convention lives, and the only place: `main`
     /// never compares the path to `"-"`, and neither does the loader. The
     /// rejected combination is checked here rather than left to clap's
     /// `conflicts_with` because the conflict is with a positional *value*
     /// (`-`), not with another flag — clap has no rule for that.
+    ///
+    /// A missing `file` answers [`DocumentSource::Scratch`] — "these
+    /// arguments name no document" is a real, total answer once a bare
+    /// `stele` is a valid invocation, not an error this function raises.
+    /// [`Cli::start`] never actually reaches this arm (a missing `file`
+    /// resolves straight to [`Start::Explore`] at the current directory
+    /// without asking `source` at all), but the mapping stays honest for any
+    /// other caller.
     pub fn source(&self) -> Result<DocumentSource, CliError> {
-        if self.file != Path::new(STDIN_ARG) {
-            return Ok(DocumentSource::Path(self.file.clone()));
+        let Some(file) = &self.file else {
+            return Ok(DocumentSource::Scratch);
+        };
+        if file != Path::new(STDIN_ARG) {
+            return Ok(DocumentSource::Path(file.clone()));
         }
         if self.watch {
             return Err(CliError::WatchStdin);
         }
         Ok(DocumentSource::Stdin)
+    }
+
+    /// Resolves `self.file` to a [`Start`]: a document to load, or a
+    /// directory to browse — the one place that distinguishes them, so
+    /// `main.rs` never has to `stat` an argument itself.
+    ///
+    /// **Three cases, decided in this order:**
+    /// 1. No argument at all: browse the current directory. Getting *that*
+    ///    directory can itself fail (deleted out from under the process),
+    ///    which is the one way this function's own I/O can produce
+    ///    [`CliError::Cwd`] rather than a filesystem fact about the
+    ///    argument.
+    /// 2. `-`: unchanged — delegates to [`Cli::source`] for the stdin/
+    ///    `--watch` rule.
+    /// 3. Anything else: `stat`s the path. A directory becomes
+    ///    [`Start::Explore`] (refusing `--watch`, which has no single file
+    ///    to poll); anything else — a regular file, and deliberately a path
+    ///    that fails to `stat` at all — becomes [`Start::Document`] and is
+    ///    left to the ordinary load path to accept or refuse. **That last
+    ///    part is load-bearing, not an oversight**: a missing file must keep
+    ///    producing exactly the message `DocumentSource::load_with` has
+    ///    always produced (`could not read file: …`), not a different one
+    ///    minted here before the loader ever runs.
+    ///
+    /// An unreadable-but-existing directory is deliberately *not* a case
+    /// here — [`Start::Explore`] is returned regardless, and
+    /// `explore::Listing::read`'s own total, panic-free error handling
+    /// (a notice row naming the OS error) is what the reader sees once the
+    /// explorer opens. Checking readability here would mean reading the
+    /// directory twice, in two places that could disagree.
+    pub fn start(&self) -> Result<Start, CliError> {
+        let Some(file) = &self.file else {
+            let cwd = std::env::current_dir().map_err(CliError::Cwd)?;
+            return self.explore_or_watch_conflict(cwd);
+        };
+        if file == Path::new(STDIN_ARG) {
+            return self.source().map(Start::Document);
+        }
+        match std::fs::metadata(file) {
+            Ok(meta) if meta.is_dir() => self.explore_or_watch_conflict(file.clone()),
+            // Anything else — a regular file, a device node the loader will
+            // refuse in its own way, or a path that does not exist at all —
+            // is a `Document`. See this method's doc for why a failed `stat`
+            // is not decided here.
+            Ok(_) | Err(_) => Ok(Start::Document(DocumentSource::Path(file.clone()))),
+        }
+    }
+
+    /// [`Start::Explore(dir)`], unless `--watch` was also given — `--watch`
+    /// polls one file's mtime, and a directory has none, so the two are
+    /// rejected together the same way `--watch -` is. Shared by both routes
+    /// [`Cli::start`] can reach a directory from (a bare invocation and an
+    /// explicit positional), so the rule cannot drift between them.
+    fn explore_or_watch_conflict(&self, dir: PathBuf) -> Result<Start, CliError> {
+        if self.watch {
+            return Err(CliError::WatchDirectory(dir));
+        }
+        Ok(Start::Explore(dir))
     }
 
     /// The source-text policy these flags name.
@@ -210,7 +330,7 @@ mod tests {
     fn test_dw_5_6_cli_parses_max_width_flag() {
         let cli = Cli::parse_from(["stele", "file.md", "--max-width", "60"]);
         assert_eq!(cli.max_width, Some(60));
-        assert_eq!(cli.file, std::path::PathBuf::from("file.md"));
+        assert_eq!(cli.file, Some(std::path::PathBuf::from("file.md")));
     }
 
     #[test]

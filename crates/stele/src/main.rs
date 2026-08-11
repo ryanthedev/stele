@@ -18,8 +18,9 @@ use layout::{Chrome, IntrinsicSizer, LayoutConfig, Padding, layout};
 use width::{WidthConfig, WidthEngine};
 
 use stele::app::{AppState, ChromeAction, LayoutContext, Mode, PendingAction, StatusMessage};
-use stele::cli::Cli;
+use stele::cli::{Cli, Start};
 use stele::decor::themed::ThemedDecor;
+use stele::explore::Listing;
 use stele::link::{Followed, Navigator, SystemOpener};
 use stele::loader::{DocumentSource, LoadOptions};
 use stele::media::{GfxMediaSink, ImageSizer, MediaMode, NoopMediaSink, TextMediaSink};
@@ -71,10 +72,17 @@ const WATCH_POLL_INTERVAL: Duration = Duration::from_millis(250);
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    // Resolved before anything is read: `--watch -` is a contradiction
-    // (DW-2.3) and must not cost the user a terminal switch to find out.
-    let source = match cli.source() {
-        Ok(source) => source,
+    // Resolved before anything is read: `--watch -`/`--watch <dir>` are
+    // contradictions (DW-2.3, DW-3.14) neither of which should cost the user
+    // a terminal switch to find out, and a directory argument is decided
+    // *here* — before `load_with` can ever see it (DW-3.13) — rather than
+    // being discovered as an "Is a directory" read failure. `explore_root`
+    // is `Some(dir)` for a launch that browses instead of loading; `source`
+    // is `DocumentSource::Scratch` in that case, which loads as the empty
+    // placeholder document nothing ever paints (see that variant's doc).
+    let (source, explore_root) = match cli.start() {
+        Ok(Start::Document(source)) => (source, None),
+        Ok(Start::Explore(dir)) => (DocumentSource::Scratch, Some(dir)),
         Err(err) => {
             eprintln!("stele: {err}");
             return ExitCode::FAILURE;
@@ -239,6 +247,14 @@ fn main() -> ExitCode {
     if chrome.line_numbers || chrome.padding != Padding::default() {
         let ctx = session.ctx();
         state.apply_chrome(chrome, &ctx);
+    }
+    // A rooted launch (`stele` bare, or `stele <dir>`, Phase 3): the one
+    // directory read that happens before the event loop exists at all,
+    // because there is no prior document to seat the selection on — see
+    // `read_listing_seated`'s `seed: None` case.
+    if let Some(dir) = explore_root {
+        let (listing, selected) = read_listing_seated(&dir, None);
+        state.install_listing(listing, selected, true);
     }
 
     let mut painter = Painter::new(WidthEngine::new(WidthConfig::default()));
@@ -616,7 +632,111 @@ fn perform_action(
             }
             true
         }
+        // `_` from `Mode::Normal` (DW-3.1): `AppState` cannot name the open
+        // document's directory itself (that lives in `session.source`, not
+        // in it), so it queues this bare marker and the seating-by-name
+        // happens here instead. `base_dir` already answers "." for a
+        // document with no directory of its own — a stdin document
+        // included — so the cwd fallback DW-3.1 asks for costs no special
+        // case.
+        PendingAction::OpenExplorer => {
+            let dir = session.source.base_dir();
+            let seed = match &session.source {
+                DocumentSource::Path(path) => path.file_name(),
+                DocumentSource::Stdin | DocumentSource::Scratch => None,
+            };
+            let (listing, selected) = read_listing_seated(&dir, seed);
+            state.install_listing(listing, selected, false);
+            true
+        }
+        // `Enter` on a directory row, or `-` (DW-3.4): `AppState` already
+        // named the exact target directory (an `Entry::path`, or `dir()`'s
+        // own parent), so the only thing left to decide here is where to
+        // seat the selection — the directory just being *left* is looked up
+        // by name in the directory being entered, which is what lets `-`
+        // then `Enter` retrace the same steps back down.
+        PendingAction::ListDirectory(dir) => {
+            let seed = state
+                .explore_dir()
+                .and_then(|prev| prev.file_name())
+                .map(std::ffi::OsStr::to_os_string);
+            let rooted = matches!(state.mode(), Mode::Explore { rooted, .. } if rooted);
+            let (listing, selected) = read_listing_seated(&dir, seed.as_deref());
+            state.install_listing(listing, selected, rooted);
+            true
+        }
+        // `Enter` on a document row (DW-3.3): opens through the path-native
+        // barricade rather than `OpenLink`'s href-string one — see
+        // `Navigator::open_path`'s own doc for why the two must not share a
+        // route. A refusal (DW-3.8: the barricade declines, or the file was
+        // deleted since it was listed) leaves the explorer open with the
+        // reason on the status row, exactly like a refused `OpenLink`.
+        PendingAction::OpenPath(path) => {
+            let current = session.source.clone();
+            match session.nav.open_path(&path, &current, state.scroll()) {
+                Ok(Followed::Opened { source, loaded }) => {
+                    session.install_document(state, painter, source, loaded, 0, out);
+                }
+                // `open_path` documents that it never returns this — a path
+                // from a directory listing is never a URL. A real arm rather
+                // than a wildcard, so a future change to that contract fails
+                // loudly here instead of silently doing nothing.
+                Ok(Followed::Handed) => state.set_status(StatusMessage::new(
+                    "internal error: open_path unexpectedly handed off to the OS opener",
+                )),
+                Err(err) => state.set_status(StatusMessage::new(err.to_string())),
+            }
+            true
+        }
     }
+}
+
+/// Reads `dir` and picks up where the reader's attention already was: the
+/// row named by `seed` (an entry name carried over from wherever they came
+/// from), or [`default_selection`] if `seed` is `None` or no longer exists
+/// in the fresh listing.
+///
+/// One function for three different callers with three different ideas of
+/// `seed` — the open document's own name (`_`), the directory just left
+/// (`Enter`/`-`), or none at all (the initial rooted launch) — so the
+/// fallback rule cannot drift between them.
+fn read_listing_seated(dir: &std::path::Path, seed: Option<&std::ffi::OsStr>) -> (Listing, usize) {
+    let listing = Listing::read(dir);
+    let selected = seed
+        .and_then(|name| {
+            listing
+                .entries()
+                .iter()
+                .position(|entry| entry.name == name)
+        })
+        .unwrap_or_else(|| default_selection(&listing));
+    (listing, selected)
+}
+
+/// Where a fresh listing lands with no seed to reseat by: the first
+/// selectable row that **is not** the `../` row, when one exists.
+///
+/// [`explore::Listing::first_selectable`] documents, correctly, that `../`
+/// itself counts as selectable — Phase 2's DW-2.3 pins exactly that, as the
+/// landing spot for a directory with nothing else in it. But `../` is
+/// always entry `0` when it exists, so a caller that used
+/// `first_selectable` as its *only* answer would land every fresh listing
+/// with real content on `../` instead of the first real entry — including
+/// the very first frame a rooted `stele <dir>` paints. This tries "the first
+/// real entry" before falling back to `first_selectable`'s own answer
+/// (`../`, or `None`), so DW-2.3's fallback still holds for the directory it
+/// was written for — one with nothing selectable past the parent row.
+fn default_selection(listing: &Listing) -> usize {
+    let starts_with_parent = matches!(
+        listing.entries().first(),
+        Some(entry) if entry.kind == stele::explore::EntryKind::Parent
+    );
+    let skip_parent = starts_with_parent
+        .then(|| listing.next_selectable(0))
+        .flatten();
+    skip_parent
+        .or_else(|| listing.first_selectable())
+        .unwrap_or(0)
 }
 
 /// The interactive session: initial paint, then the scroll/resize/paint event
@@ -715,8 +835,16 @@ fn run_session(
                 // activates the link under it, and everything else is inert.
                 // `handle_mouse_event` says whether anything changed, so a
                 // click on empty text does not cost a repaint.
+                //
+                // Gated on `captures_all_keys()` (DW-3.9, Phase 3): a mode
+                // that owns the keyboard owns the mouse too, for the same
+                // reason chrome is inert while it is up — a wheel scroll
+                // must not move a document the reader cannot see, and a
+                // click must not activate a link at coordinates that now
+                // paint an explorer row instead.
                 Event::Mouse(mouse) => {
-                    repaint = state.handle_mouse_event(mouse, &session.engine);
+                    repaint = !state.mode().captures_all_keys()
+                        && state.handle_mouse_event(mouse, &session.engine);
                 }
                 // Anything else (focus, paste) changes nothing on screen, so
                 // it does not earn a frame — but it must still fall through to
@@ -762,10 +890,19 @@ fn run_session(
 fn paint(state: &mut AppState, painter: &mut Painter, out: &mut dyn Write) -> io::Result<()> {
     let status = state.status();
     match state.mode() {
-        // The TOC is the one mode that paints something other than the
+        // The TOC is one of two modes that paint something other than the
         // document: a full-screen list, over the whole content viewport.
         Mode::Toc { .. } => {
             let rows = state.toc_rows(state.size().height);
+            painter.frame_overlay(&rows, state.size(), &status, out)
+        }
+        // The explorer is the other (Phase 3), sharing the same
+        // `frame_overlay` entry point `OverlayRow`/`RowStyle` were unified
+        // for in Phase 2 — the hidden document's tree is never touched here,
+        // so whatever it looks like once the explorer closes is exactly
+        // what a resize kept it laid out as in the background.
+        Mode::Explore { .. } => {
+            let rows = state.explore_rows(state.size().height);
             painter.frame_overlay(&rows, state.size(), &status, out)
         }
         // Every other mode is the document with zero, one, or both overlays

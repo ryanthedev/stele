@@ -496,6 +496,12 @@ pub fn reread_document(
         // render a blank screen with no explanation. Refusing says the true
         // thing instead, and matches `--watch -`'s CLI-parse refusal.
         DocumentSource::Stdin => return Err(LinkError::StreamNotRereadable),
+        // Unreachable by construction: `Navigator::open_path` refuses to
+        // push a `Scratch` source, so `DocumentStack::pop` can never hand
+        // this function one. Kept as a real arm — not a wildcard — so a
+        // future caller that *does* manage to push one fails loudly here
+        // rather than being told there is a file to re-resolve.
+        DocumentSource::Scratch => return Err(LinkError::AtRoot),
     };
     let resolved = resolve_regular_file(path, Path::new("."), limit)?;
     let text = read_text_target(&resolved, limit)?;
@@ -524,7 +530,11 @@ pub fn reread_document(
 pub fn refuse_unless_regular_file(source: &DocumentSource) -> Result<(), LinkError> {
     let path = match source {
         DocumentSource::Path(path) => path,
-        DocumentSource::Stdin => return Ok(()),
+        // Nothing to check for either: a stream has no file to `stat`, and
+        // neither does the rooted explorer's placeholder — see
+        // `DocumentSource::Scratch`'s doc for why `--watch` can never be
+        // live while it is the open source.
+        DocumentSource::Stdin | DocumentSource::Scratch => return Ok(()),
     };
     // A path that cannot be stat'ed is *not* refused here: it is almost
     // certainly a deleted file, and the caller's own load reports that with
@@ -813,8 +823,17 @@ impl Navigator {
         let text = read_text_target(&resolved, limit)?;
         let source = DocumentSource::Path(resolved);
         let loaded = crate::loader::document_from_text(&text, source.display_name(), self.options);
-        self.stack
-            .push(current.clone(), current_scroll, self.current_limit)?;
+        // `current` is `Scratch` exactly when this is the first file opened
+        // out of a rooted explorer — there was never a document on screen to
+        // record a way back to. Pushing it anyway would let `Backspace`
+        // later try to re-resolve a path that was never on disk
+        // (`reread_document` on `Scratch` is unreachable *because* of this
+        // check); refusing the push instead leaves the stack empty, so
+        // `Backspace` correctly reports `LinkError::AtRoot`.
+        if !matches!(current, DocumentSource::Scratch) {
+            self.stack
+                .push(current.clone(), current_scroll, self.current_limit)?;
+        }
         self.current_limit = limit;
         Ok(Followed::Opened { source, loaded })
     }

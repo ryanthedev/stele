@@ -6,6 +6,7 @@ use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
+use std::path::{Path, PathBuf};
 
 use ast::{BlockKind, Document, NodeId, NodeRef};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -15,7 +16,7 @@ use layout::{
 };
 use width::WidthEngine;
 
-use crate::explore::{OverlayRow, RowStyle};
+use crate::explore::{EntryKind, Listing, OverlayRow, RowStyle};
 use crate::painter::{self, Page, SearchOverlay, Size, item_columns};
 
 /// Mixed into [`AppState::fingerprint`] between lines so two blocks whose runs
@@ -244,6 +245,25 @@ pub enum Mode {
     /// can do is index past the end, which [`AppState::reseat_link_select`]
     /// clamps on the same relayout hook [`AppState::reseat_search`] uses.
     LinkSelect { index: usize },
+    /// The full-screen directory explorer (Phase 3), with `selected` indexing
+    /// [`AppState::explore`]'s [`crate::explore::Listing::entries`] and
+    /// `rooted` saying whether there is a real document behind it to reveal.
+    ///
+    /// `rooted` rides on the variant for the same reason `Search { origin }`
+    /// does: the datum must not outlive the mode it gives meaning to. It is
+    /// `true` exactly when this explorer is the *reason* the process is
+    /// running — `stele` with no argument, or `stele <dir>` — so there is no
+    /// previously-open document for `Esc`/`q` to reveal (DW-3.15). It starts
+    /// `false` and stays `false` for every explorer opened with `_` from a
+    /// real document, and — once set at the root of a rooted launch — is
+    /// carried unchanged through every re-list `Enter`/`-` produce, however
+    /// deep the reader descends, because the *reason* the process is running
+    /// does not change on the way down.
+    ///
+    /// The listing itself cannot ride on the variant: `Mode` is `Copy`, and
+    /// [`crate::explore::Listing`] owns a [`std::path::PathBuf`] per entry.
+    /// It lives in [`AppState::explore`] instead, alongside this index.
+    Explore { selected: usize, rooted: bool },
 }
 
 impl Mode {
@@ -293,6 +313,13 @@ impl Mode {
             // The reader would see the indicator jump to a different link on
             // a keystroke that was never about links.
             Mode::LinkSelect { .. } => true,
+            // The explorer's own key table reads `j`/`k`/`Enter`/`Esc`/`-`/
+            // `q` and deliberately ignores the rest — including `-`, which
+            // `chrome_action` would otherwise claim as `ChromeAction::Narrow`
+            // before this method is ever consulted. Answering `true` here is
+            // the entire reason `-` can mean "up a directory" inside the
+            // explorer at all (DW-3.6).
+            Mode::Explore { .. } => true,
         }
     }
 }
@@ -347,6 +374,30 @@ pub enum PendingAction {
     CopyCodeBlock,
     /// `m`: turn mouse capture on or off (DW-6.6).
     SetMouseCapture(bool),
+    /// `_` from [`Mode::Normal`]: open the explorer at the open document's
+    /// directory (Phase 3, DW-3.1).
+    ///
+    /// Carries no path, unlike [`PendingAction::ListDirectory`] below —
+    /// `AppState` performs no I/O and, unlike once a [`crate::explore::Listing`]
+    /// is already held, has no way to *name* the open document's directory
+    /// either: that lives in `Session::source`, in `main.rs`. The event loop
+    /// resolves it (`session.source.base_dir()`, which already answers the
+    /// current working directory for a document with no directory of its
+    /// own — a stdin document included) and seats the selection on the open
+    /// document's own row.
+    OpenExplorer,
+    /// Re-list this directory into the explorer (Phase 3, DW-3.4): `Enter`
+    /// on a directory row, `Enter` on `../`, or `-`. Unlike
+    /// [`PendingAction::OpenExplorer`], `AppState` already holds a
+    /// [`crate::explore::Listing`] by the time this is queued, so it can
+    /// name the exact target path itself — the entry's own recorded
+    /// [`crate::explore::Entry::path`], never reconstructed from display
+    /// text (which is lossy for a non-UTF8 name).
+    ListDirectory(PathBuf),
+    /// `Enter` on a document row (Phase 3, DW-3.3): open this path through
+    /// [`crate::link::Navigator::open_path`], the same non-lossy path as
+    /// [`PendingAction::ListDirectory`].
+    OpenPath(PathBuf),
 }
 /// What the status row says when a heading motion or the TOC has nothing to
 /// work with. One constant, because a document with no headings must answer
@@ -485,6 +536,22 @@ pub struct AppState {
     /// the terminal holds the real state — so `m` can report which way it
     /// went without the event loop having to tell this type back.
     mouse_capture: bool,
+    /// The directory listing behind [`Mode::Explore`], read by `Session` and
+    /// handed over whole by [`AppState::install_listing`] (Phase 3).
+    ///
+    /// Holding an already-read [`crate::explore::Listing`] is not the I/O
+    /// this type forbids itself — only [`crate::explore::Listing::read`] is,
+    /// and nothing here calls it (see `app.rs`'s own no-I/O module note,
+    /// and DW-3.4's dedicated source-text test). Every method that acts on
+    /// this field — `next_selectable`, `prev_selectable`, `entries`, `dir`,
+    /// `rows` — is a pure projection over data `Session` already gathered.
+    /// `None` outside [`Mode::Explore`].
+    explore: Option<Listing>,
+    /// Where `Esc` puts the reader back when an *unrooted* explorer closes
+    /// (DW-3.5) — the same `toc_return_scroll` idiom, captured on the way
+    /// in and left untouched across every re-list a re-listed `Enter`/`-`
+    /// produces.
+    explore_return_scroll: usize,
 }
 
 impl AppState {
@@ -514,6 +581,8 @@ impl AppState {
             pending_fold_snap: None,
             action: None,
             mouse_capture: true,
+            explore: None,
+            explore_return_scroll: 0,
         }
     }
 
@@ -697,11 +766,38 @@ impl AppState {
             Mode::Normal | Mode::Toc { .. } | Mode::LinkSelect { .. } => {
                 self.take_transient_message()
             }
+            // The listed directory owns the row while the explorer is open
+            // (DW-3.10) — never the hidden document's name and scroll
+            // percentage, which `position_pct`/`file_info.name` below would
+            // otherwise supply. A transient message (a barricade refusal or
+            // a re-list failure, DW-3.8) still ages and takes priority over
+            // it for exactly as long as its TTL runs, the same rule the TOC
+            // arm above follows; once it expires this reverts to the
+            // directory rather than to the ordinary ruler.
+            Mode::Explore { .. } => Some(
+                self.take_transient_message()
+                    .unwrap_or_else(|| self.explore_status_text()),
+            ),
         };
         StatusLine {
             position_pct: self.position_pct(),
             name: self.file_info.name.clone(),
             message,
+        }
+    }
+
+    /// The explorer's default status text: the listed directory. Always
+    /// `Some` from [`AppState::status`]'s `Mode::Explore` arm, so
+    /// `position_pct`/`name` below are never actually rendered — see
+    /// [`StatusLine::render`].
+    fn explore_status_text(&self) -> String {
+        match self.explore_dir() {
+            Some(dir) => dir.display().to_string(),
+            // Reachable only mid-startup, before the first
+            // `install_listing` call — `main.rs` never paints a frame in
+            // that window, but the answer has to exist regardless of
+            // whether anything today reads it.
+            None => String::new(),
         }
     }
 
@@ -1243,6 +1339,192 @@ impl AppState {
             .collect()
     }
 
+    // --------------------------------------------------------------- explore (Phase 3)
+
+    /// Installs a freshly-read [`crate::explore::Listing`] and enters or
+    /// stays in [`Mode::Explore`] — the one seam every way of reaching or
+    /// re-listing the explorer goes through: the initial rooted launch, `_`
+    /// from [`Mode::Normal`], and every `Enter`-on-directory or `-` re-list.
+    ///
+    /// `rooted` is the caller's to set correctly; this method does not infer
+    /// it. `main.rs` passes `true` only for the launch that opened the
+    /// explorer with nothing behind it, and reads the *current* mode's
+    /// `rooted` back out to pass unchanged into every re-list — see
+    /// [`Mode::Explore`]'s own doc for why a re-list must never flip it.
+    ///
+    /// The reader's scroll position is captured for [`AppState::handle_explore_key`]'s
+    /// `Esc` to restore, but **only on the way in** — a re-list while already
+    /// exploring must not overwrite the position the *document* was left at
+    /// with whatever [`AppState::scroll`] happens to hold mid-browse (it is
+    /// meaningless there; the explorer paints over the whole viewport).
+    pub fn install_listing(&mut self, listing: Listing, selected: usize, rooted: bool) {
+        if !matches!(self.mode, Mode::Explore { .. }) {
+            self.explore_return_scroll = self.scroll;
+        }
+        self.explore = Some(listing);
+        self.mode = Mode::Explore { selected, rooted };
+    }
+
+    /// The rows the explorer overlay paints into a viewport `height` rows
+    /// tall (DW-3.2), windowed exactly as [`AppState::toc_rows`] windows the
+    /// TOC — delegated to [`crate::explore::Listing::rows`], which already
+    /// does that windowing and the dim/selected styling both, over data this
+    /// type only ever holds, never reads.
+    ///
+    /// Empty outside [`Mode::Explore`], and empty when nothing has been
+    /// installed yet — reachable only mid-startup, before the first
+    /// [`AppState::install_listing`] call lands.
+    pub fn explore_rows(&self, height: u16) -> Vec<OverlayRow> {
+        let Mode::Explore { selected, .. } = self.mode else {
+            return Vec::new();
+        };
+        match &self.explore {
+            Some(listing) => listing.rows(height, selected),
+            None => Vec::new(),
+        }
+    }
+
+    /// The directory the explorer is currently listing, or `None` outside
+    /// [`Mode::Explore`] — read by `main.rs` before a re-list, so the
+    /// directory just being *left* can be looked up by name in the
+    /// directory being entered (DW-3.7's noted re-seat-by-name choice).
+    pub fn explore_dir(&self) -> Option<&Path> {
+        self.explore.as_ref().map(Listing::dir)
+    }
+
+    /// The explorer's key table (DW-3.6): `j`/`k` move the selection,
+    /// skipping unselectable rows; `Enter` opens or descends; `-` ascends;
+    /// `Esc` closes (or quits, rooted); `q`/`Ctrl-c` always quit. Every other
+    /// key — including the whole chrome table, which `chrome_action` has
+    /// already declined to claim because [`Mode::captures_all_keys`] says
+    /// this mode owns the keyboard — is a deliberate no-op.
+    fn handle_explore_key(&mut self, key: KeyEvent, selected: usize, rooted: bool) -> bool {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Char('q') => return true,
+            KeyCode::Char('c') if ctrl => return true,
+            KeyCode::Esc => {
+                if rooted {
+                    // Nothing real is behind this explorer (DW-3.15): there
+                    // is no document to reveal, so the only honest answer to
+                    // "leave" is to leave the process.
+                    return true;
+                }
+                self.close_explore();
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.move_explore_selection(selected, rooted, true)
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.move_explore_selection(selected, rooted, false)
+            }
+            KeyCode::Enter => self.activate_explore_row(selected),
+            KeyCode::Char('-') => self.ascend_explore(),
+            _ => {}
+        }
+        false
+    }
+
+    /// `Esc` with `rooted: false` (DW-3.5): back to the document, at the
+    /// scroll position the reader left it at.
+    fn close_explore(&mut self) {
+        self.mode = Mode::Normal;
+        self.explore = None;
+        self.set_scroll(self.explore_return_scroll);
+    }
+
+    /// `j`/`k`: the next or previous selectable row, or a no-op at either
+    /// end — [`crate::explore::Listing::next_selectable`]/`prev_selectable`
+    /// already encode "never land on an unopenable row" and "no wrap", so
+    /// this only has to thread `rooted` through unchanged.
+    fn move_explore_selection(&mut self, selected: usize, rooted: bool, forward: bool) {
+        let Some(listing) = &self.explore else {
+            return;
+        };
+        let target = if forward {
+            listing.next_selectable(selected)
+        } else {
+            listing.prev_selectable(selected)
+        };
+        if let Some(selected) = target {
+            self.mode = Mode::Explore { selected, rooted };
+        }
+    }
+
+    /// `Enter` (DW-3.3/DW-3.4): a directory or `../` row re-lists through
+    /// [`PendingAction::ListDirectory`]; a document row opens through
+    /// [`PendingAction::OpenPath`]. Both name the entry's own recorded
+    /// [`crate::explore::Entry::path`] — exact, never reconstructed from the
+    /// row's display text, which is lossy for a non-UTF8 name.
+    ///
+    /// An [`EntryKind::Unopenable`] row is a deliberate no-op rather than an
+    /// error: the three movement methods already refuse to select one, so
+    /// reaching this arm at all would mean `selected` was never seated by
+    /// them — defended here rather than assumed away.
+    fn activate_explore_row(&mut self, selected: usize) {
+        let Some(listing) = &self.explore else {
+            return;
+        };
+        let Some(entry) = listing.entries().get(selected) else {
+            return;
+        };
+        self.action = Some(match entry.kind {
+            EntryKind::Parent | EntryKind::Directory => {
+                PendingAction::ListDirectory(entry.path.clone())
+            }
+            EntryKind::Document => PendingAction::OpenPath(entry.path.clone()),
+            EntryKind::Unopenable => return,
+        });
+    }
+
+    /// `-` (DW-3.4/DW-3.6): re-lists the parent directory, or does nothing at
+    /// the filesystem root, where there is no parent to ascend to — the same
+    /// "no such row" no-op `Enter` on a `../` that does not exist would be.
+    fn ascend_explore(&mut self) {
+        let Some(listing) = &self.explore else {
+            return;
+        };
+        if let Some(parent) = listing.dir().parent() {
+            self.action = Some(PendingAction::ListDirectory(parent.to_path_buf()));
+        }
+    }
+
+    /// Re-clamps [`Mode::Explore`]'s `selected` after a relayout — a resize
+    /// storm being the only thing that can trigger one while the explorer is
+    /// open, since [`AppState::explore`] itself only ever changes through
+    /// [`AppState::install_listing`], which seats `selected` fresh every
+    /// time. Called unconditionally, like [`AppState::reseat_link_select`]:
+    /// a clamp that finds nothing out of range is a no-op.
+    ///
+    /// **Only ever clamps, never drops to [`Mode::Normal`].**
+    /// [`crate::explore::Listing::rows`] is total over every `(height,
+    /// selected)`, including an empty listing, so there is never a listing
+    /// this mode cannot honestly paint — and for a rooted launch, dropping to
+    /// `Normal` would reveal the empty placeholder document, which DW-3.15
+    /// forbids outright. DW-3.7's "or drop cleanly to Normal" alternative is
+    /// therefore never exercised: a valid row (or the honest absence of one,
+    /// on a listing with nothing selectable) always exists instead.
+    fn reseat_explore(&mut self) {
+        let Mode::Explore { selected, rooted } = self.mode else {
+            return;
+        };
+        let Some(listing) = &self.explore else {
+            return;
+        };
+        let count = listing.entries().len();
+        let clamped = if count == 0 {
+            0
+        } else {
+            selected.min(count - 1)
+        };
+        if clamped != selected {
+            self.mode = Mode::Explore {
+                selected: clamped,
+                rooted,
+            };
+        }
+    }
+
     /// `z` (DW-5.1): folds or unfolds the heading at or above the cursor.
     ///
     /// Zero-arg by design (see the plan's `Produces`): this only decides
@@ -1450,7 +1732,9 @@ impl AppState {
                 // Unreachable — `selected_link` already returned `None` in
                 // every other mode. Named rather than wildcarded so a new
                 // mode has to be considered here too.
-                Mode::Normal | Mode::Toc { .. } | Mode::Search { .. } => return,
+                Mode::Normal | Mode::Toc { .. } | Mode::Search { .. } | Mode::Explore { .. } => {
+                    return;
+                }
             };
             self.set_status(StatusMessage::new(format!(
                 "link {index}/{count}: {}",
@@ -1764,6 +2048,7 @@ impl AppState {
             Mode::Search { .. } => self.handle_search_key(key),
             Mode::LinkSelect { index } => self.handle_link_select_key(key, index),
             Mode::Normal => self.handle_normal_key(key),
+            Mode::Explore { selected, rooted } => self.handle_explore_key(key, selected, rooted),
         }
     }
 
@@ -1844,6 +2129,15 @@ impl AppState {
                 }
                 KeyCode::Char('m') => {
                     self.toggle_mouse_capture();
+                    return false;
+                }
+                // `_` (Phase 3, DW-3.1): opens the explorer at the open
+                // document's directory. Unbound before this phase — verified
+                // against every `KeyCode::Char` arm in this file — and safe
+                // from `-`'s fate (claimed by `chrome_action` before this
+                // table runs) because `_` was never claimed there either.
+                KeyCode::Char('_') => {
+                    self.action = Some(PendingAction::OpenExplorer);
                     return false;
                 }
                 _ => {}
@@ -1998,7 +2292,9 @@ impl AppState {
             // compiler's price for the exhaustiveness that makes a new mode a
             // compile error everywhere. "Wherever the reader is" is the
             // honest answer for a caller that arrived without an origin.
-            Mode::Normal | Mode::Toc { .. } | Mode::LinkSelect { .. } => self.scroll,
+            Mode::Normal | Mode::Toc { .. } | Mode::LinkSelect { .. } | Mode::Explore { .. } => {
+                self.scroll
+            }
         };
         self.search.matches = find_matches(&self.tree, &self.search);
         self.search.current = first_match_at_or_after(&self.search.matches, origin);
@@ -2214,6 +2510,7 @@ impl AppState {
         self.place_cursor(cursor_offset);
         self.reseat_search(reflowed);
         self.reseat_link_select();
+        self.reseat_explore();
         self.recompute_matches(ctx);
     }
 
@@ -5169,6 +5466,21 @@ mod tests {
         assert!(Mode::LinkSelect { index: 0 }.captures_all_keys());
         assert!(Mode::LinkSelect { index: 7 }.captures_all_keys());
         assert!(Mode::Toc { selected: 0 }.captures_all_keys());
+        // Phase 3: `rooted` is likewise irrelevant to the answer.
+        assert!(
+            Mode::Explore {
+                selected: 0,
+                rooted: false,
+            }
+            .captures_all_keys()
+        );
+        assert!(
+            Mode::Explore {
+                selected: 3,
+                rooted: true,
+            }
+            .captures_all_keys()
+        );
     }
 
     // ---- Search meets the modes and features that landed beside it -------
@@ -5228,6 +5540,14 @@ mod tests {
             Mode::Toc { selected: 0 },
             Mode::Search { origin: 0 },
             Mode::LinkSelect { index: 0 },
+            Mode::Explore {
+                selected: 0,
+                rooted: false,
+            },
+            Mode::Explore {
+                selected: 0,
+                rooted: true,
+            },
         ] {
             state.mode = mode;
             let claimed: Vec<char> = chrome_keys
@@ -6538,7 +6858,7 @@ mod tests {
     fn selected_index(state: &AppState) -> Option<usize> {
         match state.mode() {
             Mode::LinkSelect { index } => Some(index),
-            Mode::Normal | Mode::Toc { .. } | Mode::Search { .. } => None,
+            Mode::Normal | Mode::Toc { .. } | Mode::Search { .. } | Mode::Explore { .. } => None,
         }
     }
 
@@ -7022,8 +7342,8 @@ mod tests {
                 state.visible_links().is_empty(),
                 "dropping to Normal is only right when nothing is selectable"
             ),
-            Mode::Toc { .. } | Mode::Search { .. } => {
-                panic!("a resize cannot open an overlay or a query prompt")
+            Mode::Toc { .. } | Mode::Search { .. } | Mode::Explore { .. } => {
+                panic!("a resize cannot open an overlay, a query prompt, or the explorer")
             }
         }
     }
@@ -7552,5 +7872,370 @@ mod tests {
         assert!(!Mode::Normal.captures_all_keys());
         assert!(Mode::Toc { selected: 0 }.captures_all_keys());
         assert!(Mode::LinkSelect { index: 0 }.captures_all_keys());
+        assert!(
+            Mode::Explore {
+                selected: 0,
+                rooted: false,
+            }
+            .captures_all_keys()
+        );
+    }
+
+    // ------------------------------------------------------- explore (Phase 3)
+
+    mod explore_tests {
+        use std::path::PathBuf;
+
+        use crate::explore::{Entry, EntryKind, Listing};
+
+        use super::*;
+
+        /// A directory fixture with one of every kind `explore::Listing`
+        /// classifies, so a test can select any of them by index without
+        /// touching the filesystem — `Listing::from_entries` is the pure
+        /// seam `explore.rs`'s own doc says exists for exactly this.
+        ///
+        /// Order: `../`, `alpha/` (directory), `blocked` (unopenable),
+        /// `notes.md` (document), `zeta.md` (document). Names are chosen to
+        /// sort in this order, matching `Listing::read`'s own ordering, so a
+        /// test reasoning about "the next selectable row" is reasoning about
+        /// the fixture as written rather than about a sort it has to
+        /// remember.
+        fn mixed_listing(dir: &Path) -> Listing {
+            let entries = vec![
+                Entry {
+                    name: "..".into(),
+                    path: dir.parent().unwrap_or(dir).to_path_buf(),
+                    kind: EntryKind::Parent,
+                },
+                Entry {
+                    name: "alpha".into(),
+                    path: dir.join("alpha"),
+                    kind: EntryKind::Directory,
+                },
+                Entry {
+                    name: "blocked".into(),
+                    path: dir.join("blocked"),
+                    kind: EntryKind::Unopenable,
+                },
+                Entry {
+                    name: "notes.md".into(),
+                    path: dir.join("notes.md"),
+                    kind: EntryKind::Document,
+                },
+                Entry {
+                    name: "zeta.md".into(),
+                    path: dir.join("zeta.md"),
+                    kind: EntryKind::Document,
+                },
+            ];
+            Listing::from_entries(dir.to_path_buf(), entries, false)
+        }
+
+        /// A viewport shorter than the fixture document (30 short paragraphs
+        /// against 5 rows), so a handful of `j` presses reliably scrolls —
+        /// `test_dw_3_5_esc_unrooted_restores_the_readers_scroll_position`
+        /// needs a real, non-zero scroll to prove `Esc` restores.
+        fn explore_state() -> (PathBuf, AppState) {
+            let (_doc, _config, _engine, state) = build(&numbered_paragraphs(30), 80, 5);
+            (PathBuf::from("/fixture/dir"), state)
+        }
+
+        /// DW-3.1 (unit half): `_` from `Mode::Normal` queues
+        /// `PendingAction::OpenExplorer` — the path-free marker `main.rs`
+        /// resolves against `Session::source`, since `AppState` cannot name
+        /// the open document's directory itself. The pty half
+        /// (`explorer_keys.rs`) proves the seating `main.rs` then does with
+        /// it; this proves the key is bound to the right action at all.
+        #[test]
+        fn test_dw_3_1_underscore_in_normal_mode_queues_open_explorer() {
+            let (_doc, _config, _engine, mut state) = build(&numbered_paragraphs(5), 80, 10);
+            assert_eq!(state.mode(), Mode::Normal);
+            let quit = state.handle_key_event(plain(KeyCode::Char('_')));
+            assert!(!quit);
+            assert_eq!(state.take_action(), Some(PendingAction::OpenExplorer));
+            // The mode must not change until the round trip comes back with
+            // a listing — there is nothing yet to show.
+            assert_eq!(state.mode(), Mode::Normal);
+        }
+
+        /// DW-3.4 (unit half): `install_listing` is the one seam that enters
+        /// or re-enters `Mode::Explore`, and the rows it exposes come from
+        /// the listing it was handed — never from a fresh read.
+        #[test]
+        fn test_dw_3_4_install_listing_enters_explore_mode_with_the_given_selection() {
+            let (dir, mut state) = explore_state();
+            state.install_listing(mixed_listing(&dir), 3, false);
+            assert_eq!(
+                state.mode(),
+                Mode::Explore {
+                    selected: 3,
+                    rooted: false
+                }
+            );
+            let rows = state.explore_rows(20);
+            assert_eq!(rows.len(), 5, "every entry in the fixture must paint");
+            assert_eq!(rows[3].style, RowStyle::Selected);
+            assert_eq!(rows[2].style, RowStyle::Dimmed, "the unopenable row dims");
+        }
+
+        /// DW-3.4: nothing in `app.rs` may *call* the read function this
+        /// whole module holds itself to never calling — the one function in
+        /// the crate that touches a directory. A test that only calls
+        /// `install_listing`/`explore_rows` and gets the right rows would
+        /// pass just as well against a version that read the directory
+        /// itself; this instead inspects the *source text* of the module
+        /// under the no-I/O invariant, so an implementation that
+        /// reintroduces the call fails here even if its behavior looks
+        /// correct.
+        ///
+        /// Matches on the call shape — the type, `::`, the method name, and
+        /// an opening parenthesis, joined at runtime rather than written as
+        /// one literal — so this comment can describe the check without the
+        /// check tripping over its own description, and this file's own
+        /// source cannot contain the literal call pattern by accident
+        /// either.
+        #[test]
+        fn test_dw_3_4_app_rs_never_calls_listing_read() {
+            let call_pattern = ["Listing", "::", "read", "("].concat();
+            let source = std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/app.rs"),
+            )
+            .expect("app.rs readable");
+            assert!(
+                !source.contains(&call_pattern),
+                "app.rs must never call {call_pattern}...) — AppState performs no I/O"
+            );
+        }
+
+        /// DW-3.6 (unit half): every chrome key is inert while exploring,
+        /// via the ordinary `handle_key_event` dispatch — the pty test in
+        /// `explorer_keys.rs` covers the resize-drain dispatch path this one
+        /// cannot reach.
+        #[test]
+        fn test_dw_3_6_chrome_keys_change_nothing_while_exploring() {
+            let (dir, mut state) = explore_state();
+            state.install_listing(mixed_listing(&dir), 3, false);
+            for c in ['+', 'T', 'z', 'R', 'M', '#'] {
+                let before = state.mode();
+                assert_eq!(
+                    state.chrome_action(plain(KeyCode::Char(c))),
+                    None,
+                    "`{c}` must not be claimed as chrome while exploring"
+                );
+                state.handle_key_event(plain(KeyCode::Char(c)));
+                assert_eq!(
+                    state.mode(),
+                    before,
+                    "`{c}` must change nothing while exploring"
+                );
+            }
+        }
+
+        /// DW-3.6: `-` ascends instead of narrowing — asserted by the queued
+        /// action, which is what `-` would never produce if it had been
+        /// claimed as `ChromeAction::Narrow` upstream.
+        #[test]
+        fn test_dw_3_6_dash_ascends_rather_than_narrowing() {
+            let (dir, mut state) = explore_state();
+            state.install_listing(mixed_listing(&dir), 3, false);
+            state.handle_key_event(plain(KeyCode::Char('-')));
+            assert_eq!(
+                state.take_action(),
+                Some(PendingAction::ListDirectory(
+                    dir.parent().unwrap().to_path_buf()
+                ))
+            );
+        }
+
+        /// `-` at a listing with no parent row (the fixture the fs root
+        /// would produce) is a no-op, not a queued action to nowhere.
+        #[test]
+        fn test_dash_at_a_listing_with_no_parent_is_a_no_op() {
+            let (_dir, mut state) = explore_state();
+            let root = PathBuf::from("/");
+            let entries = vec![Entry {
+                name: "etc".into(),
+                path: root.join("etc"),
+                kind: EntryKind::Directory,
+            }];
+            state.install_listing(Listing::from_entries(root, entries, false), 0, false);
+            state.handle_key_event(plain(KeyCode::Char('-')));
+            assert_eq!(state.take_action(), None);
+        }
+
+        /// `j`/`k` skip the unopenable row in both directions and never
+        /// land on it.
+        #[test]
+        fn test_j_and_k_skip_the_unopenable_row_in_both_directions() {
+            let (dir, mut state) = explore_state();
+            state.install_listing(mixed_listing(&dir), 1, false);
+            state.handle_key_event(plain(KeyCode::Char('j')));
+            assert_eq!(
+                state.mode(),
+                Mode::Explore {
+                    selected: 3,
+                    rooted: false
+                },
+                "j from `alpha/` must skip `blocked` and land on `notes.md`"
+            );
+            state.handle_key_event(plain(KeyCode::Char('k')));
+            assert_eq!(
+                state.mode(),
+                Mode::Explore {
+                    selected: 1,
+                    rooted: false
+                },
+                "k back must skip `blocked` again"
+            );
+        }
+
+        /// `Enter` on a directory row queues a re-list at that entry's own
+        /// path (DW-3.4); `Enter` on `../` does the same for the parent row.
+        #[test]
+        fn test_dw_3_4_enter_on_a_directory_row_queues_list_directory() {
+            let (dir, mut state) = explore_state();
+            state.install_listing(mixed_listing(&dir), 1, false);
+            state.handle_key_event(plain(KeyCode::Enter));
+            assert_eq!(
+                state.take_action(),
+                Some(PendingAction::ListDirectory(dir.join("alpha")))
+            );
+
+            state.install_listing(mixed_listing(&dir), 0, false);
+            state.handle_key_event(plain(KeyCode::Enter));
+            assert_eq!(
+                state.take_action(),
+                Some(PendingAction::ListDirectory(dir.parent().unwrap().into()))
+            );
+        }
+
+        /// DW-3.3: `Enter` on a document row queues `OpenPath` at that
+        /// entry's own path, not a reconstruction from its display text.
+        #[test]
+        fn test_dw_3_3_enter_on_a_document_row_queues_open_path() {
+            let (dir, mut state) = explore_state();
+            state.install_listing(mixed_listing(&dir), 3, false);
+            state.handle_key_event(plain(KeyCode::Enter));
+            assert_eq!(
+                state.take_action(),
+                Some(PendingAction::OpenPath(dir.join("notes.md")))
+            );
+        }
+
+        /// `Enter` on the unopenable row is a no-op — reachable only if
+        /// `selected` were seated off the movement methods, which this
+        /// still defends against rather than assuming away.
+        #[test]
+        fn test_enter_on_the_unopenable_row_queues_nothing() {
+            let (dir, mut state) = explore_state();
+            state.install_listing(mixed_listing(&dir), 2, false);
+            state.handle_key_event(plain(KeyCode::Enter));
+            assert_eq!(state.take_action(), None);
+        }
+
+        /// DW-3.5: `Esc` unrooted restores the reader's scroll and closes
+        /// the explorer.
+        #[test]
+        fn test_dw_3_5_esc_unrooted_restores_the_readers_scroll_position() {
+            let (dir, mut state) = explore_state();
+            // Reach a real, non-zero scroll the ordinary way, before opening
+            // the explorer over it.
+            for _ in 0..5 {
+                state.handle_key_event(plain(KeyCode::Char('j')));
+            }
+            let scroll_before = state.scroll();
+            assert!(scroll_before > 0, "the fixture must actually scroll");
+
+            state.install_listing(mixed_listing(&dir), 0, false);
+            let quit = state.handle_key_event(plain(KeyCode::Esc));
+            assert!(!quit, "an unrooted Esc must not quit");
+            assert_eq!(state.mode(), Mode::Normal);
+            assert_eq!(state.scroll(), scroll_before);
+        }
+
+        /// DW-3.15: `Esc` and `q` both quit a rooted explorer rather than
+        /// falling back to `Mode::Normal`, where the empty placeholder
+        /// document would show.
+        #[test]
+        fn test_dw_3_15_esc_and_q_both_quit_a_rooted_explorer() {
+            for key in [KeyCode::Esc, KeyCode::Char('q')] {
+                let (dir, mut state) = explore_state();
+                state.install_listing(mixed_listing(&dir), 0, true);
+                let quit = state.handle_key_event(plain(key));
+                assert!(quit, "{key:?} must quit a rooted explorer");
+            }
+        }
+
+        /// Rootedness survives a re-list untouched — `install_listing` is
+        /// given exactly what the caller passes, and `main.rs`'s
+        /// `PendingAction::ListDirectory` handler is what is responsible for
+        /// reading it back out of the current mode before re-listing.
+        #[test]
+        fn test_rooted_survives_reinstalling_a_listing() {
+            let (dir, mut state) = explore_state();
+            state.install_listing(mixed_listing(&dir), 0, true);
+            state.install_listing(mixed_listing(&dir), 1, true);
+            assert_eq!(
+                state.mode(),
+                Mode::Explore {
+                    selected: 1,
+                    rooted: true
+                }
+            );
+        }
+
+        /// DW-3.7 (unit half): a relayout re-clamps `selected` against a
+        /// listing that has shrunk since it was installed, rather than
+        /// leaving it addressing a row that no longer exists. Driven through
+        /// `relayout_preserving_anchor`, the same entry point every chrome
+        /// mutation (and, in `main.rs`, every resize) uses.
+        #[test]
+        fn test_dw_3_7_reseat_explore_reclamps_selection_after_the_listing_shrinks() {
+            let dir = PathBuf::from("/fixture/dir");
+            let (doc, config, engine, mut state) = build(&numbered_paragraphs(10), 80, 20);
+            state.install_listing(mixed_listing(&dir), 4, false);
+            assert_eq!(
+                state.mode(),
+                Mode::Explore {
+                    selected: 4,
+                    rooted: false
+                }
+            );
+
+            // A shrunk listing installed directly (as a re-list would), but
+            // *without* going through the seating logic `main.rs` applies —
+            // exactly the "stale index into a shorter listing" shape DW-3.7
+            // names, forced here so `reseat_explore` is the thing proven to
+            // fix it rather than `install_listing`'s own clamp (it has
+            // none — the caller is trusted to pass a valid index, and this
+            // test is what proves the *next* relayout no longer trusts it
+            // blindly).
+            let shorter = Listing::from_entries(
+                dir.clone(),
+                vec![Entry {
+                    name: "only.md".into(),
+                    path: dir.join("only.md"),
+                    kind: EntryKind::Document,
+                }],
+                false,
+            );
+            state.install_listing(shorter, 4, false);
+            let ctx = LayoutContext {
+                doc: &doc,
+                config: &config,
+                engine: &engine,
+                sizer: &NullSizer,
+            };
+            state.relayout_preserving_anchor(&ctx, config);
+            assert_eq!(
+                state.mode(),
+                Mode::Explore {
+                    selected: 0,
+                    rooted: false
+                },
+                "the only row left is index 0 — selected must land there, not stay at 4"
+            );
+        }
     }
 }

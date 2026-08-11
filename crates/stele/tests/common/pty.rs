@@ -232,10 +232,37 @@ pub fn spawn_viewer_with(
     stdin: ChildStdin<'_>,
     graphics: Graphics,
 ) -> ViewerProcess {
+    spawn_viewer_in(pty, args, stdin, graphics, None)
+}
+
+/// [`spawn_viewer_with`] with an explicit working directory — for `stele`
+/// invoked with no document argument (Phase 3, DW-3.12): what the explorer
+/// opens on depends on the process's cwd, which every other test here leaves
+/// at the test runner's own, and which none of them needed to name until now.
+pub fn spawn_viewer_in_dir(
+    pty: &Pty,
+    args: &[&OsStr],
+    stdin: ChildStdin<'_>,
+    graphics: Graphics,
+    cwd: &std::path::Path,
+) -> ViewerProcess {
+    spawn_viewer_in(pty, args, stdin, graphics, Some(cwd))
+}
+
+fn spawn_viewer_in(
+    pty: &Pty,
+    args: &[&OsStr],
+    stdin: ChildStdin<'_>,
+    graphics: Graphics,
+    cwd: Option<&std::path::Path>,
+) -> ViewerProcess {
     let mut cmd = super::viewer_command();
     cmd.args(args)
         .env("TERM", "xterm-256color")
         .env_remove("TMUX");
+    if let Some(cwd) = cwd {
+        cmd.current_dir(cwd);
+    }
     match graphics {
         Graphics::Off => {
             cmd.env_remove("TERM_PROGRAM");
@@ -464,6 +491,24 @@ pub fn assert_restores_the_terminal(label: &str, exit: Exit) {
         .and_then(|mut f| f.write_all(b"# hi\n\nbody text\n"))
         .expect("write fixture");
 
+    assert_restores_the_terminal_in(label, exit, &[doc.as_os_str()], None);
+
+    let _ = std::fs::remove_file(&doc);
+}
+
+/// [`assert_restores_the_terminal`] with explicit `args` and an optional
+/// `cwd`, for a launch that opens the explorer instead of a named document
+/// (Phase 3, DW-3.12: bare `stele`, no document argument at all).
+///
+/// The rest of the contract is identical: raw mode and the alternate screen
+/// must be entered, `exit` must end the process the way it says, and the
+/// wire must carry exactly [`RESTORE`] and nothing else once it does.
+pub fn assert_restores_the_terminal_in(
+    label: &str,
+    exit: Exit,
+    args: &[&OsStr],
+    cwd: Option<&std::path::Path>,
+) {
     let pty = Pty::open();
     let canonical = pty.lflag();
     assert_ne!(
@@ -473,7 +518,7 @@ pub fn assert_restores_the_terminal(label: &str, exit: Exit) {
     );
 
     let mut cmd = super::viewer_command();
-    cmd.arg(&doc)
+    cmd.args(args)
         .env("TERM", "xterm-256color")
         // Graphics are only enabled on Ghostty; either way stele enters the
         // alternate screen and raw mode, which is what is under test.
@@ -482,6 +527,9 @@ pub fn assert_restores_the_terminal(label: &str, exit: Exit) {
         .stdin(Stdio::from(pty.slave_dup()))
         .stdout(Stdio::from(pty.slave_dup()))
         .stderr(Stdio::from(pty.slave_dup()));
+    if let Some(cwd) = cwd {
+        cmd.current_dir(cwd);
+    }
     // SAFETY: `pre_exec` runs between fork and exec, so it may only call
     // async-signal-safe functions. `setsid` and `ioctl(TIOCSCTTY)` both are;
     // together they make the pty the child's controlling terminal, which is
@@ -568,6 +616,4 @@ pub fn assert_restores_the_terminal(label: &str, exit: Exit) {
         "{label} must put the tty's line discipline back exactly as it found it \
          — raw mode is state on the terminal and outlives the process"
     );
-
-    let _ = std::fs::remove_file(&doc);
 }

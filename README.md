@@ -64,7 +64,16 @@ toolchain, so upgrade with `rustup update` first if it is older.
 ```
 stele <file.md>          open a file
 stele -                  read the document from stdin
+stele <dir>              browse a directory
+stele                    browse the current directory
 ```
+
+Inside the browser: `j`/`k` move, `Enter` opens a file or descends into a
+directory, `-` goes up, `Esc` or `q` leaves it (or quits, if there was no
+document open in the first place). Unopenable entries — sockets, devices,
+FIFOs, symlinks that resolve to nothing — are listed dim and cannot be
+selected; everything else, whatever its extension, opens exactly as it
+would from the command line.
 
 | Flag | Effect |
 |---|---|

@@ -239,13 +239,27 @@ pub struct LoadedDocument {
 
 /// Where the document's bytes come from.
 ///
-/// Two kinds, both known at compile time, so this is an enum rather than a
-/// trait: the exhaustive matches below turn a third source kind into a
+/// Three kinds, all known at compile time, so this is an enum rather than a
+/// trait: the exhaustive matches below turn a fourth source kind into a
 /// compile error instead of a silently unhandled case.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DocumentSource {
     Path(PathBuf),
     Stdin,
+    /// No document at all — the rooted explorer's placeholder (Phase 3),
+    /// used when `stele` opens directly into a directory with no file on
+    /// the command line to fall back to.
+    ///
+    /// **Never reaches the screen.** `Mode::Explore { rooted: true }`
+    /// captures every key until either a real document is opened (which
+    /// replaces this source outright via `Session::install_document`) or
+    /// the reader quits, so nothing ever renders the empty tree this loads
+    /// to. [`crate::link::Navigator::open_path`] additionally refuses to
+    /// push this variant onto the document stack, so `Backspace` from the
+    /// first file opened out of a rooted explorer reports
+    /// [`crate::link::LinkError::AtRoot`] rather than trying to re-read a
+    /// document that was never on disk.
+    Scratch,
 }
 
 impl DocumentSource {
@@ -266,17 +280,27 @@ impl DocumentSource {
     /// only repeat caller is the `--watch` reload, and `--watch -` is
     /// rejected at CLI parse (DW-2.3) precisely because a stream cannot be
     /// re-read.
+    ///
+    /// [`DocumentSource::Scratch`] always succeeds with an empty document —
+    /// there is nothing to read, and nothing paints it (see that variant's
+    /// doc). `crates/layout`'s own
+    /// `test_empty_document_yields_empty_tree` proves a zero-block document
+    /// lays out to `line_count() == 0` with no panic, which is what makes an
+    /// empty document — rather than a one-line placeholder — the right
+    /// answer here.
     pub fn load_with(&self, options: LoadOptions) -> Result<LoadedDocument, LoadError> {
-        // Both arms go through `read_bounded`: the ceiling is a property of
-        // "a document stele will read", not of one source. `read_to_end`
-        // already retries on `ErrorKind::Interrupted` (EINTR), so no retry
-        // loop is needed on either.
+        // All three arms go through `read_bounded`/`document_from_text`: the
+        // ceiling and the parse pipeline are properties of "a document stele
+        // will read", not of one source. `read_to_end` already retries on
+        // `ErrorKind::Interrupted` (EINTR), so no retry loop is needed on
+        // either real source.
         let bytes = match self {
             DocumentSource::Path(path) => read_bounded(
                 std::fs::File::open(path).map_err(LoadError::Io)?,
                 MAX_DOCUMENT_BYTES,
             )?,
             DocumentSource::Stdin => read_bounded(std::io::stdin().lock(), MAX_DOCUMENT_BYTES)?,
+            DocumentSource::Scratch => Vec::new(),
         };
         let text = String::from_utf8(bytes).map_err(|_| LoadError::InvalidUtf8)?;
         Ok(document_from_text(&text, self.display_name(), options))
@@ -300,8 +324,9 @@ impl DocumentSource {
     pub fn changed_since(&self, since: Instant) -> bool {
         let path = match self {
             DocumentSource::Path(path) => path,
-            // A consumed stream has no "later version" to poll for.
-            DocumentSource::Stdin => return false,
+            // A consumed stream has no "later version" to poll for, and
+            // neither does a placeholder that was never on disk.
+            DocumentSource::Stdin | DocumentSource::Scratch => return false,
         };
         let Ok(mtime) = std::fs::metadata(path).and_then(|meta| meta.modified()) else {
             return true;
@@ -315,22 +340,30 @@ impl DocumentSource {
     }
 
     /// The name shown in the status row and by `Ctrl-G`.
+    ///
+    /// [`DocumentSource::Scratch`] answers the empty string rather than a
+    /// placeholder label: nothing ever paints it (see that variant's doc),
+    /// so there is no reader-facing name to get right, and the empty string
+    /// is what [`crate::app::StatusLine::render`] already treats as "no
+    /// document" for the ordinary ruler.
     pub fn display_name(&self) -> String {
         match self {
             DocumentSource::Path(path) => path.display().to_string(),
             DocumentSource::Stdin => STDIN_DISPLAY_NAME.to_string(),
+            DocumentSource::Scratch => String::new(),
         }
     }
 
     /// The directory relative image paths resolve against: the document's own
-    /// directory, or the working directory for a stream that has none.
+    /// directory, or the working directory for a stream — or a placeholder —
+    /// that has none.
     pub fn base_dir(&self) -> PathBuf {
         match self {
             DocumentSource::Path(path) => path
                 .parent()
                 .filter(|parent| !parent.as_os_str().is_empty())
                 .map_or_else(|| PathBuf::from("."), Path::to_path_buf),
-            DocumentSource::Stdin => PathBuf::from("."),
+            DocumentSource::Stdin | DocumentSource::Scratch => PathBuf::from("."),
         }
     }
 }

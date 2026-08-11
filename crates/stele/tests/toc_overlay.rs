@@ -95,6 +95,15 @@ impl Harness {
                     .frame_overlay(&rows, size, &status, &mut buf)
                     .expect("paint")
             }
+            // This harness never opens the explorer, but the match must
+            // still name every `Mode` — see `Mode::Toc`'s arm above for why
+            // this file cares at all.
+            Mode::Explore { .. } => {
+                let rows = self.state.explore_rows(size.height);
+                self.painter
+                    .frame_overlay(&rows, size, &status, &mut buf)
+                    .expect("paint")
+            }
             // A document frame plus the link-selection indicator — the same
             // branch `main.rs::paint` takes, kept here so this harness stays
             // a faithful stand-in for the event loop.
