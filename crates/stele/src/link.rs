@@ -294,7 +294,12 @@ fn url_scheme(href: &str) -> Option<&str> {
 
 /// Whether `path`'s extension names markdown. Case-insensitive: `README.MD`
 /// is markdown.
-fn is_markdown_path(path: &Path) -> bool {
+///
+/// `pub(crate)` for the directory listing, which uses it to decide which rows
+/// are worth offering the reader. That is a *hint*, not a decision: the
+/// authoritative refusal is the barricade at open time, and the two are
+/// allowed to disagree — a `.md` file may still turn out to be a FIFO.
+pub(crate) fn is_markdown_path(path: &Path) -> bool {
     path.extension().is_some_and(|ext| {
         let ext = ext.to_string_lossy().to_ascii_lowercase();
         ext == "md" || ext == "markdown"
@@ -532,11 +537,16 @@ pub struct StackedDocument {
     /// The size ceiling this document was admitted under, carried so the way
     /// back is judged by the same rule as the way in.
     ///
-    /// Entry 0 is the document the reader named on the command line and is
-    /// worth [`crate::loader::MAX_DOCUMENT_BYTES`]; everything above it was
-    /// reached by following a link and is worth [`MAX_LINK_FILE_BYTES`].
+    /// A document the reader named on the command line, or reached by
+    /// [`Navigator::open_path`] from a directory listing, is worth
+    /// [`crate::loader::MAX_DOCUMENT_BYTES`]; one reached by following a link
+    /// someone else wrote is worth the tighter [`MAX_LINK_FILE_BYTES`].
     /// Without this, `Backspace` out of a link would refuse to reopen a
     /// 20 MiB document the reader had opened deliberately a moment earlier.
+    ///
+    /// Recorded from [`DocumentStack::push`]'s `limit` argument, never
+    /// re-derived from the stack's depth — see that method for the defect the
+    /// derivation caused.
     limit: u64,
 }
 
@@ -557,23 +567,31 @@ impl DocumentStack {
         }
     }
 
-    /// Records `source` at `scroll` as the document to return to.
+    /// Records `source` at `scroll`, admitted under `limit`, as the document
+    /// to return to.
     ///
-    /// The size ceiling is derived rather than passed: the first entry pushed
-    /// is by construction the document the session started on — the one named
-    /// on the command line — and every later one was reached by following a
-    /// link from it.
-    pub fn push(&mut self, source: DocumentSource, scroll: usize) -> Result<(), LinkError> {
+    /// **`limit` is passed rather than derived, and that is a fix.** This used
+    /// to read the ceiling off the stack's own depth — entry 0 at
+    /// [`crate::loader::MAX_DOCUMENT_BYTES`], everything above it at
+    /// [`MAX_LINK_FILE_BYTES`] — on the premise that only the session's first
+    /// document could have come from outside a link. [`Navigator::open_path`]
+    /// breaks that premise: it admits at the document ceiling at *any* depth,
+    /// so a 20 MiB file opened from the explorer one hop in was recorded as an
+    /// 8 MiB entry and `Backspace` refused the reader their own document —
+    /// exactly the failure [`StackedDocument::limit`]'s doc says the field
+    /// exists to prevent. Depth cannot answer a question about provenance;
+    /// the caller that admitted the document can.
+    pub fn push(
+        &mut self,
+        source: DocumentSource,
+        scroll: usize,
+        limit: u64,
+    ) -> Result<(), LinkError> {
         if self.entries.len() >= MAX_STACK_DEPTH {
             return Err(LinkError::StackTooDeep {
                 limit: MAX_STACK_DEPTH,
             });
         }
-        let limit = if self.entries.is_empty() {
-            crate::loader::MAX_DOCUMENT_BYTES
-        } else {
-            MAX_LINK_FILE_BYTES
-        };
         self.entries.push(StackedDocument {
             source,
             scroll,
@@ -665,6 +683,28 @@ pub struct Navigator {
     stack: DocumentStack,
     opener: Box<dyn UrlOpener>,
     options: LoadOptions,
+    /// The size ceiling the document **currently on screen** was admitted
+    /// under, and therefore the ceiling it is pushed at when the reader moves
+    /// off it.
+    ///
+    /// Provenance cannot be recovered from the stack's depth, which is what
+    /// [`DocumentStack::push`] used to try: `open_path` admits at
+    /// [`crate::loader::MAX_DOCUMENT_BYTES`] at *any* depth, so a 20 MiB
+    /// document opened from the explorer one hop in used to be pushed as an
+    /// 8 MiB entry and refused on the way back. Remembering the ceiling that
+    /// was actually used is the only thing that makes
+    /// [`StackedDocument::limit`]'s stated invariant true.
+    ///
+    /// Seeded at the command-line ceiling because that is what the session's
+    /// first document came in under, then maintained by the three methods that
+    /// change which document is on screen: `follow` (link ceiling),
+    /// `open_path` (document ceiling), and `back` (whatever the popped entry
+    /// recorded). **The invariant a caller could break is that the document on
+    /// screen is the one this `Navigator` last returned** — the same
+    /// assumption `follow`'s `current` argument already makes. A `--watch`
+    /// reload re-reads the same source at the same provenance and so cannot
+    /// disturb it.
+    current_limit: u64,
 }
 
 impl Navigator {
@@ -673,11 +713,84 @@ impl Navigator {
             stack: DocumentStack::new(),
             opener,
             options,
+            current_limit: crate::loader::MAX_DOCUMENT_BYTES,
         }
     }
 
     pub fn depth(&self) -> usize {
         self.stack.depth()
+    }
+
+    /// Opens the document at `path` — a path that came from a directory
+    /// listing or a command line, **not** from an href a document author
+    /// wrote.
+    ///
+    /// The difference is the whole reason this exists beside
+    /// [`Navigator::follow`], and it is a difference of *parsing*, never of
+    /// *policy*. `follow` must first decide what an untrusted string means:
+    /// [`LinkTarget::classify`] runs the RFC 3986 scheme grammar over it (so a
+    /// file really named `notes:2026.md` is read as a `notes:` URL and
+    /// refused), percent-decodes it (so `my%20notes.md` is looked up as
+    /// `my notes.md`), and truncates it at a `?` or `#` (so `draft?.md` is
+    /// looked up as `draft`). Every one of those is correct for an href and
+    /// wrong for a filename that already exists on disk — the explorer must
+    /// open what it lists, and a file refused for how it is *spelled* is a
+    /// bug rather than a defence.
+    ///
+    /// So the string handling is skipped and **the barricade is not**: the
+    /// same [`resolve_regular_file`] then [`read_text_target`] pair
+    /// [`reread_document`] composes, in the same order, so the file's type is
+    /// settled by `stat` before any `open(2)` — a FIFO with no writer blocks
+    /// in `open` itself, and no keystroke may be able to wedge a raw-mode
+    /// viewer. Nothing is extracted or copied; a private variant of that
+    /// sequence here is the divergence `reread_document`'s own doc comment
+    /// records as a real, reproduced defect.
+    ///
+    /// Two deliberate differences from `follow`:
+    ///
+    /// - **The ceiling is [`crate::loader::MAX_DOCUMENT_BYTES`], not
+    ///   [`MAX_LINK_FILE_BYTES`].** The ceiling is a property of provenance,
+    ///   and a path the reader navigated to themselves has the provenance of
+    ///   one they typed on the command line, not of one a document offered
+    ///   them. Admitting at 8 MiB here would make the explorer refuse files
+    ///   `stele <path>` opens.
+    /// - **A relative path resolves against the process's working
+    ///   directory**, not the open document's, for the same reason: it is not
+    ///   a destination written relative to anything.
+    ///
+    /// There is no containment check, and adding one would be a change of
+    /// policy: this module already documents an absolute path and a symlink
+    /// leaving the document's directory as legitimate targets, and `stele
+    /// <path>` accepts both.
+    ///
+    /// Returns [`Followed::Opened`] or an error — never [`Followed::Handed`],
+    /// which has no meaning for a path. The shared return type is the seam the
+    /// caller in a later phase installs documents through.
+    ///
+    /// **Nothing is pushed until the target has loaded**, so a refusal leaves
+    /// the stack and the document on screen exactly as they were.
+    pub fn open_path(
+        &mut self,
+        path: &Path,
+        current: &DocumentSource,
+        current_scroll: usize,
+    ) -> Result<Followed, LinkError> {
+        // Checked before the read, so a stack at its ceiling does not cost a
+        // 64 MiB read to say no.
+        if self.stack.depth() >= MAX_STACK_DEPTH {
+            return Err(LinkError::StackTooDeep {
+                limit: MAX_STACK_DEPTH,
+            });
+        }
+        let limit = crate::loader::MAX_DOCUMENT_BYTES;
+        let resolved = resolve_regular_file(path, Path::new("."), limit)?;
+        let text = read_text_target(&resolved, limit)?;
+        let source = DocumentSource::Path(resolved);
+        let loaded = crate::loader::document_from_text(&text, source.display_name(), self.options);
+        self.stack
+            .push(current.clone(), current_scroll, self.current_limit)?;
+        self.current_limit = limit;
+        Ok(Followed::Opened { source, loaded })
     }
 
     /// Follows `href`, written in the document `current` at `current_scroll`.
@@ -710,7 +823,11 @@ impl Navigator {
                 let source = DocumentSource::Path(path);
                 let loaded =
                     crate::loader::document_from_text(&text, source.display_name(), self.options);
-                self.stack.push(current.clone(), current_scroll)?;
+                self.stack
+                    .push(current.clone(), current_scroll, self.current_limit)?;
+                // What is now on screen arrived by link, so it is worth the
+                // link ceiling when it is itself pushed.
+                self.current_limit = MAX_LINK_FILE_BYTES;
                 Ok(Followed::Opened { source, loaded })
             }
         }
@@ -726,12 +843,19 @@ impl Navigator {
     pub fn back(&mut self) -> Result<(DocumentSource, LoadedDocument, usize), LinkError> {
         let entry = self.stack.pop().ok_or(LinkError::AtRoot)?;
         match reread_document(&entry.source, entry.limit, self.options) {
-            Ok(loaded) => Ok((entry.source, loaded, entry.scroll)),
+            Ok(loaded) => {
+                // The document now on screen is worth what it was worth on
+                // the way in, so a later push records the same ceiling and
+                // the round trip stays reversible however many times it runs.
+                self.current_limit = entry.limit;
+                Ok((entry.source, loaded, entry.scroll))
+            }
             Err(err) => {
-                // Restored field-by-field rather than through `push`, which
-                // would re-derive `limit` from the stack's *current* depth —
-                // and the entry has already been popped, so the root would
-                // come back as a link-provenance entry.
+                // Restored field-by-field rather than through `push`, so the
+                // entry keeps the ceiling it was admitted under rather than
+                // whatever the document currently on screen was admitted
+                // under — a reader who presses `Backspace` again must get the
+                // same answer, not a stricter one.
                 self.stack.entries.push(entry);
                 Err(err)
             }
@@ -1867,11 +1991,15 @@ mod tests {
         assert!(stack.is_empty());
         for i in 0..MAX_STACK_DEPTH {
             stack
-                .push(DocumentSource::Path(PathBuf::from(format!("{i}.md"))), i)
+                .push(
+                    DocumentSource::Path(PathBuf::from(format!("{i}.md"))),
+                    i,
+                    MAX_LINK_FILE_BYTES,
+                )
                 .expect("within the ceiling");
         }
         assert!(matches!(
-            stack.push(DocumentSource::Stdin, 0),
+            stack.push(DocumentSource::Stdin, 0, MAX_LINK_FILE_BYTES),
             Err(LinkError::StackTooDeep { .. })
         ));
         for i in (0..MAX_STACK_DEPTH).rev() {
@@ -1879,5 +2007,529 @@ mod tests {
             assert_eq!(entry.scroll, i);
         }
         assert!(stack.pop().is_none());
+    }
+
+    #[test]
+    fn test_the_stack_records_the_ceiling_it_was_given_rather_than_reading_it_off_the_depth() {
+        let mut stack = DocumentStack::new();
+        // Deliberately the "wrong" way round for the old depth derivation,
+        // which would have said 64 MiB then 8 MiB.
+        stack
+            .push(DocumentSource::Path(PathBuf::from("a.md")), 1, 4096)
+            .expect("push");
+        stack
+            .push(DocumentSource::Path(PathBuf::from("b.md")), 2, 999_999)
+            .expect("push");
+        assert_eq!(stack.pop().expect("b").limit, 999_999);
+        assert_eq!(stack.pop().expect("a").limit, 4096);
+    }
+
+    // ---------------------------------------------------------------- DW-1.1
+
+    /// What [`Navigator::follow`] does with the very same string — the half of
+    /// DW-1.1 that makes the other half mean something.
+    #[derive(Debug)]
+    enum FollowSays {
+        /// Refused outright, because [`LinkTarget::classify`] read the name as
+        /// something it is not.
+        Refuses,
+        /// Worse than a refusal: it silently opens a *different* file that
+        /// really exists, because the name was rewritten before the lookup.
+        OpensInstead(&'static str),
+    }
+
+    /// The divergence `open_path` exists for, asserted **as a divergence**.
+    ///
+    /// Each name here is a real file on disk and each is one `classify`
+    /// cannot read: a colon parses as an RFC 3986 scheme, `%20`
+    /// percent-decodes to a space, and `?`/`#` truncate the name at the
+    /// suffix they would introduce on an href. `open_path` must open the
+    /// literal file in every case — the explorer has to open what it lists,
+    /// and a file refused for how it is *spelled* is a bug, not a defence.
+    ///
+    /// Asserting only that `open_path` succeeds would leave the test green if
+    /// someone "simplified" it back through `classify` on a machine where the
+    /// decoyed name happened not to exist. Pinning what `follow` does with the
+    /// identical string is what makes that unsurvivable.
+    #[test]
+    fn test_dw_1_1_a_name_follow_would_misread_opens_verbatim_through_open_path() {
+        let dir = scratch_dir("verbatim-names");
+        let source = DocumentSource::Path(write(&dir, "index.md", "# Index\n"));
+        // The decoy `follow` reaches when it percent-decodes `my%20notes.md`.
+        // Distinct content, so opening the wrong one is visible rather than
+        // merely suspected.
+        let decoy = "# Decoyed — this is not the file that was asked for\n";
+        write(&dir, "my notes.md", decoy);
+
+        for (name, body, follow_says) in [
+            ("notes:2026.md", "# Colon\n", FollowSays::Refuses),
+            (
+                "my%20notes.md",
+                "# Percent\n",
+                FollowSays::OpensInstead("my notes.md"),
+            ),
+            ("draft?.md", "# Question\n", FollowSays::Refuses),
+            ("draft#1.md", "# Hash\n", FollowSays::Refuses),
+        ] {
+            let path = write(&dir, name, body);
+
+            let mut by_path = navigator();
+            let opened = by_path
+                .open_path(&path, &source, 0)
+                .unwrap_or_else(|err| panic!("open_path must open {name} verbatim, got {err:?}"));
+            match opened {
+                Followed::Opened {
+                    source: opened_source,
+                    loaded,
+                } => {
+                    assert!(
+                        opened_source.display_name().ends_with(name),
+                        "{name} opened as {}",
+                        opened_source.display_name()
+                    );
+                    assert_eq!(
+                        loaded.info.byte_size,
+                        body.len() as u64,
+                        "{name} opened with the wrong file's bytes"
+                    );
+                }
+                Followed::Handed => panic!("{name}: open_path must never hand a path to an opener"),
+            }
+            assert_eq!(by_path.depth(), 1, "{name} must have pushed the caller");
+
+            let mut by_href = navigator();
+            let answer = by_href.follow(name, &source, 0);
+            match follow_says {
+                FollowSays::Refuses => assert!(
+                    answer.is_err(),
+                    "{name}: follow is expected to misread this name and refuse — if it now \
+                     succeeds, either classify changed or open_path has been routed back \
+                     through it; got {answer:?}"
+                ),
+                FollowSays::OpensInstead(other) => match answer {
+                    Ok(Followed::Opened {
+                        source: wrong,
+                        loaded,
+                    }) => {
+                        assert!(
+                            wrong.display_name().ends_with(other),
+                            "{name}: follow was expected to rewrite the name to {other}, got {}",
+                            wrong.display_name()
+                        );
+                        assert_eq!(
+                            loaded.info.byte_size,
+                            decoy.len() as u64,
+                            "{name}: follow was expected to read the decoy's bytes"
+                        );
+                    }
+                    Ok(Followed::Handed) | Err(_) => {
+                        panic!("{name}: follow was expected to open {other} instead")
+                    }
+                },
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The dirty case: a filename that is *nothing but* the character
+    /// `classify` treats as structure.
+    #[test]
+    fn test_dw_1_1_a_file_named_only_a_colon_opens_through_open_path() {
+        let dir = scratch_dir("colon-only");
+        let source = DocumentSource::Path(write(&dir, "index.md", "# Index\n"));
+        let path = write(&dir, ":", "# Just a colon\n");
+
+        let mut nav = navigator();
+        let opened = nav
+            .open_path(&path, &source, 0)
+            .expect("a file named `:` is a file");
+        assert!(matches!(opened, Followed::Opened { .. }));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A filename whose bytes are not UTF-8 opens, and this is deliberate.
+    ///
+    /// `stele <path>` opens such a file — `Path` is bytes on unix and nothing
+    /// on the load path decodes the *name* — and the explorer must not be
+    /// more restrictive than the command line. The barricade governs what the
+    /// file **is** (DW-1.4 covers non-UTF-8 *content*), never how it is
+    /// spelled. The display name is lossy, exactly as it is for the command
+    /// line.
+    ///
+    /// **Skipped where the filesystem itself refuses the fixture.** APFS
+    /// enforces UTF-8 filenames and returns `EILSEQ` from `creat`, so on macOS
+    /// there is no such file to open and nothing here to assert; ext4 stores
+    /// names as bytes and the test runs for real on Linux, which is where CI
+    /// runs. Skipping is stated rather than silent, because a test that
+    /// quietly passes by never reaching its subject is worse than no test —
+    /// the same reasoning as the root-skip in
+    /// [`test_dw_6_4_an_unreadable_file_is_refused`].
+    #[test]
+    #[cfg(unix)]
+    fn test_a_filename_that_is_not_utf8_opens_because_the_command_line_opens_it() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let dir = scratch_dir("nonutf8-name");
+        let source = DocumentSource::Path(write(&dir, "index.md", "# Index\n"));
+        let name = OsString::from_vec(vec![b'b', b'a', b'd', 0xff, b'.', b'm', b'd']);
+        let path = dir.join(&name);
+        let body = "# Fine content, unspellable name\n";
+        if std::fs::write(&path, body).is_err() {
+            eprintln!(
+                "skipping: this filesystem refuses a non-UTF-8 filename (EILSEQ), so the fixture \
+                 cannot exist here"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+
+        let mut nav = navigator();
+        let opened = nav
+            .open_path(&path, &source, 0)
+            .expect("a name that is not UTF-8 is still a name");
+        match opened {
+            Followed::Opened { source, loaded } => {
+                assert_eq!(loaded.info.byte_size, body.len() as u64);
+                // Lossy, and that is the command line's behaviour too.
+                assert!(source.display_name().contains("bad"));
+            }
+            Followed::Handed => panic!("a path must never be handed to an opener"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `follow` would hand this **filename** to the OS opener, because
+    /// `https:` is a scheme by the grammar. `open_path` must open the file and
+    /// leave the opener untouched — the seam, not just the return value.
+    #[test]
+    fn test_open_path_never_reaches_the_url_opener_even_for_a_name_shaped_like_a_url() {
+        let dir = scratch_dir("url-shaped-name");
+        let source = DocumentSource::Path(write(&dir, "index.md", "# Index\n"));
+        let path = write(&dir, "https:evil.md", "# A file, not a site\n");
+
+        let (mut by_path, path_log) = navigator_watching_the_opener();
+        assert!(matches!(
+            by_path.open_path(&path, &source, 0),
+            Ok(Followed::Opened { .. })
+        ));
+        assert!(
+            path_log.borrow().is_empty(),
+            "open_path handed something to the opener: {:?}",
+            path_log.borrow()
+        );
+
+        let (mut by_href, href_log) = navigator_watching_the_opener();
+        assert!(
+            matches!(
+                by_href.follow("https:evil.md", &source, 0),
+                Ok(Followed::Handed)
+            ),
+            "the divergence being tested is that follow reads this name as a URL"
+        );
+        assert_eq!(href_log.borrow().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A relative path resolves against the working directory, not the open
+    /// document's — because it did not come from that document.
+    ///
+    /// Asserted without changing directory (which no test may do safely while
+    /// others run): the fixture is reachable relative to the document and not
+    /// relative to the process's cwd, so the two bases give opposite answers.
+    #[test]
+    fn test_open_path_resolves_a_relative_path_against_the_working_directory() {
+        let dir = scratch_dir("relative-base");
+        let source = DocumentSource::Path(write(&dir, "index.md", "# Index\n"));
+        write(&dir, "sibling.md", "# Sibling\n");
+
+        let mut nav = navigator();
+        let err = nav
+            .open_path(Path::new("sibling.md"), &source, 0)
+            .expect_err("`sibling.md` is not relative to the working directory");
+        assert!(matches!(err, LinkError::Missing(_)), "{err:?}");
+        assert_eq!(nav.depth(), 0);
+
+        // The same string through `follow`, which *does* resolve against the
+        // document, finds it — so the fixture proves the base and not merely
+        // that the file is absent.
+        let mut by_href = navigator();
+        assert!(matches!(
+            by_href.follow("sibling.md", &source, 0),
+            Ok(Followed::Opened { .. })
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------------------------------------------------------------- DW-1.3
+
+    /// The ceiling is a property of provenance: a path the reader navigated
+    /// to is admitted exactly as one they typed on the command line.
+    ///
+    /// Both halves are asserted against the constants, never a byte count —
+    /// raising either ceiling must not quietly make this test vacuous.
+    #[test]
+    fn test_dw_1_3_open_path_admits_under_the_command_line_ceiling_not_the_link_one() {
+        let dir = scratch_dir("ceiling");
+        let source = DocumentSource::Path(write(&dir, "index.md", "# Index\n"));
+
+        // Real text rather than a sparse hole, so the NUL sniff has to pass
+        // and it is the size gate that is under test.
+        let body = "lorem ipsum dolor sit amet\n".repeat(400_000);
+        let size = body.len() as u64;
+        assert!(
+            size > MAX_LINK_FILE_BYTES && size <= crate::loader::MAX_DOCUMENT_BYTES,
+            "the fixture must sit strictly between the two ceilings to say anything"
+        );
+        let big = dir.join("big.md");
+        std::fs::write(&big, &body).expect("write a large fixture");
+
+        let mut by_path = navigator();
+        match by_path.open_path(&big, &source, 0).expect(
+            "a path-opened document is admitted at the command-line ceiling, which this fixture \
+             is under",
+        ) {
+            Followed::Opened { loaded, .. } => assert_eq!(loaded.info.byte_size, size),
+            Followed::Handed => panic!("a path must never be handed to an opener"),
+        }
+
+        // The same file through `follow` keeps the tighter link ceiling —
+        // this phase reconciles `open_path` with the command line, it does
+        // not loosen link following.
+        let mut by_href = navigator();
+        let err = by_href
+            .follow("big.md", &source, 0)
+            .expect_err("a link keeps the 8 MiB ceiling");
+        assert!(
+            matches!(err, LinkError::TooLarge { limit } if limit == MAX_LINK_FILE_BYTES),
+            "{err:?}"
+        );
+
+        // And one byte past the document ceiling is refused, naming that
+        // ceiling. Sparse, because the refusal happens on the stat size
+        // before a byte is read.
+        let huge = dir.join("huge.md");
+        let file = std::fs::File::create(&huge).expect("create sparse file");
+        file.set_len(crate::loader::MAX_DOCUMENT_BYTES + 1)
+            .expect("set_len");
+        drop(file);
+        let mut nav = navigator();
+        let err = nav
+            .open_path(&huge, &source, 0)
+            .expect_err("past the document ceiling must be refused");
+        assert!(
+            matches!(err, LinkError::TooLarge { limit } if limit == crate::loader::MAX_DOCUMENT_BYTES),
+            "the refusal must name the command-line ceiling, got {err:?}"
+        );
+        assert_eq!(nav.depth(), 0, "a refusal must not touch the stack");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------------------------------------------------------------- DW-1.4
+
+    /// Binary content is refused by the sniff inside [`read_text_target`] —
+    /// the same function `follow` reads through, not a copy.
+    ///
+    /// Three claims, and the third is the one that fails if `open_path` ever
+    /// grows its own check: `open_path`, `follow`, and a direct call to the
+    /// shared function must produce the **same rendered message** for the same
+    /// file. A private copy would have to reproduce the wording and the path
+    /// it names, and a private copy that drifted would show up here rather
+    /// than in a review.
+    #[test]
+    fn test_dw_1_4_binary_content_is_refused_through_the_same_sniff_follow_uses() {
+        let dir = scratch_dir("binary-sniff");
+        let source = DocumentSource::Path(write(&dir, "index.md", "# Index\n"));
+
+        let mut trailing = b"# a document that ends badly\n".to_vec();
+        trailing.push(0);
+        for (name, bytes) in [
+            ("nul-early.md", b"# hi\x00 there\n".to_vec()),
+            ("nul-last.md", trailing),
+            ("bad-utf8.md", vec![0x68, 0x69, 0xff, 0xfe]),
+        ] {
+            let path = dir.join(name);
+            std::fs::write(&path, &bytes).expect("write fixture");
+
+            let mut by_path = navigator();
+            let by_path_err = by_path
+                .open_path(&path, &source, 0)
+                .expect_err("binary content must be refused");
+            assert!(matches!(by_path_err, LinkError::Binary(_)), "{name}");
+            assert_eq!(by_path.depth(), 0, "{name} disturbed the stack");
+
+            let mut by_href = navigator();
+            let by_href_err = by_href
+                .follow(name, &source, 0)
+                .expect_err("binary content must be refused on the link path too");
+            assert!(matches!(by_href_err, LinkError::Binary(_)), "{name}");
+
+            let shared = read_text_target(
+                &std::fs::canonicalize(&path).expect("canonicalize"),
+                crate::loader::MAX_DOCUMENT_BYTES,
+            )
+            .expect_err("the shared function is where the sniff lives");
+            assert_eq!(
+                by_path_err.to_string(),
+                shared.to_string(),
+                "{name}: open_path's refusal must be the shared function's own refusal"
+            );
+            assert_eq!(
+                by_path_err.to_string(),
+                by_href_err.to_string(),
+                "{name}: both entry points must give the reader the same reason"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The two entry points agree on the sniff's **negative** too: a NUL past
+    /// the bounded window is not caught, by design, and `open_path` must not
+    /// be quietly stricter or laxer than `follow` about where that window
+    /// ends.
+    #[test]
+    fn test_dw_1_4_a_nul_past_the_sniff_window_is_treated_the_same_by_both_entry_points() {
+        let dir = scratch_dir("late-nul");
+        let source = DocumentSource::Path(write(&dir, "index.md", "# Index\n"));
+        let mut bytes = vec![b'a'; BINARY_SNIFF_BYTES];
+        bytes.push(0);
+        let path = dir.join("late.md");
+        std::fs::write(&path, &bytes).expect("write fixture");
+
+        let mut by_path = navigator();
+        assert!(
+            matches!(
+                by_path.open_path(&path, &source, 0),
+                Ok(Followed::Opened { .. })
+            ),
+            "a NUL past the window is not what the heuristic claims to catch"
+        );
+        let mut by_href = navigator();
+        assert!(matches!(
+            by_href.follow("late.md", &source, 0),
+            Ok(Followed::Opened { .. })
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------------------------------------------------------------- DW-1.6
+
+    /// A listing is a snapshot; the file it named may be gone by the time the
+    /// reader presses a key. The refusal must be named, and it must leave the
+    /// reader exactly where they were.
+    #[test]
+    fn test_dw_1_6_a_path_deleted_after_it_was_listed_is_refused_and_the_stack_is_untouched() {
+        let dir = scratch_dir("deleted-since-listed");
+        let root = write(&dir, "root.md", "# Root\n");
+        write(&dir, "other.md", "# Other\n");
+        let gone = write(&dir, "gone.md", "# Gone\n");
+
+        let mut nav = navigator();
+        // One good hop first, so there is a stack that a bug could damage.
+        nav.follow("other.md", &DocumentSource::Path(root.clone()), 4)
+            .expect("hop");
+        assert_eq!(nav.depth(), 1);
+
+        std::fs::remove_file(&gone).expect("delete the listed file");
+        let other = DocumentSource::Path(dir.join("other.md"));
+        let err = nav
+            .open_path(&gone, &other, 9)
+            .expect_err("a deleted path must be refused");
+        assert!(matches!(err, LinkError::Missing(_)), "{err:?}");
+        assert!(err.to_string().starts_with("no such file:"));
+        assert_eq!(nav.depth(), 1, "the refusal must not touch the stack");
+
+        // And the document the reader was on is still the one `back` returns
+        // to, at the offset they left it at.
+        let (source, _, scroll) = nav.back().expect("the good hop is still poppable");
+        assert_eq!(source, DocumentSource::Path(root));
+        assert_eq!(scroll, 4);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other TOCTOU window: the path was a regular file when it was
+    /// `stat`ed and is gone by the read.
+    ///
+    /// Exercised on [`read_text_target`] directly because that is the only
+    /// place the window is observable — `open_path` closes over both halves,
+    /// so nothing can be interposed between them from outside.
+    #[test]
+    fn test_dw_1_6_a_path_deleted_between_the_stat_and_the_read_is_refused() {
+        let dir = scratch_dir("deleted-mid-open");
+        let path = write(&dir, "doomed.md", "# Doomed\n");
+        let resolved = std::fs::canonicalize(&path).expect("it exists at stat time");
+        std::fs::remove_file(&resolved).expect("and not at read time");
+
+        let err = read_text_target(&resolved, crate::loader::MAX_DOCUMENT_BYTES)
+            .expect_err("a vanished file must be refused, not read");
+        assert!(matches!(err, LinkError::Io(_)), "{err:?}");
+        assert!(err.to_string().starts_with("could not read linked file:"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ------------------------------------------- the admitted-limit invariant
+
+    /// The unit-level claim behind DW-1.5: each pushed entry carries the
+    /// ceiling *that document* came in under, whatever the stack's depth is.
+    ///
+    /// Both orders are checked, because depth cannot distinguish them and
+    /// that is exactly why the derivation was wrong.
+    #[test]
+    fn test_each_stack_entry_carries_the_ceiling_its_own_document_was_admitted_under() {
+        let dir = scratch_dir("admitted-limits");
+        let root = write(&dir, "root.md", "# Root\n");
+        let linked = write(&dir, "linked.md", "# Linked\n");
+        let listed = write(&dir, "listed.md", "# Listed\n");
+        let last = write(&dir, "last.md", "# Last\n");
+
+        let mut nav = navigator();
+        // root (command line) -> linked (a link) -> listed (a listing) -> last
+        nav.follow("linked.md", &DocumentSource::Path(root), 0)
+            .expect("root -> linked");
+        nav.open_path(&listed, &DocumentSource::Path(linked), 0)
+            .expect("linked -> listed");
+        nav.open_path(&last, &DocumentSource::Path(listed), 0)
+            .expect("listed -> last");
+
+        let limits: Vec<u64> = nav.stack.entries.iter().map(|entry| entry.limit).collect();
+        assert_eq!(
+            limits,
+            vec![
+                crate::loader::MAX_DOCUMENT_BYTES,
+                MAX_LINK_FILE_BYTES,
+                crate::loader::MAX_DOCUMENT_BYTES,
+            ],
+            "the middle entry arrived by link and the outer two did not; depth cannot tell them \
+             apart, which is why it is not asked"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Going back must not lose provenance either: after a round trip the
+    /// document on screen is re-pushed at the ceiling it was originally
+    /// admitted under, not at whatever the last hop happened to use.
+    #[test]
+    fn test_a_document_returned_to_keeps_the_ceiling_it_was_first_admitted_under() {
+        let dir = scratch_dir("back-keeps-limit");
+        let root = write(&dir, "root.md", "# Root\n");
+        let linked = write(&dir, "linked.md", "# Linked\n");
+        let listed = write(&dir, "listed.md", "# Listed\n");
+
+        let mut nav = navigator();
+        nav.follow("linked.md", &DocumentSource::Path(root), 0)
+            .expect("root -> linked");
+        nav.open_path(&listed, &DocumentSource::Path(linked.clone()), 0)
+            .expect("linked -> listed");
+        nav.back().expect("back to linked");
+        // On screen is `linked`, which arrived by link. Pushing it again must
+        // record the link ceiling, not the document ceiling `open_path` last
+        // used.
+        nav.open_path(&listed, &DocumentSource::Path(linked), 0)
+            .expect("linked -> listed again");
+        assert_eq!(
+            nav.stack.entries.last().expect("an entry").limit,
+            MAX_LINK_FILE_BYTES
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
