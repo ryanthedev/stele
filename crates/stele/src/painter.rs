@@ -18,8 +18,9 @@ use highlight::{HYPERLINK_CLOSE, HighlightCache, hyperlink_open};
 use layout::{LayoutTree, Line, LineItem, Reserved, ReservedLine, Run, Semantic, StyleId};
 use width::WidthEngine;
 
-use crate::app::{LinkSpan, Match, StatusLine, TocRow, line_text_len};
+use crate::app::{LinkSpan, Match, StatusLine, line_text_len};
 use crate::decor::{Decor, StructuralDecor};
+use crate::explore::{OverlayRow, RowStyle};
 use crate::media::{MediaSink, NoopMediaSink};
 
 /// A viewport extent in terminal cells.
@@ -569,8 +570,9 @@ impl Painter {
         painted.and(closed)
     }
 
-    /// Paints the TOC overlay (DW-3.2): `rows` over the whole content
-    /// viewport, then the same reserved status row every other frame gets.
+    /// Paints a full-screen overlay (DW-3.2; also the explorer's listing,
+    /// Phase 3): `rows` over the whole content viewport, then the same
+    /// reserved status row every other frame gets.
     ///
     /// **It is a frame, not a decoration**, and that is what DW-3.3 turns on.
     /// It opens the media sink's frame boundary exactly as
@@ -588,7 +590,7 @@ impl Painter {
     /// reason.
     pub fn frame_overlay(
         &mut self,
-        rows: &[TocRow],
+        rows: &[OverlayRow],
         size: Size,
         status: &StatusLine,
         out: &mut dyn Write,
@@ -604,22 +606,33 @@ impl Painter {
     /// The body of [`frame_overlay`](Self::frame_overlay), split out for the
     /// same reason [`frame_body`](Self::frame_body) is: every `?` in here is
     /// caught before the synchronized-update block is closed.
-    fn overlay_body(&mut self, rows: &[TocRow], size: Size, out: &mut dyn Write) -> io::Result<()> {
+    fn overlay_body(
+        &mut self,
+        rows: &[OverlayRow],
+        size: Size,
+        out: &mut dyn Write,
+    ) -> io::Result<()> {
         self.media.begin_frame(out);
         for row in 0..size.height {
             write!(out, "\x1b[{};1H", row + 1)?;
             if let Some(entry) = rows.get(usize::from(row)) {
                 let sanitized = sanitize(&entry.text);
                 let (clipped, _) = clip_to_width(&sanitized, &self.width_engine, size.width);
-                // Reverse video for the selection: the overlay has no theme
-                // roles of its own, and reverse is the one attribute that is
-                // legible against whatever background the terminal is using
-                // in either theme variant.
-                if entry.selected {
-                    out.write_all(b"\x1b[7m")?;
-                }
+                // The overlay has no theme roles of its own (`Style`'s
+                // fg/bg/bold/etc. are not in play here), so selection and
+                // dimming are each one raw SGR attribute — reverse video is
+                // legible against either theme's background, and dim (`2`,
+                // the same code `write_sgr` uses) is the one attribute that
+                // reads as "present but unselectable" without needing a
+                // color at all.
+                let attr: &[u8] = match entry.style {
+                    RowStyle::Selected => b"\x1b[7m",
+                    RowStyle::Dimmed => b"\x1b[2m",
+                    RowStyle::Ordinary => b"",
+                };
+                out.write_all(attr)?;
                 out.write_all(clipped.as_bytes())?;
-                if entry.selected {
+                if !attr.is_empty() {
                     out.write_all(SGR_RESET)?;
                 }
             }

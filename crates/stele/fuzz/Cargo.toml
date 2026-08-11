@@ -1,0 +1,23 @@
+[package]
+name = "stele-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+stele = { path = ".." }
+
+[[bin]]
+name = "explore_listing"
+path = "fuzz_targets/explore_listing.rs"
+test = false
+doc = false
+bench = false
+
+# Standalone: never part of the stele workspace (nightly-only sanitizer
+# builds must not leak into the stable fmt/clippy/test/linkage jobs).
+[workspace]

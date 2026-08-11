@@ -13,7 +13,7 @@ members = [
 ]
 # cargo-fuzz targets build with nightly sanitizer flags; keep them out of the
 # stable workspace so fmt/clippy/test/linkage jobs never touch them.
-exclude = ["crates/ast/fuzz"]
+exclude = ["crates/ast/fuzz", "crates/stele/fuzz"]
 
 [workspace.package]
 edition = "2024"

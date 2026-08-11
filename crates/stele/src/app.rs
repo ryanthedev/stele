@@ -15,6 +15,7 @@ use layout::{
 };
 use width::WidthEngine;
 
+use crate::explore::{OverlayRow, RowStyle};
 use crate::painter::{self, Page, SearchOverlay, Size, item_columns};
 
 /// Mixed into [`AppState::fingerprint`] between lines so two blocks whose runs
@@ -347,19 +348,6 @@ pub enum PendingAction {
     /// `m`: turn mouse capture on or off (DW-6.6).
     SetMouseCapture(bool),
 }
-/// One row of the rendered TOC overlay: the text to paint and whether it is
-/// the selected entry.
-///
-/// [`AppState::toc_rows`] composes these, so which entries are on screen,
-/// how a level is shown, and what happens when the list is taller than the
-/// terminal are all decided in pure code a test can call — the painter only
-/// prints what it is handed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TocRow {
-    pub text: String,
-    pub selected: bool,
-}
-
 /// What the status row says when a heading motion or the TOC has nothing to
 /// work with. One constant, because a document with no headings must answer
 /// the same way whichever key asked (DW-3.1, and the overlay's edge case).
@@ -1219,7 +1207,7 @@ impl AppState {
     /// Empty outside [`Mode::Toc`], and empty for a zero-row viewport — a
     /// terminal too short to render the overlay paints nothing rather than
     /// panicking on the window arithmetic.
-    pub fn toc_rows(&self, height: u16) -> Vec<TocRow> {
+    pub fn toc_rows(&self, height: u16) -> Vec<OverlayRow> {
         let Mode::Toc { selected } = self.mode else {
             return Vec::new();
         };
@@ -1234,7 +1222,7 @@ impl AppState {
         entries[first..first + height]
             .iter()
             .enumerate()
-            .map(|(offset, entry)| TocRow {
+            .map(|(offset, entry)| OverlayRow {
                 // Level shown twice over, and both are load-bearing: the
                 // indent makes the shape of the document scannable, the
                 // `#`s name the level exactly (an indent alone cannot
@@ -1246,7 +1234,11 @@ impl AppState {
                     entry.text,
                     width = 2 * usize::from(entry.level.saturating_sub(1)),
                 ),
-                selected: first + offset == selected,
+                style: if first + offset == selected {
+                    RowStyle::Selected
+                } else {
+                    RowStyle::Ordinary
+                },
             })
             .collect()
     }
@@ -4297,9 +4289,14 @@ mod tests {
                 row.text
             );
         }
-        assert!(rows[0].selected, "the reader is under the first heading");
+        assert!(
+            rows[0].style == RowStyle::Selected,
+            "the reader is under the first heading"
+        );
         assert_eq!(
-            rows.iter().filter(|row| row.selected).count(),
+            rows.iter()
+                .filter(|row| row.style == RowStyle::Selected)
+                .count(),
             1,
             "exactly one row is selected"
         );
@@ -4369,7 +4366,10 @@ mod tests {
                 5,
                 "step {step}: the window must fill the screen"
             );
-            let selected: Vec<&TocRow> = rows.iter().filter(|row| row.selected).collect();
+            let selected: Vec<&OverlayRow> = rows
+                .iter()
+                .filter(|row| row.style == RowStyle::Selected)
+                .collect();
             assert_eq!(
                 selected.len(),
                 1,
@@ -4387,14 +4387,17 @@ mod tests {
         state.handle_key_event(plain(KeyCode::Char('G')));
         let rows = state.toc_rows(5);
         assert!(
-            rows.last().unwrap().selected,
+            rows.last().unwrap().style == RowStyle::Selected,
             "`G` selects the last heading"
         );
         assert!(rows.last().unwrap().text.contains("Heading 29"));
 
         state.handle_key_event(plain(KeyCode::Char('g')));
         let rows = state.toc_rows(5);
-        assert!(rows[0].selected, "`g` selects the first heading");
+        assert!(
+            rows[0].style == RowStyle::Selected,
+            "`g` selects the first heading"
+        );
         assert!(rows[0].text.contains("Heading 0"));
     }
 
@@ -4479,7 +4482,7 @@ mod tests {
         let rows = state.toc_rows(8);
         assert_eq!(rows.len(), 3, "the overlay must list the new document");
         assert!(
-            rows[2].selected && rows[2].text.contains("Heading 2"),
+            rows[2].style == RowStyle::Selected && rows[2].text.contains("Heading 2"),
             "a visible row must be highlighted: {rows:?}"
         );
 
