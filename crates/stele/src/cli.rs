@@ -10,7 +10,7 @@ use clap::Parser;
 use crate::loader::{DocumentSource, LoadOptions};
 
 /// Commit + build time this binary was produced from, stamped by `build.rs`.
-/// Shown by `--version` and painted in the viewport corner, so "the fix does
+/// Carried by `--version` and painted in the viewport corner, so "the fix does
 /// not work" can always be told apart from "that is not the fix you built."
 pub const BUILD: &str = env!("STELE_BUILD");
 
@@ -18,12 +18,18 @@ pub const BUILD: &str = env!("STELE_BUILD");
 /// columns are scarce.
 pub const BUILD_SHA: &str = env!("STELE_BUILD_SHA");
 
+/// What `--version` prints: the release, then the build it came from —
+/// `0.2.0 (abc1234 2026-08-07T…)`. A bug report needs both, and only one of
+/// them was reachable before. `-V` stays the bare release number, which is
+/// what a script grepping for a version wants.
+pub const LONG_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("STELE_BUILD"), ")");
+
 /// `stele <file.md>` — a terminal markdown viewer.
 #[derive(Debug, Parser)]
 #[command(
     name = "stele",
     version,
-    long_version = BUILD,
+    long_version = LONG_VERSION,
     about = "A terminal markdown viewer for Ghostty"
 )]
 pub struct Cli {
@@ -366,5 +372,34 @@ mod tests {
         // It still has to say what the flags do.
         assert!(help.contains("alt text"), "{help}");
         assert!(help.contains("--no-rewrite"), "{help}");
+    }
+
+    /// A bug report quotes one line. `--version` has to answer both questions
+    /// that line is asked — which release, and which build of it — because
+    /// the release number alone cannot tell a rebuilt working tree from the
+    /// tag, and the sha alone means nothing to someone holding a tarball.
+    #[test]
+    fn test_the_long_version_carries_both_the_release_and_the_build() {
+        let long = <Cli as clap::CommandFactory>::command()
+            .render_long_version()
+            .to_string();
+        assert!(
+            long.contains(env!("CARGO_PKG_VERSION")),
+            "--version dropped the release number:\n{long}"
+        );
+        assert!(
+            long.contains(BUILD_SHA),
+            "--version dropped the build stamp:\n{long}"
+        );
+
+        // `-V` stays the bare release: scripts parse it, and a build stamp
+        // that moves on every rebuild would break them.
+        let short = <Cli as clap::CommandFactory>::command()
+            .render_version()
+            .to_string();
+        assert!(
+            !short.contains(BUILD_SHA),
+            "-V grew the build stamp:\n{short}"
+        );
     }
 }
