@@ -16,7 +16,7 @@ use layout::{
 };
 use width::WidthEngine;
 
-use crate::explore::{EntryKind, Listing, OverlayRow, RowStyle};
+use crate::explore::{EditBuffer, EditPlan, EntryKind, Listing, OverlayRow, RowStyle};
 use crate::painter::{self, Page, SearchOverlay, Size, item_columns};
 
 /// Mixed into [`AppState::fingerprint`] between lines so two blocks whose runs
@@ -398,11 +398,36 @@ pub enum PendingAction {
     /// [`crate::link::Navigator::open_path`], the same non-lossy path as
     /// [`PendingAction::ListDirectory`].
     OpenPath(PathBuf),
+    /// `y` at the confirmation gate (Phase 4): carry out this plan.
+    ///
+    /// **The only way a write can happen**, and it exists for the reason
+    /// every other variant here does — `AppState` performs no I/O — but with
+    /// a second job on top. Because the plan is a *value* that only reaches
+    /// `main.rs` through this queue, and because
+    /// [`AppState::handle_confirm_key`] is the only thing that queues it,
+    /// "no filesystem operation occurs until the confirmation is accepted"
+    /// (DW-4.3) is a structural property: a rejected confirmation drops the
+    /// plan without ever constructing this action.
+    ApplyEdits(EditPlan),
 }
 /// What the status row says when a heading motion or the TOC has nothing to
 /// work with. One constant, because a document with no headings must answer
 /// the same way whichever key asked (DW-3.1, and the overlay's edge case).
 const NO_HEADINGS: &str = "no headings in this document";
+
+/// What a rejected confirmation says (Phase 4, DW-4.3). States the outcome —
+/// *nothing* changed — rather than merely that the question went away, because
+/// "cancelled" alone leaves a reader wondering how much of it ran.
+const WRITE_CANCELLED: &str = "write cancelled: nothing on disk was changed";
+
+/// `w` over a buffer that asks for nothing.
+const NOTHING_TO_WRITE: &str = "no changes to write";
+
+/// `Enter` or `-` with unsaved edits: leaving would throw them away.
+const UNSAVED_EDITS: &str = "unsaved edits: w writes them, Esc discards them";
+
+/// `Esc` over a dirty buffer.
+const EDITS_DISCARDED: &str = "edits discarded: nothing on disk was changed";
 
 /// `z`'s answer when the document *has* headings but the cursor is above all
 /// of them (`Outline::index_at_or_before` returns `None` for that reason
@@ -552,6 +577,36 @@ pub struct AppState {
     /// in and left untouched across every re-list a re-listed `Enter`/`-`
     /// produces.
     explore_return_scroll: usize,
+    /// The editable buffer over [`AppState::explore`] (Phase 4), or `None`
+    /// while the explorer is read-only — which it is until the reader
+    /// presses `i`, `o`, `d` or `w`.
+    ///
+    /// **Dropped by [`AppState::install_listing`], unconditionally.** That is
+    /// not tidiness: the buffer's lines carry indices into
+    /// [`AppState::explore`]'s entries, so a buffer that outlived its listing
+    /// would name the wrong files, and the diff would happily rename or
+    /// delete them. Making the drop part of the one seam that installs a
+    /// listing is what turns that into an impossibility rather than a rule.
+    explore_edit: Option<EditSession>,
+}
+
+/// The reader's in-progress edit of a directory (Phase 4).
+///
+/// Three states in one struct rather than three [`Mode`] variants, because
+/// `Mode` is `Copy` and every one of these fields owns heap data — and
+/// because the confirmation gate is not a different *mode* to a reader, it is
+/// a question the explorer is asking.
+#[derive(Debug)]
+struct EditSession {
+    buffer: EditBuffer,
+    /// The row the reader is typing into, if any.
+    editing: Option<usize>,
+    /// The plan waiting for a `y`.
+    ///
+    /// **The gate.** While this is `Some`, exactly three keys mean anything
+    /// (`y`, `n`, `Esc`) and every other key — `Enter` emphatically included
+    /// — is inert, so no reflexive keystroke can confirm a delete.
+    pending: Option<EditPlan>,
 }
 
 impl AppState {
@@ -583,6 +638,7 @@ impl AppState {
             mouse_capture: true,
             explore: None,
             explore_return_scroll: 0,
+            explore_edit: None,
         }
     }
 
@@ -790,7 +846,31 @@ impl AppState {
     /// `Some` from [`AppState::status`]'s `Mode::Explore` arm, so
     /// `position_pct`/`name` below are never actually rendered — see
     /// [`StatusLine::render`].
+    ///
+    /// While an edit is in progress (Phase 4) the row carries the dirty
+    /// indicator instead, and while a plan is waiting it carries the
+    /// confirmation question — which is the *only* place that question
+    /// appears, so a reader can never be at the gate without seeing it.
     fn explore_status_text(&self) -> String {
+        if let Some(session) = &self.explore_edit {
+            return match &session.pending {
+                Some(plan) => plan.confirmation(),
+                // The indicator leads and the directory trails, which is the
+                // opposite of the read-only row and is not a preference: the
+                // status row is one terminal line and the painter clips it.
+                // A pty test found the whole indicator — the dirty state and
+                // both the keys that resolve it — clipped off the end by an
+                // ordinary-length directory path. While an edit is in
+                // progress, what the reader needs is "you have unsaved
+                // changes, `w` writes and `Esc` discards"; the directory is
+                // the part that can afford to be cut.
+                None => format!(
+                    "{}  {}",
+                    session.buffer.indicator(),
+                    self.explore_dir().unwrap_or(Path::new("")).display()
+                ),
+            };
+        }
         match self.explore_dir() {
             Some(dir) => dir.display().to_string(),
             // Reachable only mid-startup, before the first
@@ -1369,11 +1449,17 @@ impl AppState {
     /// exploring must not overwrite the position the *document* was left at
     /// with whatever [`AppState::scroll`] happens to hold mid-browse (it is
     /// meaningless there; the explorer paints over the whole viewport).
+    /// Any edit in progress is dropped here (Phase 4), and this is the only
+    /// place that needs to do it: a buffer's lines index the entries of the
+    /// listing it was built from, so a buffer that survived a re-list would
+    /// name different files than the ones the reader typed over. See
+    /// [`AppState::explore_edit`].
     pub fn install_listing(&mut self, listing: Listing, selected: usize, rooted: bool) {
         if !matches!(self.mode, Mode::Explore { .. }) {
             self.explore_return_scroll = self.scroll;
         }
         self.explore = Some(listing);
+        self.explore_edit = None;
         self.mode = Mode::Explore { selected, rooted };
     }
 
@@ -1386,13 +1472,21 @@ impl AppState {
     /// Empty outside [`Mode::Explore`], and empty when nothing has been
     /// installed yet — reachable only mid-startup, before the first
     /// [`AppState::install_listing`] call lands.
+    ///
+    /// Once an edit is in progress (Phase 4) the buffer paints instead of the
+    /// listing, through [`crate::explore::EditBuffer::rows`], which windows
+    /// identically — so the overlay does not jump when `i` is pressed. While
+    /// editing, `selected` indexes the *buffer's* rows; the buffer holds one
+    /// row per entry in the same order, so the two spaces agree until the
+    /// reader adds a row.
     pub fn explore_rows(&self, height: u16) -> Vec<OverlayRow> {
         let Mode::Explore { selected, .. } = self.mode else {
             return Vec::new();
         };
-        match &self.explore {
-            Some(listing) => listing.rows(height, selected),
-            None => Vec::new(),
+        match (&self.explore_edit, &self.explore) {
+            (Some(session), _) => session.buffer.rows(height, selected),
+            (None, Some(listing)) => listing.rows(height, selected),
+            (None, None) => Vec::new(),
         }
     }
 
@@ -1422,11 +1516,66 @@ impl AppState {
     /// key — including the whole chrome table, which `chrome_action` has
     /// already declined to claim because [`Mode::captures_all_keys`] says
     /// this mode owns the keyboard — is a deliberate no-op.
+    ///
+    /// Phase 4 puts three tiers in front of that table, checked in this
+    /// order, and the order is the safety property: a confirmation gate that
+    /// could be reached *past* a typed character, or a typed character that
+    /// could be read as a command, is how a reflexive keystroke deletes
+    /// something.
+    ///
+    /// 1. **A plan is waiting.** `y` applies, `n`/`Esc` cancels, everything
+    ///    else is inert.
+    /// 2. **A row is being typed into.** Every printable key is a character
+    ///    of the name — which is why `q` cannot quit from here, and why
+    ///    `Ctrl-c` is lifted above all three tiers as the one key that always
+    ///    can.
+    /// 3. **A buffer is open.** `j`/`k`/`i`/`o`/`d`/`w`/`Esc`/`q`.
+    ///
+    /// With no buffer open the explorer is exactly the Phase 3 read-only
+    /// navigator, except that `i`/`o`/`d`/`w` open a buffer and then act.
     fn handle_explore_key(&mut self, key: KeyEvent, selected: usize, rooted: bool) -> bool {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // Above every tier, including the one where letters are text: a
+        // reader who has typed themselves into a corner must always be able
+        // to leave the process.
+        if ctrl && key.code == KeyCode::Char('c') {
+            return true;
+        }
+        if self
+            .explore_edit
+            .as_ref()
+            .is_some_and(|session| session.pending.is_some())
+        {
+            self.handle_confirm_key(key);
+            return false;
+        }
+        if let Some(row) = self
+            .explore_edit
+            .as_ref()
+            .and_then(|session| session.editing)
+        {
+            self.handle_row_edit_key(key, row, ctrl);
+            return false;
+        }
+        if self.explore_edit.is_none() {
+            if ctrl || !matches!(key.code, KeyCode::Char('i' | 'o' | 'd' | 'w')) {
+                return self.handle_browse_key(key, selected, rooted);
+            }
+            if !self.begin_edit_buffer() {
+                return false;
+            }
+        }
+        self.handle_buffer_key(key, selected, rooted)
+    }
+
+    /// The Phase 3 read-only table, unchanged except that its `Ctrl-c` arm
+    /// moved up to [`AppState::handle_explore_key`]. It had to: `Ctrl-c` must
+    /// also quit from inside a half-typed filename, where `c` is a character,
+    /// and a copy left down here would have been a branch nothing could
+    /// reach.
+    fn handle_browse_key(&mut self, key: KeyEvent, selected: usize, rooted: bool) -> bool {
         match key.code {
             KeyCode::Char('q') => return true,
-            KeyCode::Char('c') if ctrl => return true,
             KeyCode::Esc => {
                 if rooted {
                     // Nothing real is behind this explorer (DW-3.15): there
@@ -1449,11 +1598,207 @@ impl AppState {
         false
     }
 
+    // ----------------------------------------------------- editing (Phase 4)
+
+    /// Opens an edit buffer over the current listing. Answers whether there
+    /// was a listing to open one over.
+    fn begin_edit_buffer(&mut self) -> bool {
+        let Some(listing) = &self.explore else {
+            return false;
+        };
+        self.explore_edit = Some(EditSession {
+            buffer: EditBuffer::new(listing),
+            editing: None,
+            pending: None,
+        });
+        true
+    }
+
+    /// The confirmation gate's whole key table (DW-4.3).
+    ///
+    /// `Enter` is **deliberately not** a yes. It is the key a reader presses
+    /// without reading, and the sentence above it names files that are about
+    /// to stop existing. `y` is a key you have to mean.
+    ///
+    /// And only a **bare** `y` or `n`. A chord is not an answer to a
+    /// yes-or-no question: `Alt-y` is a key the reader's terminal or window
+    /// manager may well have sent on its own, and it must not be the thing
+    /// that deletes their files. `Esc` is exempt from that rule in the safe
+    /// direction — cancelling is always allowed, however it arrives.
+    fn handle_confirm_key(&mut self, key: KeyEvent) {
+        let bare = key.modifiers.is_empty();
+        match key.code {
+            KeyCode::Char('y') if bare => {
+                let plan = self
+                    .explore_edit
+                    .as_mut()
+                    .and_then(|session| session.pending.take());
+                if let Some(plan) = plan {
+                    self.action = Some(PendingAction::ApplyEdits(plan));
+                }
+            }
+            KeyCode::Char('n') if bare => self.cancel_pending_write(),
+            KeyCode::Esc => self.cancel_pending_write(),
+            // Every other key is inert, on purpose. Falling through to the
+            // buffer's table here would let `d` mark a row for deletion while
+            // a delete confirmation is on screen.
+            _ => {}
+        }
+    }
+
+    /// Drops the plan without running any of it, and says so.
+    fn cancel_pending_write(&mut self) {
+        if let Some(session) = self.explore_edit.as_mut() {
+            session.pending = None;
+        }
+        self.set_status(StatusMessage::new(WRITE_CANCELLED));
+    }
+
+    /// Typing a name into one row: the same four arms
+    /// [`AppState::handle_search_key`] uses, which is the whole of the
+    /// crate's line editing.
+    ///
+    /// **Not factored into a shared editor**, and that is this phase's answer
+    /// to the plan's stated uncertainty. The search prompt's editor is
+    /// `String::push` on a printable key and `String::pop` on `Backspace` —
+    /// no cursor, no word motions, no kill ring. An abstraction over those
+    /// two calls would be a module with no depth at all, and both callers
+    /// would still own their own `Esc` semantics (search restores a scroll
+    /// position; this restores a row's seeded text). There is nothing here to
+    /// share yet; when one of the two grows a cursor, there will be.
+    fn handle_row_edit_key(&mut self, key: KeyEvent, row: usize, ctrl: bool) {
+        let Some(session) = self.explore_edit.as_mut() else {
+            return;
+        };
+        match key.code {
+            // A chord is never a character. Without this guard `Ctrl-d` would
+            // type a `d` into a filename.
+            KeyCode::Char(ch) if !ctrl => session.buffer.push_char(row, ch),
+            KeyCode::Backspace => session.buffer.pop_char(row),
+            KeyCode::Enter => session.editing = None,
+            KeyCode::Esc => {
+                session.buffer.revert(row);
+                session.editing = None;
+            }
+            _ => {}
+        }
+    }
+
+    /// The open-buffer table: move, edit, add, remove, write, discard.
+    fn handle_buffer_key(&mut self, key: KeyEvent, selected: usize, rooted: bool) -> bool {
+        match key.code {
+            KeyCode::Char('q') => return true,
+            KeyCode::Esc => self.discard_edits(),
+            KeyCode::Down | KeyCode::Char('j') => self.move_edit_selection(selected, rooted, true),
+            KeyCode::Up | KeyCode::Char('k') => self.move_edit_selection(selected, rooted, false),
+            KeyCode::Char('i') => self.begin_row_edit(selected),
+            KeyCode::Char('o') => self.insert_edit_row(selected, rooted),
+            KeyCode::Char('d') => self.toggle_row_removal(selected),
+            KeyCode::Char('w') => self.build_edit_plan(),
+            // Leaving the directory would throw the edit away silently. Say
+            // so instead: the reader has two keys that resolve it and neither
+            // is the one they pressed.
+            KeyCode::Enter | KeyCode::Char('-') => {
+                self.set_status(StatusMessage::new(UNSAVED_EDITS));
+            }
+            _ => {}
+        }
+        false
+    }
+
+    /// `j`/`k` over the buffer. Every buffer row is selectable — including
+    /// `../`, which cannot be edited but can be passed over, and a row marked
+    /// for removal, which the reader must be able to reach again to unmark.
+    fn move_edit_selection(&mut self, selected: usize, rooted: bool, forward: bool) {
+        let Some(session) = &self.explore_edit else {
+            return;
+        };
+        let last = match session.buffer.len().checked_sub(1) {
+            Some(last) => last,
+            None => return,
+        };
+        let selected = if forward {
+            selected.saturating_add(1).min(last)
+        } else {
+            selected.saturating_sub(1)
+        };
+        self.mode = Mode::Explore { selected, rooted };
+    }
+
+    /// `i`: start typing into the selected row, unless it is `../`.
+    fn begin_row_edit(&mut self, selected: usize) {
+        let Some(session) = self.explore_edit.as_mut() else {
+            return;
+        };
+        if session.buffer.is_editable(selected) {
+            session.editing = Some(selected);
+        }
+    }
+
+    /// `o`: a new empty row below the selection, already being typed into.
+    fn insert_edit_row(&mut self, selected: usize, rooted: bool) {
+        let Some(session) = self.explore_edit.as_mut() else {
+            return;
+        };
+        let selected = session.buffer.insert_new(selected);
+        session.editing = Some(selected);
+        self.mode = Mode::Explore { selected, rooted };
+    }
+
+    /// `d`: mark the selected row for removal, or unmark it. A mark is not a
+    /// delete — nothing happens until `w` and then `y`.
+    fn toggle_row_removal(&mut self, selected: usize) {
+        if let Some(session) = self.explore_edit.as_mut() {
+            session.buffer.toggle_removed(selected);
+        }
+    }
+
+    /// `w`: turn the buffer into a plan and put the confirmation up.
+    ///
+    /// Still no I/O — [`crate::explore::EditPlan::diff`] is pure, which is
+    /// what lets this type build the prompt at all. A refusal lands on the
+    /// status row naming the row that caused it; an edit that asks for
+    /// nothing says so rather than putting an empty question on screen.
+    fn build_edit_plan(&mut self) {
+        let (Some(listing), Some(session)) = (&self.explore, &self.explore_edit) else {
+            return;
+        };
+        match EditPlan::diff(listing, &session.buffer.lines()) {
+            Ok(plan) if plan.is_empty() => self.set_status(StatusMessage::new(NOTHING_TO_WRITE)),
+            Ok(plan) => {
+                if let Some(session) = self.explore_edit.as_mut() {
+                    session.pending = Some(plan);
+                }
+            }
+            Err(error) => self.set_status(StatusMessage::new(error.to_string())),
+        }
+    }
+
+    /// `Esc` with a buffer open: throw the edit away and go back to browsing.
+    ///
+    /// Says so when there was something to throw away, and stays silent when
+    /// there was not — a reader who pressed `i` and changed their mind should
+    /// not be told they lost work.
+    fn discard_edits(&mut self) {
+        let dirty = self
+            .explore_edit
+            .as_ref()
+            .is_some_and(|session| session.buffer.is_dirty());
+        self.explore_edit = None;
+        if dirty {
+            self.set_status(StatusMessage::new(EDITS_DISCARDED));
+        }
+        // The buffer's row space can be longer than the listing's (`o` adds
+        // rows), so the selection has to come back into range.
+        self.reseat_explore();
+    }
+
     /// `Esc` with `rooted: false` (DW-3.5): back to the document, at the
     /// scroll position the reader left it at.
     fn close_explore(&mut self) {
         self.mode = Mode::Normal;
         self.explore = None;
+        self.explore_edit = None;
         self.set_scroll(self.explore_return_scroll);
     }
 
@@ -2005,6 +2350,7 @@ impl AppState {
         // falsifying that method's own documented contract for any future
         // caller that trusted it.
         self.explore = None;
+        self.explore_edit = None;
         self.clear_status();
         self.document_changed = false;
         self.set_scroll(scroll);

@@ -15,4 +15,4 @@
 # per-mutant logs, build output. Ignored rather than cleaned up by hand,
 # because every sweep recreates it and one forgotten `git add .` would commit
 # hundreds of megabytes of scratch.
-mutants.out/
+mutants.out*/

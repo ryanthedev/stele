@@ -694,6 +694,35 @@ fn perform_action(
             }
             true
         }
+        // `y` at the confirmation gate (Phase 4). **The only place in this
+        // program that writes to the filesystem.** It is here, and not in
+        // `AppState`, for the same no-I/O reason every arm above exists —
+        // and the confinement is worth more here than anywhere else: the
+        // decision to destroy something is made in a type a unit test can
+        // drive with no disk at all, and the destruction itself is one call
+        // in one arm of one function.
+        //
+        // Three things follow the apply, in this order and for these
+        // reasons. The directory is re-read, because after a partial apply
+        // the reader's buffer describes a directory that no longer exists and
+        // guessing at it would be worse than looking. `install_listing`
+        // drops the edit session on the way through, so nothing survives that
+        // could still be holding indices into the old listing. And the
+        // summary goes on last, because it is the transient message and
+        // `install_listing` does not clear one — it has to outlive the
+        // re-list to be read at all.
+        PendingAction::ApplyEdits(plan) => {
+            let results = plan.apply();
+            let summary = explore::apply_summary(&results);
+            let rooted = matches!(state.mode(), Mode::Explore { rooted, .. } if rooted);
+            // No seed: after a write, "the row you were on" may not exist,
+            // may have a new name, or may be one of several new rows. The
+            // honest answer is the directory's own default landing spot.
+            let (listing, selected) = read_listing_seated(plan.dir(), None);
+            state.install_listing(listing, selected, rooted);
+            state.set_status(StatusMessage::new(summary));
+            true
+        }
     }
 }
 

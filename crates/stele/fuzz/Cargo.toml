@@ -18,6 +18,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "edit_plan"
+path = "fuzz_targets/edit_plan.rs"
+test = false
+doc = false
+bench = false
+
 # Standalone: never part of the stele workspace (nightly-only sanitizer
 # builds must not leak into the stable fmt/clippy/test/linkage jobs).
 [workspace]
