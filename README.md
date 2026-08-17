@@ -75,6 +75,31 @@ FIFOs, symlinks that resolve to nothing — are listed dim and cannot be
 selected; everything else, whatever its extension, opens exactly as it
 would from the command line.
 
+### Editing a directory
+
+The listing is also a text buffer. `i` edits the selected name, `o` adds a
+line, `d` marks a line for removal, and `Esc` throws the whole edit away.
+Rename by changing a line, create by adding one, delete by removing one —
+then `w` to write.
+
+Nothing reaches the disk until you answer a confirmation that names and counts
+every operation it is about to run, and only a bare `y` answers it: `Enter` is
+the key people press without reading. **There is no trash and no undo**, so
+that prompt is the entire safety net, and it holds the status row for as long
+as it is waiting.
+
+Renaming a *file* cannot silently destroy another one. The new name is created
+with `link(2)`, which fails `EEXIST` in the kernel, so a collision is refused
+by the filesystem rather than by stele's guess about how it folds names — including
+collisions only the filesystem can see, like `Target.md` against `target.md`
+on a case-insensitive volume, or NFC against NFD `café.md`.
+
+Renaming a **symlink or a directory** does not take that path. It checks the
+destination and then renames, and a separate process that creates that
+destination in the window between the two wins the race. Nothing in ordinary
+single-user editing goes near it, but it is a real window and it is not closed
+yet — see [issue #1](https://github.com/ryanthedev/stele/issues/1).
+
 | Flag | Effect |
 |---|---|
 | `--watch` | Reload on change, keeping the scroll anchor. Rejected with `-`. |

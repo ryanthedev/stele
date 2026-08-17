@@ -780,8 +780,10 @@ impl AppState {
     /// message this type shows describes the document as it was when the
     /// message was set — `Ctrl-G`'s byte and line counts, or a failed
     /// reload's reason — so replacing the document invalidates all of them at
-    /// once. Hence the caller: [`AppState::reload_document`], the one place a
-    /// document is replaced.
+    /// once. Hence the callers: [`AppState::reload_document`], the one place
+    /// a document is replaced, and [`AppState::build_edit_plan`], where
+    /// arming a confirmation invalidates every account of the edit that
+    /// preceded it.
     fn clear_status(&mut self) {
         self.status_message = None;
     }
@@ -830,16 +832,40 @@ impl AppState {
             // it for exactly as long as its TTL runs, the same rule the TOC
             // arm above follows; once it expires this reverts to the
             // directory rather than to the ordinary ruler.
-            Mode::Explore { .. } => Some(
-                self.take_transient_message()
-                    .unwrap_or_else(|| self.explore_status_text()),
-            ),
+            //
+            // **Except over an armed confirmation, which outranks
+            // everything.** A pending plan is the only state in which a bare
+            // `y` destroys files, so the question naming what it destroys
+            // must be the text on the row — not merely the text that gets
+            // there when nothing else happens to be showing. `w`, `n`, `w`
+            // put a live `WRITE_CANCELLED` in front of a re-armed DELETE for
+            // its whole TTL and `y` still ran it. [`AppState::build_edit_plan`]
+            // clears the row when it arms; this makes that unforgeable
+            // rather than a convention every future caller must remember.
+            // The transient is still taken, so it ages underneath the
+            // question and cannot pop back once the gate closes.
+            Mode::Explore { .. } => {
+                let transient = self.take_transient_message();
+                Some(match self.pending_confirmation() {
+                    Some(question) => question,
+                    None => transient.unwrap_or_else(|| self.explore_status_text()),
+                })
+            }
         };
         StatusLine {
             position_pct: self.position_pct(),
             name: self.file_info.name.clone(),
             message,
         }
+    }
+
+    /// The question an armed plan is asking, if one is armed.
+    ///
+    /// The single source of truth for "is the reader at the gate", read by
+    /// [`AppState::status`] to give that question precedence over any
+    /// transient message.
+    fn pending_confirmation(&self) -> Option<String> {
+        Some(self.explore_edit.as_ref()?.pending.as_ref()?.confirmation())
     }
 
     /// The explorer's default status text: the listed directory. Always
@@ -851,25 +877,28 @@ impl AppState {
     /// indicator instead, and while a plan is waiting it carries the
     /// confirmation question — which is the *only* place that question
     /// appears, so a reader can never be at the gate without seeing it.
+    /// [`AppState::status`] reaches the gate before this function is
+    /// consulted; the arm here keeps the answer right for a caller that does
+    /// not, rather than leaving a second definition of it to drift.
     fn explore_status_text(&self) -> String {
+        if let Some(question) = self.pending_confirmation() {
+            return question;
+        }
         if let Some(session) = &self.explore_edit {
-            return match &session.pending {
-                Some(plan) => plan.confirmation(),
-                // The indicator leads and the directory trails, which is the
-                // opposite of the read-only row and is not a preference: the
-                // status row is one terminal line and the painter clips it.
-                // A pty test found the whole indicator — the dirty state and
-                // both the keys that resolve it — clipped off the end by an
-                // ordinary-length directory path. While an edit is in
-                // progress, what the reader needs is "you have unsaved
-                // changes, `w` writes and `Esc` discards"; the directory is
-                // the part that can afford to be cut.
-                None => format!(
-                    "{}  {}",
-                    session.buffer.indicator(),
-                    self.explore_dir().unwrap_or(Path::new("")).display()
-                ),
-            };
+            // The indicator leads and the directory trails, which is the
+            // opposite of the read-only row and is not a preference: the
+            // status row is one terminal line and the painter clips it.
+            // A pty test found the whole indicator — the dirty state and
+            // both the keys that resolve it — clipped off the end by an
+            // ordinary-length directory path. While an edit is in
+            // progress, what the reader needs is "you have unsaved
+            // changes, `w` writes and `Esc` discards"; the directory is
+            // the part that can afford to be cut.
+            return format!(
+                "{}  {}",
+                session.buffer.indicator(),
+                self.explore_dir().unwrap_or(Path::new("")).display()
+            );
         }
         match self.explore_dir() {
             Some(dir) => dir.display().to_string(),
@@ -1769,6 +1798,15 @@ impl AppState {
                 if let Some(session) = self.explore_edit.as_mut() {
                     session.pending = Some(plan);
                 }
+                // Arming the gate retires whatever the row was saying. Every
+                // message that could still be up here describes the edit
+                // *before* this plan — a refusal, or the `WRITE_CANCELLED`
+                // from the last time this same buffer was offered — and none
+                // of them is true of the question now being asked.
+                // [`AppState::status`] gives the question precedence anyway;
+                // this keeps a stale message from outliving the gate and
+                // reappearing on the frame after it closes.
+                self.clear_status();
             }
             Err(error) => self.set_status(StatusMessage::new(error.to_string())),
         }

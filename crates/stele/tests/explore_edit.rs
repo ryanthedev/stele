@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use ast::Document;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use layout::{LayoutConfig, NullSizer, layout};
-use stele::app::{AppState, FileInfo, PendingAction};
+use stele::app::{AppState, FileInfo, PendingAction, StatusMessage};
 use stele::explore::{
     EditBuffer, EditError, EditPlan, Entry, EntryKind, Listing, NameFault, Operation, RowStyle,
     apply_summary,
@@ -3172,4 +3172,104 @@ fn test_the_dirty_indicator_counts_each_kind_of_change() {
         buffer.indicator(),
         "[+] 1 renamed, 2 new, 3 removed — w writes, Esc discards"
     );
+}
+
+/// The gate must be *visible* whenever it is armed, not merely armed.
+///
+/// A transient status message set before the plan was built used to win the
+/// status row for its whole 100-frame TTL while the confirmation sat behind
+/// it. `w`, `n`, `w` is the shortest way there: the `n` leaves "write
+/// cancelled: nothing on disk was changed" on the row, the second `w` re-arms
+/// the same DELETE behind it, and a bare `y` ran the delete off a row that
+/// said nothing had been changed. The rollback story for this phase is that
+/// every destructive operation is named and counted before anything runs —
+/// there is no trash and no undo — so a question the reader cannot see is not
+/// a lesser bug than a question that is not asked.
+#[test]
+fn test_dw_4_3_an_armed_gate_is_never_hidden_by_a_stale_message() {
+    let dir = fixture("dw43-visible-gate");
+    let before = snapshot(&dir);
+
+    let mut state = app_state();
+    state.install_listing(Listing::read(&dir), 1, true);
+    press_char(&mut state, 'd'); // mark alpha.md for removal
+    press_char(&mut state, 'w');
+    assert!(
+        status_text(&mut state).contains("DELETE 1 (alpha.md)"),
+        "the first arming must show the question"
+    );
+
+    press_char(&mut state, 'n'); // leaves a transient with its full TTL
+    press_char(&mut state, 'w'); // re-arms the same plan behind it
+
+    let row = status_text(&mut state);
+    assert!(
+        row.contains("DELETE 1 (alpha.md)") && row.contains("[y/n]"),
+        "a re-armed gate must name its delete, not report the last cancel: {row:?}"
+    );
+    assert_eq!(snapshot(&dir), before, "arming still writes nothing");
+}
+
+/// And the stale message must not outlive the gate either: resolving the
+/// confirmation may not hand the row back to a message describing the edit
+/// that came before it.
+#[test]
+fn test_dw_4_3_arming_the_gate_retires_the_previous_message() {
+    let dir = fixture("dw43-retired-message");
+
+    let mut state = app_state();
+    state.install_listing(Listing::read(&dir), 1, true);
+    press_char(&mut state, 'd');
+    press_char(&mut state, 'w');
+    press_char(&mut state, 'n');
+    press_char(&mut state, 'w'); // re-arm, retiring the cancel
+    press_char(&mut state, 'y'); // resolve the gate
+
+    assert!(
+        matches!(state.take_action(), Some(PendingAction::ApplyEdits(_))),
+        "sanity: `y` still confirms"
+    );
+    let row = status_text(&mut state);
+    assert!(
+        !row.contains("nothing on disk was changed"),
+        "a cancel from before the gate must not reappear after it: {row:?}"
+    );
+}
+
+/// And the precedence is a property of the row, not of the two call sites
+/// that happen to get the order right today.
+///
+/// [`AppState::build_edit_plan`] clearing the row is what fixes the `w`, `n`,
+/// `w` sequence, but on its own it only fixes *that* sequence: any future
+/// caller that sets a transient message while a plan is armed would hide the
+/// question again, and no test above would notice. `set_status` is public, so
+/// this test is that caller. The rule it pins is the one the phase's safety
+/// story rests on — while a plan is waiting, the row says what the plan will
+/// destroy, whatever else wanted to be there.
+#[test]
+fn test_dw_4_3_a_pending_confirmation_outranks_any_transient_message() {
+    let dir = fixture("dw43-gate-precedence");
+    let before = snapshot(&dir);
+
+    let mut state = app_state();
+    state.install_listing(Listing::read(&dir), 1, true);
+    press_char(&mut state, 'd'); // mark alpha.md for removal
+    press_char(&mut state, 'w'); // arm the gate
+
+    state.set_status(StatusMessage::new("a message from somewhere else"));
+
+    let row = status_text(&mut state);
+    assert!(
+        row.contains("DELETE 1 (alpha.md)") && row.contains("[y/n]"),
+        "an armed gate must outrank a transient set after it: {row:?}"
+    );
+
+    // The suppressed message must not be waiting to take the row back, either.
+    press_char(&mut state, 'n');
+    press_char(&mut state, 'w');
+    assert!(
+        status_text(&mut state).contains("[y/n]"),
+        "and it must not resurface across a cancel and a re-arm"
+    );
+    assert_eq!(snapshot(&dir), before, "none of this writes anything");
 }
