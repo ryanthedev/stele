@@ -19,7 +19,7 @@
 mod common;
 
 use ast::Document;
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use layout::{LayoutConfig, NullSizer, layout};
 use stele::app::{AppState, FileInfo};
 use stele::painter::Size;
@@ -30,6 +30,11 @@ const VIEWPORT: Size = Size {
     width: 40,
     height: 10,
 };
+
+/// A Control chord, as raw mode delivers it.
+fn ctrl(c: char) -> KeyEvent {
+    KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+}
 
 #[test]
 fn test_scroll_clamps_at_both_ends_for_every_document_height() {
@@ -60,6 +65,17 @@ fn test_scroll_clamps_at_both_ends_for_every_document_height() {
             expected_max,
             "{lines} lines: PageDown at tail"
         );
+        // Ctrl-e is the one motion that can move the page without moving the
+        // reader, so it is also the one that could walk past the tail on its
+        // own. It clamps like everything else — including on a document with
+        // no lines at all, where `max_scroll` is 0 and every arithmetic step
+        // is a saturating one.
+        state.handle_key_event(ctrl('e'));
+        assert_eq!(
+            state.scroll(),
+            expected_max,
+            "{lines} lines: Ctrl-e at tail"
+        );
 
         state.handle_key_event(KeyEvent::from(KeyCode::Char('g')));
         assert_eq!(state.scroll(), 0, "{lines} lines: g");
@@ -67,6 +83,8 @@ fn test_scroll_clamps_at_both_ends_for_every_document_height() {
         assert_eq!(state.scroll(), 0, "{lines} lines: Up at top");
         state.handle_key_event(KeyEvent::from(KeyCode::PageUp));
         assert_eq!(state.scroll(), 0, "{lines} lines: PageUp at top");
+        state.handle_key_event(ctrl('y'));
+        assert_eq!(state.scroll(), 0, "{lines} lines: Ctrl-y at top");
 
         // The last scrollable position must show the final document line as
         // the LAST viewport row — never past it, never one short of it.

@@ -1199,6 +1199,19 @@ impl AppState {
         self.reseat_cursor();
     }
 
+    /// Moves the page by `delta` rows and does **not** move the reading line.
+    ///
+    /// The third motion, and the one with no opinion about the reader: the
+    /// page slides, and the reading line stays on the text it was on until
+    /// the page has slid far enough to push it off — at which point
+    /// [`AppState::set_scroll`]'s `reseat_cursor` drags it back onto the
+    /// screen, one row at a time, honouring [`AppState::scrolloff`].
+    ///
+    /// This is what the mouse wheel does ([`AppState::handle_mouse_event`])
+    /// and what `Ctrl-e`/`Ctrl-y` do. Contrast [`AppState::move_cursor`],
+    /// where the reader leads and the page follows, and
+    /// [`AppState::move_page`], where the page leads and takes the reader
+    /// along whether or not it had to.
     fn scroll_by(&mut self, delta: isize) {
         let current = self.scroll as isize;
         self.set_scroll((current + delta).max(0) as usize);
@@ -1231,6 +1244,10 @@ impl AppState {
     /// At the end of the document the page stops and the reading line does
     /// not: `Ctrl-f` on the last screen still walks to the final line, which
     /// is the only way to reach it with a page key.
+    ///
+    /// There is a third motion that is neither of these:
+    /// [`AppState::scroll_by`], where the page moves and the reader is left
+    /// behind entirely. That is `Ctrl-e`/`Ctrl-y` and the mouse wheel.
     fn move_page(&mut self, delta: isize) {
         let target = (self.cursor as isize).saturating_add(delta).max(0) as usize;
         self.scroll_by(delta);
@@ -2796,6 +2813,12 @@ impl AppState {
     /// ours, `None` when it means nothing — which is what lets
     /// [`AppState::handle_key_event`] fall through to the unmodified binding
     /// for the same key code.
+    ///
+    /// Three kinds of motion live here, and the difference is what happens to
+    /// the reading line: `Ctrl-d`/`Ctrl-u`/`Ctrl-f`/`Ctrl-b` move the page and
+    /// carry the reader with it, while `Ctrl-e`/`Ctrl-y` move the page and
+    /// leave the reader on the text they were reading. See
+    /// [`AppState::move_page`] and [`AppState::scroll_by`].
     fn handle_control_chord(&mut self, code: KeyCode) -> Option<bool> {
         match code {
             // Ctrl-C quits, exactly like `q`. Raw mode clears `ISIG`, so a
@@ -2810,6 +2833,21 @@ impl AppState {
             KeyCode::Char('u') => self.move_page(-(self.half_page() as isize)),
             KeyCode::Char('f') => self.move_page(self.page_size() as isize),
             KeyCode::Char('b') => self.move_page(-(self.page_size() as isize)),
+            // Ctrl-e/Ctrl-y: one line of page, with the reading line left
+            // where it was. The only keyboard motion that moves the viewport
+            // *without* addressing the reader — which is why it calls
+            // `scroll_by` rather than `move_page`, and why the wheel
+            // (`handle_mouse_event`) is its closest relative rather than
+            // `Ctrl-d`. `reseat_cursor` decides when the page has finally
+            // pushed the reader off and has to take them along.
+            //
+            // Both were unbound before this: a chord falls through to the
+            // unmodified table, and that table has no `e` arm and no `y` arm.
+            // The `y` that copies a code block lives one level up in
+            // `handle_normal_key`, behind a `!CONTROL` guard written for
+            // exactly this reason — so `Ctrl-y` scrolls and never copies.
+            KeyCode::Char('e') => self.scroll_by(1),
+            KeyCode::Char('y') => self.scroll_by(-1),
             // Ctrl-g (DW-1.3): file info. Before this phase, lowercase
             // Ctrl-g meant nothing to us and fell through to the unmodified
             // `'g'` binding (jump to top) — an accident of the "strictly
@@ -2829,7 +2867,8 @@ impl AppState {
     /// Deliberately **private**: a `KeyCode` on its own cannot express a
     /// chord — `Ctrl-C` and a bare `c` are the same value here — so any caller
     /// reaching for this name by reflex would silently drop Ctrl-C and the
-    /// vim `Ctrl-d`/`u`/`f`/`b` motions. [`AppState::handle_key_event`] is the
+    /// vim `Ctrl-d`/`u`/`f`/`b`/`e`/`y` motions.
+    /// [`AppState::handle_key_event`] is the
     /// only way in, for the event loop and for tests alike, so there is
     /// exactly one path a key can take through this type.
     fn handle_key(&mut self, code: KeyCode) -> bool {
@@ -4460,6 +4499,163 @@ mod tests {
         assert_eq!(state.scroll(), tail - 5);
     }
 
+    /// `Ctrl-e`/`Ctrl-y` move the page one line and leave the reading line on
+    /// the text it was on. That is the whole difference between them and
+    /// every other motion in the table, and it is what this pins.
+    ///
+    /// Driven from a reader parked in the *middle* of the page, deliberately.
+    /// Neither end of the document round-trips: at the tail `Ctrl-y` drops the
+    /// reader a row (the page no longer reaches the last line) and `Ctrl-e`
+    /// back does not lift them again, because `reseat_cursor` only ever pulls
+    /// a reader who is off the page and never pushes one who is on it.
+    #[test]
+    fn test_vim_ctrl_e_and_ctrl_y_move_the_page_and_leave_the_reader() {
+        let (_doc, _config, _engine, mut state) = build(&non_reflowing_source(50), 40, 10);
+        scroll_to(&mut state, 5);
+        // `scroll_to` leaves the reader on the bottom row; walk them up so
+        // there is room on both sides and neither edge is what is being
+        // measured.
+        for _ in 0..3 {
+            state.handle_key_event(plain(KeyCode::Up));
+        }
+        let reader = state.cursor();
+        assert_eq!((state.scroll(), reader), (5, 11), "an interior start");
+
+        assert!(!state.handle_key_event(ctrl('e')));
+        assert_eq!(state.scroll(), 6, "Ctrl-e moves the page one line");
+        assert_eq!(
+            state.cursor(),
+            reader,
+            "and leaves the reader on their line"
+        );
+
+        assert!(!state.handle_key_event(ctrl('y')));
+        assert_eq!(state.scroll(), 5, "Ctrl-y moves it back");
+        assert_eq!(state.cursor(), reader, "still without moving the reader");
+    }
+
+    /// The page takes the reader along only once it has run them off the
+    /// screen — and then by one line per press, never in a jump.
+    #[test]
+    fn test_vim_ctrl_e_pushes_the_reading_line_only_once_it_reaches_them() {
+        let (_doc, _config, _engine, mut state) = build(&non_reflowing_source(50), 40, 10);
+        scroll_to(&mut state, 5);
+        for _ in 0..3 {
+            state.handle_key_event(plain(KeyCode::Up));
+        }
+        let reader = state.cursor();
+        assert_eq!((state.scroll(), reader), (5, 11));
+
+        // Six presses to bring the top row up to the reader's line: the
+        // reader is on the page the whole way and must not move.
+        for step in 1..=6 {
+            state.handle_key_event(ctrl('e'));
+            assert_eq!(state.scroll(), 5 + step);
+            assert_eq!(
+                state.cursor(),
+                reader,
+                "the page has not reached the reader yet"
+            );
+        }
+
+        // The seventh puts the top row past them, and now they come along —
+        // one line, not a recentring jump.
+        state.handle_key_event(ctrl('e'));
+        assert_eq!(state.scroll(), 12);
+        assert_eq!(state.cursor(), 12, "pushed exactly one line");
+        state.handle_key_event(ctrl('e'));
+        assert_eq!(
+            (state.scroll(), state.cursor()),
+            (13, 13),
+            "then in lockstep"
+        );
+    }
+
+    /// With a `scrolloff` margin the reader is pushed as soon as the page
+    /// stops being at line 0 — the margin is dropped only at the document's
+    /// ends, so the first `Ctrl-e` has to open the whole gap at once.
+    ///
+    /// The chrome is set *before* any motion, deliberately: `set_chrome`
+    /// relayouts nothing and reseats nobody, so raising `scrolloff` after the
+    /// reader has moved builds a state the motion code guarantees can never
+    /// occur, and the test would then be measuring the fixture.
+    #[test]
+    fn test_vim_ctrl_e_opens_the_scrolloff_margin_in_one_press() {
+        let (_doc, _config, _engine, mut state) = build(&non_reflowing_source(50), 40, 10);
+        state.set_chrome(Chrome {
+            scrolloff: 3,
+            ..Chrome::default()
+        });
+        assert_eq!((state.scroll(), state.cursor()), (0, 0));
+
+        state.handle_key_event(ctrl('e'));
+        assert_eq!(state.scroll(), 1);
+        assert_eq!(
+            state.cursor(),
+            4,
+            "line 0 left the page and the margin owes the reader three rows"
+        );
+
+        state.handle_key_event(ctrl('e'));
+        assert_eq!(
+            (state.scroll(), state.cursor()),
+            (2, 5),
+            "one row thereafter"
+        );
+    }
+
+    /// Both chords clamp at the document's ends, and clamping moves nothing —
+    /// not the page and not the reader.
+    #[test]
+    fn test_vim_ctrl_e_and_ctrl_y_clamp_at_both_ends_of_the_document() {
+        let (_doc, _config, _engine, mut state) = build(&non_reflowing_source(50), 40, 10);
+        let tail = state.max_scroll();
+        assert!(tail > 10, "the fixture must be several pages tall");
+
+        assert_eq!(state.scroll(), 0);
+        let top_reader = state.cursor();
+        state.handle_key_event(ctrl('y'));
+        assert_eq!((state.scroll(), state.cursor()), (0, top_reader));
+
+        state.handle_key_event(plain(KeyCode::End));
+        assert_eq!(state.scroll(), tail);
+        let tail_reader = state.cursor();
+        state.handle_key_event(ctrl('e'));
+        assert_eq!((state.scroll(), state.cursor()), (tail, tail_reader));
+        state.handle_key_event(ctrl('e'));
+        assert_eq!(
+            (state.scroll(), state.cursor()),
+            (tail, tail_reader),
+            "a second press at the tail must be as inert as the first"
+        );
+    }
+
+    /// `Ctrl-y` must not reach the `y` that copies a code block.
+    ///
+    /// The two are one `!CONTROL` guard apart in `handle_normal_key`, and the
+    /// failure mode is silent: a reader scrolling up would find the clipboard
+    /// quietly rewritten. Pins the guard, not the chord.
+    #[test]
+    fn test_ctrl_y_scrolls_and_does_not_copy_the_code_block() {
+        let (_doc, _config, _engine, mut state) = build(&non_reflowing_source(50), 40, 10);
+        scroll_to(&mut state, 5);
+
+        state.handle_key_event(ctrl('y'));
+        assert_eq!(state.scroll(), 4, "Ctrl-y scrolled");
+        assert!(
+            state.take_action().is_none(),
+            "and queued no clipboard action"
+        );
+
+        // The bare key still copies, so the guard is narrowing `Ctrl-y` and
+        // not disabling `y`.
+        state.handle_key_event(plain(KeyCode::Char('y')));
+        assert!(matches!(
+            state.take_action(),
+            Some(PendingAction::CopyCodeBlock)
+        ));
+    }
+
     /// `Ctrl-f`/`Ctrl-b` move a full viewport — the same step `PgDn`/`PgUp`
     /// already used — and clamp at both ends.
     #[test]
@@ -4504,7 +4700,14 @@ mod tests {
     fn test_new_motions_are_no_ops_on_a_document_shorter_than_the_viewport() {
         let (_doc, _config, _engine, mut state) = build("short\n", 40, 100);
         assert_eq!(state.max_scroll(), 0);
-        for key in [ctrl('d'), ctrl('u'), ctrl('f'), ctrl('b')] {
+        for key in [
+            ctrl('d'),
+            ctrl('u'),
+            ctrl('f'),
+            ctrl('b'),
+            ctrl('e'),
+            ctrl('y'),
+        ] {
             assert!(!state.handle_key_event(key));
             assert_eq!(state.scroll(), 0, "{key:?} moved a one-screen document");
         }
@@ -4519,7 +4722,14 @@ mod tests {
     #[test]
     fn test_new_motions_are_no_ops_on_a_document_exactly_one_viewport_tall() {
         let mut state = exactly_one_viewport(6);
-        for key in [ctrl('d'), ctrl('u'), ctrl('f'), ctrl('b')] {
+        for key in [
+            ctrl('d'),
+            ctrl('u'),
+            ctrl('f'),
+            ctrl('b'),
+            ctrl('e'),
+            ctrl('y'),
+        ] {
             assert!(!state.handle_key_event(key));
             assert_eq!(state.scroll(), 0, "{key:?} scrolled past the document tail");
         }
@@ -4573,8 +4783,15 @@ mod tests {
     }
 
     /// The unmodified letters behind the new chords stay unbound: `d`, `u`,
-    /// `f`, `b` must not become motions of their own, and `g`/`G`/`q` must
-    /// keep the meaning they already had.
+    /// `f`, `b`, `e` must not become motions of their own, and `g`/`G`/`q`
+    /// must keep the meaning they already had.
+    ///
+    /// **`y` is deliberately not in this list, and cannot be.** It is the one
+    /// chord letter whose bare form is already bound — to copying the code
+    /// block at the reading line — so the symmetry this test otherwise has is
+    /// genuinely broken there rather than merely untested. That asymmetry is
+    /// pinned from the other side, by
+    /// `test_ctrl_y_scrolls_and_does_not_copy_the_code_block`.
     #[test]
     fn test_unmodified_chord_letters_remain_unbound() {
         let (_doc, _config, _engine, mut state) = build(&non_reflowing_source(50), 40, 10);
@@ -4582,7 +4799,7 @@ mod tests {
         let start = state.scroll();
         assert_eq!(start, 10);
 
-        for c in ['d', 'u', 'f', 'b'] {
+        for c in ['d', 'u', 'f', 'b', 'e'] {
             assert!(!state.handle_key_event(plain(KeyCode::Char(c))));
             assert_eq!(state.scroll(), start, "bare `{c}` must not be a motion");
         }
@@ -5428,6 +5645,8 @@ mod tests {
         // to its normal-mode motion.
         assert!(!state.handle_key_event(ctrl('d')));
         assert_eq!(state.scroll(), 0, "Ctrl-d must not scroll under the prompt");
+        assert!(!state.handle_key_event(ctrl('e')));
+        assert_eq!(state.scroll(), 0, "nor may Ctrl-e");
     }
 
     #[test]

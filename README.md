@@ -155,6 +155,7 @@ client, the TLS stack and the flag itself.
 |---|---|
 | `q`, `Ctrl-C` | Quit |
 | `j` / `k`, `↓` / `↑` | Move the reading line |
+| `Ctrl-E` / `Ctrl-Y` | One line, leaving the reading line where it is |
 | `Ctrl-D` / `Ctrl-U` | Half page |
 | `Ctrl-F` / `Ctrl-B`, `PgDn` / `PgUp` | Full page |
 | `g` / `G`, `Home` / `End` | First / last line |

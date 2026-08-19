@@ -156,6 +156,12 @@ bottom edge. A page key — `PgDn`, `Ctrl-f`, `Ctrl-d` — moves the page and ta
 the reader along, exactly as it always did. `G` now reaches the last *line*
 rather than the last screen.
 
+There is a third kind, and it is the only one that separates the two: `Ctrl-e`
+and `Ctrl-y` — and the mouse wheel — move the page and *leave the reader where
+they were*, on the same text. Keep pressing and the page eventually catches up
+with them, and from there it pushes them a line at a time, `scrolloff` and all.
+This is how you read one line ahead without giving up your place.
+
 The reading line exists whether or not it is painted. Setting
 `current_line = false` hides the band and changes no motion, because a key that
 means different things depending on a display setting is worse than either
