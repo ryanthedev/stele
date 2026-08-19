@@ -741,10 +741,18 @@ impl AppState {
     /// The largest scroll offset that still shows a full viewport (`0` for
     /// a document shorter than the viewport — never negative, never
     /// panics).
+    ///
+    /// Measured in [`AppState::content_rows`], **not** in `size.height`, and
+    /// the difference is a bug that shipped: the page draws `size.height`
+    /// less the chrome's vertical padding, so subtracting the raw terminal
+    /// height left the last `Chrome::vertical` lines of every document
+    /// unreachable under any theme that set `padding_top`/`padding_bottom`.
+    /// `G` stopped short of the end, and `reseat_cursor`'s
+    /// end-of-document exception then parked the reading line on a line
+    /// below the visible page. It was invisible for as long as it was,
+    /// because the padding defaults to `0` and no shipped theme sets it.
     pub fn max_scroll(&self) -> usize {
-        self.tree
-            .line_count()
-            .saturating_sub(self.size.height.max(1) as usize)
+        self.tree.line_count().saturating_sub(self.content_rows())
     }
 
     /// The layout width currently in effect — `tree.width()` at construction,
@@ -4497,6 +4505,36 @@ mod tests {
         assert_eq!(state.scroll(), tail);
         state.handle_key_event(ctrl('u'));
         assert_eq!(state.scroll(), tail - 5);
+    }
+
+    /// A theme with vertical padding must not fence the reader off the end of
+    /// the document.
+    #[test]
+    fn test_a_padded_theme_can_still_reach_the_last_line() {
+        let (_doc, _config, _engine, mut state) = build(&non_reflowing_source(50), 40, 10);
+        state.set_chrome(Chrome {
+            padding: Padding {
+                top: 2,
+                bottom: 2,
+                ..Padding::default()
+            },
+            ..Chrome::default()
+        });
+        let last = state.tree().line_count() - 1;
+        let rows = usize::from(state.size().height - state.fitted_chrome().vertical());
+
+        state.handle_key_event(plain(KeyCode::End));
+        let bottom_visible = state.scroll() + rows - 1;
+        assert!(
+            bottom_visible >= last,
+            "the page shows lines {}..={bottom_visible}, so line {last} is unreachable",
+            state.scroll()
+        );
+        assert!(
+            state.cursor() <= bottom_visible,
+            "the reading line sits on {} but the page ends at {bottom_visible}",
+            state.cursor()
+        );
     }
 
     /// `Ctrl-e`/`Ctrl-y` move the page one line and leave the reading line on
