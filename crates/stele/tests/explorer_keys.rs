@@ -20,7 +20,8 @@ mod common;
 
 use common::pty::{
     ChildStdin, Exit, Graphics, Pty, RESTORE, assert_restores_the_terminal_in, contains,
-    drain_to_quiet, read_one_frame, read_until, spawn_viewer, spawn_viewer_in_dir,
+    drain_to_quiet, read_frame_containing, read_one_frame, read_until, spawn_viewer,
+    spawn_viewer_in_dir,
 };
 use common::render::render_row;
 
@@ -30,7 +31,23 @@ const COLS: usize = 80;
 const CONTENT_ROWS: u16 = 23;
 const STATUS_ROW: u16 = 24;
 
-const DEADLINE: Duration = Duration::from_secs(5);
+/// Long enough to be a hang-catcher rather than a stopwatch.
+///
+/// These tests spawn a real debug binary and wait for it to paint. That wait
+/// is dominated by process startup, and on a machine already running the rest
+/// of the suite it has a very long tail: measured over 40 spawns under 12
+/// competing CPU hogs, the time from spawn to the first painted frame ran
+/// 15 ms at best, 991 ms at the median, 3.7 s at p90 and 3.9 s at worst — and
+/// the run past 5 s is the intermittent DW-3.16 failure this replaces, which
+/// reported an empty screen because nothing had been painted yet, not because
+/// anything was wrong with what the viewer eventually drew.
+///
+/// So this is deliberately far above the worst time observed rather than
+/// snugly above the median. Nothing here asserts how fast the viewer starts;
+/// the deadline exists only so a genuinely wedged child fails the test instead
+/// of hanging it, and a ceiling only costs time on a run that was going to
+/// fail anyway. `quit_and_reap` already waits 10 s for the same reason.
+const DEADLINE: Duration = Duration::from_secs(30);
 
 /// A directory whose alphabetical listing order is exactly:
 /// `../`, `alpha.md`, `blocked` (a FIFO — unopenable), `index.md`,
@@ -818,7 +835,7 @@ fn test_dw_3_13_a_directory_argument_never_shows_is_a_directory() {
     let pty = Pty::open();
     let mut child = spawn_viewer(&pty, &[dir.as_os_str()], ChildStdin::Tty);
     let master = pty.master_fd();
-    let frame = read_one_frame(master, DEADLINE);
+    let frame = read_frame_containing(master, b"alpha.md", DEADLINE);
     let body = screen(&frame);
     assert!(
         body.contains("alpha.md"),
@@ -853,7 +870,7 @@ fn test_dw_3_15_backspace_after_opening_one_file_rooted_reports_at_root() {
     let pty = Pty::open();
     let mut child = spawn_viewer(&pty, &[dir.as_os_str()], ChildStdin::Tty);
     let master = pty.master_fd();
-    let startup = read_one_frame(master, DEADLINE);
+    let startup = read_frame_containing(master, b"alpha.md", DEADLINE);
     assert!(
         screen(&startup).contains("alpha.md"),
         "a rooted launch must open the explorer:\n{}",
@@ -903,7 +920,7 @@ fn test_dw_3_16_an_unreadable_cwd_shows_a_named_notice_instead_of_a_blank_explor
     let pty = Pty::open();
     let mut child = spawn_viewer_in_dir(&pty, &[], ChildStdin::Tty, Graphics::Off, &dir);
     let master = pty.master_fd();
-    let frame = read_one_frame(master, DEADLINE);
+    let frame = read_frame_containing(master, b"cannot read directory", DEADLINE);
 
     assert!(
         frame.to_lowercase().contains("cannot read directory"),
@@ -937,7 +954,7 @@ fn test_dw_3_16_an_unreadable_cwd_can_still_be_escaped_upward() {
 
     let pty = Pty::open();
     let mut child = spawn_viewer_in_dir(&pty, &[], ChildStdin::Tty, Graphics::Off, &locked);
-    let frame = read_one_frame(pty.master_fd(), DEADLINE);
+    let frame = read_frame_containing(pty.master_fd(), b"cannot read directory", DEADLINE);
     assert!(
         frame.to_lowercase().contains("cannot read directory"),
         "the notice names the error:\n{}",

@@ -370,6 +370,52 @@ pub fn read_one_frame(master: RawFd, deadline: Duration) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
+/// Reads frames off `master` until one contains `needle`, or `deadline`
+/// elapses; returns that frame, or the last one seen if the needle never
+/// arrives.
+///
+/// For the callers that have just spawned a viewer and have no quiet wire to
+/// read against. [`read_one_frame`]'s own contract says it is "only
+/// meaningful directly after [`drain_to_quiet`]" — straight after a spawn
+/// there is nothing to drain, so a caller there is asserting on whichever
+/// frame happens to arrive first rather than on the one carrying what it
+/// came to check.
+///
+/// `read_until` already waits for content, and most of this suite uses it,
+/// but it returns a byte range that can span frames, which is no good to a
+/// caller that goes on to parse one. This waits by whole frames and hands
+/// back a complete one.
+///
+/// Returning the last frame seen, rather than nothing, is what lets the
+/// caller's own assertion produce the error message — a screen, not an empty
+/// string. It has one consequence worth knowing: a `needle` that never
+/// matches costs the whole `deadline` and then hands back a frame that may
+/// well satisfy the caller's assertion anyway, so a mistyped needle shows up
+/// as a test that passes slowly rather than one that fails. If one of these
+/// suddenly takes the full deadline to go green, suspect the needle before
+/// suspecting the viewer.
+pub fn read_frame_containing(master: RawFd, needle: &[u8], deadline: Duration) -> String {
+    let start = Instant::now();
+    let mut latest = String::new();
+    while let Some(remaining) = deadline.checked_sub(start.elapsed()) {
+        if remaining.is_zero() {
+            break;
+        }
+        let frame = read_one_frame(master, remaining);
+        if contains(frame.as_bytes(), needle) {
+            return frame;
+        }
+        if !frame.is_empty() {
+            latest = frame;
+        }
+        // An empty read means nothing more is coming: `read_one_frame` only
+        // returns early on `FRAME_END`, so it has already spent the rest of
+        // the deadline polling. Looping again would spin, and the next
+        // `checked_sub` ends it.
+    }
+    latest
+}
+
 /// Reads whatever arrives on `master` for `window`, without waiting for any
 /// particular content. For a test that must keep the wire drained while it does
 /// something else — feeding keys, say — and then inspect what came back.
